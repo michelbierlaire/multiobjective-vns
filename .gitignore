@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated P410 example reports
+examples/knapsack/p410/multiobjective-vns-logs/
+
+# Generated multi-day VRP example reports
+examples/multiday_vrp/minimal/multiobjective-vns-logs/
+examples/multiday_vrp/solomon/C101-25/.DS_Store

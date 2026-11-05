@@ -1,0 +1,97 @@
+# Keep the benchmark measures separate. The generic engine returns a
+# Pareto set; inspect vehicle count first and distance among matching counts
+# when comparing with the benchmark's hierarchical reporting convention.
+format_version = 1
+
+[[objectives]]
+objective_id = 'vehicles-used'
+base_measure_id = 'vehicles_used'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0, vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0 }
+
+[[objectives]]
+objective_id = 'total-distance'
+# Solomon travel time equals distance, so this built-in measure evaluates the
+# same quantity after the input arcs encode truncated Euclidean distance.
+base_measure_id = 'total_travel_time'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0, vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0 }
+
+# C101 windows and the depot closing time are benchmark constraints. This
+# generic model represents them as soft penalties. A rate of one million per
+# minute strongly discourages violations; keep only zero-penalty plans for
+# direct benchmark comparison.
+
+[[penalty_functions]]
+objective_id = 'vehicles-used'
+violation_category = 'early_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'vehicles-used'
+violation_category = 'late_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'vehicles-used'
+violation_category = 'vehicle_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'vehicles-used'
+violation_category = 'personnel_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'vehicles-used'
+violation_category = 'duty_overlap'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'total-distance'
+violation_category = 'early_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'total-distance'
+violation_category = 'late_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'total-distance'
+violation_category = 'vehicle_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'total-distance'
+violation_category = 'personnel_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }
+
+[[penalty_functions]]
+objective_id = 'total-distance'
+violation_category = 'duty_overlap'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1000000.0 }

@@ -1,0 +1,35 @@
+# Solomon C101 with the first 25 customers.
+# The single ScenarioBank day is 2025-01-02 in the Geneva time zone.
+format_version = 1
+instance_id = 'solomon-c101-25-package-input-v1'
+scenario_bank_file = 'scenario-bank/scenario-bank.toml'
+load_unit = 'solomon-demand-units'
+
+# Every customer pickup and delivery is required.
+service_coverage_mode = 'mandatory'
+
+# Each vehicle has one assigned driver for this one-day benchmark.
+# Driver availability begins at the assignment; no separate depot continuity
+# rule is active.
+staff_depot_mode = 'available_at_assignment'
+
+# Solomon time-window and depot-closing rules are represented by large
+# objective penalties in this package input; see README.md for the mapping.
+rule_treatment = 'penalty'
+active_simple_rules = []
+hos_regime_id = 'none'
+hos_regime_version = 'none'
+
+[files]
+nodes = 'nodes.csv'
+arcs = 'arcs.csv'
+depots = 'depots.csv'
+vehicles = 'vehicles.csv'
+vehicle_overnight_depots = 'vehicle-overnight-depots.csv'
+vehicle_availability = 'vehicle-availability.csv'
+packages = 'packages.csv'
+package_time_windows = 'package-time-windows.csv'
+vehicle_package_compatibility = 'vehicle-package-compatibility.csv'
+personnel = 'personnel.csv'
+personnel_availability = 'personnel-availability.csv'
+objectives = 'objectives.toml'

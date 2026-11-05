@@ -1,0 +1,39 @@
+# P410 bi-objective multidimensional knapsack instance.
+# Source: Mavrotas, Figueira, and Florios (2009), doi: 10.1016/j.amc.2009.08.045.
+format_version = 1
+problem_instance_id = 'p410-literature-v1'
+items = [
+  'item-1', 'item-2', 'item-3', 'item-4', 'item-5',
+  'item-6', 'item-7', 'item-8', 'item-9', 'item-10'
+]
+
+# Each array entry follows the item order above.
+[[resources]]
+id = 'resource-1'
+capacity = 246
+consumption = [70, 85, 72, 31, 17, 33, 47, 25, 83, 28]
+
+[[resources]]
+id = 'resource-2'
+capacity = 291
+consumption = [49, 15, 88, 29, 78, 98, 50, 89, 83, 3]
+
+[[resources]]
+id = 'resource-3'
+capacity = 219
+consumption = [15, 15, 51, 3, 60, 1, 78, 66, 78, 71]
+
+[[resources]]
+id = 'resource-4'
+capacity = 295
+consumption = [56, 21, 69, 60, 96, 65, 100, 25, 68, 30]
+
+[[objectives]]
+id = 'profit-1'
+name = 'Profit 1'
+contribution = [1, 87, 28, 32, 38, 9, 8, 6, 92, 78]
+
+[[objectives]]
+id = 'profit-2'
+name = 'Profit 2'
+contribution = [4, 21, 68, 17, 43, 48, 85, 30, 37, 33]

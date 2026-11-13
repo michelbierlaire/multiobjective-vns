@@ -1,0 +1,65 @@
+# Keep distance and soft temporal violations as separate objectives.
+format_version = 1
+
+[[objectives]]
+objective_id = 'total-distance'
+# Solomon travel time equals distance, so this measure evaluates the same
+# quantity after the input arcs encode truncated Euclidean distance.
+base_measure_id = 'total_travel_time'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = {}
+
+[[objectives]]
+objective_id = 'time-window-violation'
+base_measure_id = 'zero'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0, vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0 }
+
+[[objectives]]
+objective_id = 'total-waiting-time'
+base_measure_id = 'total_waiting_time'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = {}
+
+# A rate of one keeps this objective in violated minutes. Service windows,
+# vehicle/personnel availability, and duty overlap are all soft in this model.
+[[penalty_functions]]
+objective_id = 'time-window-violation'
+violation_category = 'early_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'time-window-violation'
+violation_category = 'late_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'time-window-violation'
+violation_category = 'vehicle_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'time-window-violation'
+violation_category = 'personnel_availability'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'time-window-violation'
+violation_category = 'duty_overlap'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }

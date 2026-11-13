@@ -236,3 +236,4 @@ examples/multiday_vrp/solomon/C101-25/.DS_Store
 /examples/multiday_vrp/solomon/C101-25/run-logs-1h-window-operators-20261106-seed-0
 /examples/multiday_vrp/solomon/C101-25/run-logs-2h-20261105-seed-0
 /examples/multiday_vrp/solomon/C101-25/run-logs-best-regret-20261105-seed-0
+.DS_Store

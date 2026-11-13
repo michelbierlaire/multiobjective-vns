@@ -45,6 +45,7 @@ def run_example(*, log_directory: Path | None = None) -> RunResult:
         problem_instance_id=application.problem_instance_id,
         operator_groups=application.operator_groups,
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             budget_limits=BudgetLimits(
                 max_wall_time_seconds=30.0,
                 max_candidate_attempts=1,

@@ -129,16 +129,15 @@ def test_choice_and_feedback_records_are_typed_by_choice_and_size() -> None:
     observation = FeedbackObservation(
         choice_id=choice_id,
         k=2,
-        m=0,
+        modification_counts=(),
         outcomes=(),
         failures=(),
-        stagnation_attempts=3,
-        archive_reward=0.0,
+        archive_admission_count=0,
     )
 
     assert request.choices == (descriptor,)
     assert request.category is OperatorChoiceCategory.COMPOSITION
-    assert observation.m == 0
+    assert observation.modification_counts == ()
     with pytest.raises(ValueError, match='current_k'):
         ChoiceDescriptor(
             choice_id=choice_id,
@@ -153,31 +152,28 @@ def test_choice_and_feedback_records_are_typed_by_choice_and_size() -> None:
         FeedbackObservation(
             choice_id,
             k=2,
-            m=3,
+            modification_counts=(3,),
             outcomes=(),
             failures=(),
-            stagnation_attempts=0,
-            archive_reward=0.0,
+            archive_admission_count=0,
         )
     with pytest.raises(ValueError):
         FeedbackObservation(
             choice_id,
             k=1,
-            m=0,
+            modification_counts=(2,),
             outcomes=(),
             failures=(),
-            stagnation_attempts=0,
-            archive_reward=1.1,
+            archive_admission_count=0,
         )
     with pytest.raises((TypeError, ValueError)):
         FeedbackObservation(
             choice_id,
             k=1,
-            m=0,
+            modification_counts=(),
             outcomes=(),
             failures=(),
-            stagnation_attempts=True,
-            archive_reward=0.0,
+            archive_admission_count=True,
         )
     with pytest.raises(ValueError):
         ChoiceDescriptor(
@@ -263,38 +259,41 @@ def test_base_selection_request_contains_only_valid_feasible_records() -> None:
         )
 
 
-def test_feedback_observation_has_at_most_one_submitted_candidate() -> None:
+def test_feedback_observation_accepts_ordered_candidate_batch() -> None:
     choice_id = ChoiceId.for_operator('swap')
-    outcome = CandidateOutcome(
-        source=SubmissionSource.OPERATOR,
-        submitted_solution=(1,),
-        processing_status=ProcessingStatus.COMPLETED,
-        choice_id=choice_id,
-        base_solution_id=SolutionId(0),
-        k=1,
-        m=1,
-        solution_id=SolutionId(1),
-        assessment=ApplicationAssessment.VALID,
-        disposition=SearchDisposition.ARCHIVED,
-    )
-    with pytest.raises(ValueError):
-        FeedbackObservation(
-            choice_id,
+    outcomes = tuple(
+        CandidateOutcome(
+            source=SubmissionSource.OPERATOR,
+            submitted_solution=(index,),
+            processing_status=ProcessingStatus.COMPLETED,
+            choice_id=choice_id,
+            base_solution_id=SolutionId(0),
             k=1,
             m=1,
-            outcomes=(outcome, outcome),
-            failures=(),
-            stagnation_attempts=0,
-            archive_reward=0.0,
+            candidate_index=index,
+            solution_id=SolutionId(index),
+            assessment=ApplicationAssessment.VALID,
+            disposition=SearchDisposition.ARCHIVED,
         )
+        for index in (1, 2)
+    )
+    observation = FeedbackObservation(
+        choice_id,
+        k=1,
+        modification_counts=(1, 1),
+        outcomes=outcomes,
+        failures=(),
+        archive_admission_count=2,
+    )
+    assert observation.archive_admission_count == 2
+    assert tuple(item.candidate_index for item in observation.outcomes) == (1, 2)
 
     with pytest.raises(ValueError):
         FeedbackObservation(
             ChoiceId.for_operator('other'),
             k=1,
-            m=1,
-            outcomes=(outcome,),
+            modification_counts=(1,),
+            outcomes=(outcomes[0],),
             failures=(),
-            stagnation_attempts=0,
-            archive_reward=0.0,
+            archive_admission_count=1,
         )

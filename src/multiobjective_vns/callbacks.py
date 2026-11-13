@@ -13,7 +13,7 @@ from multiobjective_vns.records.candidates import CandidateContext, OperatorResu
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 
 Solution: TypeAlias = object
-CodecPayload: TypeAlias = object
+CodecPayload: TypeAlias = bytes
 StatePayload: TypeAlias = object
 LookupKey: TypeAlias = Hashable
 
@@ -49,13 +49,13 @@ class KeyedSolutionIdentity(SolutionIdentity, Protocol):
 
 
 class SolutionCodec(CheckpointComponent, Protocol):
-    """Application-owned encoding and restoration of solution values."""
+    """Application-owned byte encoding and restoration of solution values."""
 
     def capture(self, solution: Solution) -> CodecPayload:
-        """Capture an opaque payload representing a solution."""
+        """Capture application-defined bytes representing a solution."""
 
     def restore(self, payload: CodecPayload) -> Solution:
-        """Restore the application solution represented by a payload."""
+        """Restore the application solution represented by encoded bytes."""
 
 
 class StatefulOperator(Operator, Protocol):

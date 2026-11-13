@@ -201,6 +201,7 @@ def test_duplicate_reuses_completed_or_failed_record_without_executor_call() -> 
         base_solution_id=SolutionId(0),
         k=1,
         m=1,
+        candidate_index=1,
     )
 
     assert second.outcome.solution_id == first.outcome.solution_id
@@ -282,10 +283,12 @@ def test_operator_outcome_retains_choice_and_base_metadata() -> None:
         base_solution_id=SolutionId(4),
         k=2,
         m=1,
+        candidate_index=3,
     )
 
     assert result.outcome.k == 2
     assert result.outcome.m == 1
+    assert result.outcome.candidate_index == 3
     assert result.outcome.base_solution_id == SolutionId(4)
     assert result.outcome.metadata == 'move description'
     assert result.outcome.solution_id == SolutionId(0)

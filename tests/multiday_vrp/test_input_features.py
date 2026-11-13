@@ -15,10 +15,11 @@ from multiobjective_vns.multiday_vrp.input_records import (
     InterventionToolRecord,
     LoadedScenarioBank,
     LoadedVrpInstance,
-    PersonRecord,
+    NodeCoordinateRecord,
     PackageRecord,
     PackageTimeWindowRecord,
     PersonnelAvailabilityRecord,
+    PersonRecord,
     ScenarioRecord,
     ToolRecord,
     VehicleAvailabilityRecord,
@@ -26,6 +27,7 @@ from multiobjective_vns.multiday_vrp.input_records import (
     VrpFleetData,
     VrpInterventionData,
     VrpPackageData,
+    VrpSpatialData,
 )
 from multiobjective_vns.multiday_vrp.input_validation import _numeric_tolerance
 
@@ -53,7 +55,23 @@ def _features(
         instance.event_data,
         instance.objective_data,
         instance.settings,
+        instance.spatial_data,
     ).active_features
+
+
+def test_planar_coordinate_feature_requires_coordinate_data(tmp_path: Path) -> None:
+    instance = _load_instance(tmp_path)
+    assert 'planar_node_coordinates' not in _features(instance)
+
+    spatial_instance = instance._replace(
+        spatial_data=VrpSpatialData(
+            'local-grid',
+            'km',
+            (NodeCoordinateRecord('node-a', 0.0, 0.0),),
+        )
+    )
+
+    assert 'planar_node_coordinates' in _features(spatial_instance)
 
 
 def test_time_dependence_uses_the_full_profile_range(tmp_path: Path) -> None:
@@ -71,6 +89,21 @@ def test_time_dependence_uses_the_full_profile_range(tmp_path: Path) -> None:
     features = _features(instance, scenario_bank=scenario_bank)
 
     assert 'within_day_time_dependent_travel' in features
+
+
+def test_active_vehicle_count_feature_tracks_exact_count_setting(
+    tmp_path: Path,
+) -> None:
+    instance = _load_instance(tmp_path)
+
+    variable_count_features = _features(instance)
+    fixed_count_instance = instance._replace(
+        settings=instance.settings._replace(exact_active_vehicle_count=1)
+    )
+    fixed_count_features = _features(fixed_count_instance)
+
+    assert 'variable_active_vehicle_count' in variable_count_features
+    assert 'variable_active_vehicle_count' not in fixed_count_features
 
 
 def test_scenario_uncertainty_uses_the_full_scenario_range(tmp_path: Path) -> None:

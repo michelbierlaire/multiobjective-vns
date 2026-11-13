@@ -24,6 +24,8 @@ from multiobjective_vns.multiday_vrp.operators.common import (
 )
 from multiobjective_vns.multiday_vrp.operators.feature_common import objective_position
 from multiobjective_vns.multiday_vrp.operators.path_search import (
+    PathSearchIndex,
+    build_path_search_index,
     rebuild_changed_routes,
 )
 from multiobjective_vns.multiday_vrp.solution import (
@@ -43,6 +45,8 @@ __all__ = ['RelationshipGuidedServiceRepairOperator']
 
 type _Position = tuple[int, int]
 type _TargetKey = tuple[str, str, str, str, str]
+type _ScenarioTimes = tuple[dict[ActivityRef, tuple[float, float]], ...]
+type _ScoredCandidate = tuple[VrpSolution, tuple[object, ...], ApplicationEvaluation]
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,14 @@ class RelationshipGuidedServiceRepairOperator:
         '_candidate_limit',
         '_path_limit',
         '_expansion_limit',
+        '_vehicle_package_compatibility',
+        '_intervention_eligible_days',
+        '_activity_nodes',
+        '_interventions',
+        '_people',
+        '_required_qualifications',
+        '_person_qualifications',
+        '_path_search_index',
     )
 
     def __init__(
@@ -103,19 +115,87 @@ class RelationshipGuidedServiceRepairOperator:
         self._expansion_limit = _bounded_limit(
             max_arc_expansion_steps, 'max_arc_expansion_steps', 10000
         )
+        self._vehicle_package_compatibility = {
+            (item.vehicle_id, item.package_id): item.compatible
+            for item in instance.package_data.vehicle_package_compatibility
+        }
+        eligible_days: dict[str, set[int]] = {}
+        for window in instance.intervention_data.intervention_time_windows:
+            eligible_days.setdefault(window.intervention_id, set()).add(
+                window.day_index
+            )
+        self._intervention_eligible_days = {
+            intervention_id: frozenset(day_indices)
+            for intervention_id, day_indices in eligible_days.items()
+        }
+        self._activity_nodes = {
+            node_ref: node_id
+            for package in instance.package_data.packages
+            for node_ref, node_id in (
+                (ActivityRef('pickup', package.package_id), package.pickup_node_id),
+                (
+                    ActivityRef('delivery', package.package_id),
+                    package.delivery_node_id,
+                ),
+            )
+        }
+        self._activity_nodes.update(
+            {
+                ActivityRef('intervention', item.intervention_id): item.node_id
+                for item in instance.intervention_data.interventions
+            }
+        )
+        self._interventions = {
+            intervention.intervention_id: intervention
+            for intervention in instance.intervention_data.interventions
+        }
+        self._people = tuple(
+            sorted(person.person_id for person in instance.personnel_data.personnel)
+        )
+        required_qualifications: dict[str, set[str]] = {}
+        for (
+            requirement
+        ) in instance.intervention_data.intervention_qualifications_required:
+            required_qualifications.setdefault(requirement.intervention_id, set()).add(
+                requirement.qualification_id
+            )
+        self._required_qualifications = {
+            intervention_id: frozenset(qualification_ids)
+            for intervention_id, qualification_ids in required_qualifications.items()
+        }
+        person_qualifications: dict[str, set[str]] = {}
+        for (
+            qualification
+        ) in instance.personnel_data.personnel_intervention_qualifications:
+            person_qualifications.setdefault(qualification.person_id, set()).add(
+                qualification.qualification_id
+            )
+        self._person_qualifications = {
+            person_id: frozenset(qualification_ids)
+            for person_id, qualification_ids in person_qualifications.items()
+        }
+        self._path_search_index: PathSearchIndex = build_path_search_index(instance)
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Apply up to ``k`` distinct relationship repairs sequentially."""
         size = validate_neighborhood_size(context.k, self._maximum_size)
         base = require_vrp_base(context)
         working = base
+        stored_record = context.base_evaluation
+        working_evaluation = (
+            None if stored_record is None else stored_record.application_evaluation
+        )
+        if not isinstance(working_evaluation, ApplicationEvaluation):
+            working_evaluation = _assessment(
+                self._assess_plan, self._instance, self._objectives, working
+            )
         considered: set[_TargetKey] = set()
         selected_targets: list[_RelationshipTarget] = []
 
         for _ in range(size):
             targets = tuple(
                 target
-                for target in self._targets(working, self._analysis(working))
+                for target in self._targets(working, self._analysis(working_evaluation))
                 if target.key not in considered
             )
             if not targets:
@@ -125,7 +205,7 @@ class RelationshipGuidedServiceRepairOperator:
             selected_targets.append(target)
             candidates = self._repair_candidates(working, target, context)
             if candidates:
-                working = self._choose(candidates, context)
+                working, _values, working_evaluation = self._choose(candidates, context)
 
         modifications = sum(
             _pair_changed(base, working, target) for target in selected_targets
@@ -133,9 +213,7 @@ class RelationshipGuidedServiceRepairOperator:
         if modifications == 0:
             return operator_result(None, modifications=0, requested_size=size)
 
-        final_evaluation = _assessment(
-            self._assess_plan, self._instance, self._objectives, working
-        )
+        final_evaluation = working_evaluation
         if not final_evaluation.representation_valid:
             return operator_result(None, modifications=0, requested_size=size)
         _objective_values(final_evaluation, len(self._objectives.objectives))
@@ -145,10 +223,9 @@ class RelationshipGuidedServiceRepairOperator:
             working, modifications=modifications, requested_size=size
         )
 
-    def _analysis(self, solution: VrpSolution) -> VrpOperatorAnalysis | None:
-        evaluation = _assessment(
-            self._assess_plan, self._instance, self._objectives, solution
-        )
+    def _analysis(
+        self, evaluation: ApplicationEvaluation
+    ) -> VrpOperatorAnalysis | None:
         return (
             evaluation.analysis
             if isinstance(evaluation.analysis, VrpOperatorAnalysis)
@@ -161,6 +238,7 @@ class RelationshipGuidedServiceRepairOperator:
         analysis: VrpOperatorAnalysis | None,
     ) -> tuple[_RelationshipTarget, ...]:
         locations = _activity_locations(solution)
+        scenario_times = _scenario_service_times_by_scenario(solution, analysis)
         targets: list[_RelationshipTarget] = []
         for precedence in self._instance.activity_relations.precedence:
             before = _reference(
@@ -172,7 +250,7 @@ class RelationshipGuidedServiceRepairOperator:
             if after not in locations:
                 continue
             if before not in locations or not _precedence_satisfied(
-                solution, analysis, before, after
+                scenario_times, before, after
             ):
                 targets.append(
                     _RelationshipTarget(
@@ -197,8 +275,8 @@ class RelationshipGuidedServiceRepairOperator:
                 second = _reference(
                     co_location.activity_kind_2, co_location.activity_id_2
                 )
-                first_node = _activity_node(self._instance, first)
-                second_node = _activity_node(self._instance, second)
+                first_node = self._activity_nodes[first]
+                second_node = self._activity_nodes[second]
                 if first_node != second_node and (
                     first in locations or second in locations
                 ):
@@ -223,7 +301,7 @@ class RelationshipGuidedServiceRepairOperator:
         solution: VrpSolution,
         target: _RelationshipTarget,
         context: CandidateContext,
-    ) -> tuple[tuple[VrpSolution, tuple[object, ...]], ...]:
+    ) -> tuple[_ScoredCandidate, ...]:
         if target.kind == 'precedence':
             return self._precedence_candidates(solution, target, context)
         if target.kind == 'co_location':
@@ -235,15 +313,12 @@ class RelationshipGuidedServiceRepairOperator:
         solution: VrpSolution,
         target: _RelationshipTarget,
         context: CandidateContext,
-    ) -> tuple[tuple[VrpSolution, tuple[object, ...]], ...]:
+    ) -> tuple[_ScoredCandidate, ...]:
         locations = _activity_locations(solution)
         source_position = locations.get(target.first)
         if source_position is None:
-            stop_variants = _new_activity_stops(
-                self._instance,
-                target.first,
-                context,
-                self._candidate_limit,
+            stop_variants = self._new_activity_stops(
+                target.first, context, self._candidate_limit
             )
         else:
             source_route, source_stop = source_position
@@ -257,7 +332,18 @@ class RelationshipGuidedServiceRepairOperator:
         partial = [list(route.stops) for route in solution.routes]
         if source_position is not None:
             del partial[source_position[0]][source_position[1]]
-        positions = _eligible_positions(self._instance, solution, partial, target.first)
+        positions = self._eligible_positions(solution, partial, target.first)
+        after_position = locations.get(target.second)
+        if after_position is not None:
+            after_route, after_stop = after_position
+            if source_position is not None and source_position[0] == after_route:
+                if source_position[1] < after_stop:
+                    after_stop -= 1
+            positions = tuple(
+                position
+                for position in positions
+                if position[0] != after_route or position[1] <= after_stop
+            )
         if source_position is not None:
             positions = tuple(
                 position for position in positions if position != source_position
@@ -270,7 +356,7 @@ class RelationshipGuidedServiceRepairOperator:
         sampled = randomized_sample(
             move_options, self._candidate_limit, context.random_source
         )
-        alternatives: list[tuple[VrpSolution, tuple[object, ...]]] = []
+        alternatives: list[_ScoredCandidate] = []
         for selected_stop, (route_index, stop_index) in sampled:
             trial = [list(items) for items in partial]
             trial[route_index].insert(stop_index, selected_stop)
@@ -284,13 +370,77 @@ class RelationshipGuidedServiceRepairOperator:
             )
         return tuple(alternatives)
 
+    def _eligible_positions(
+        self,
+        solution: VrpSolution,
+        stops_by_route: list[list[RouteStop]],
+        reference: ActivityRef,
+    ) -> tuple[_Position, ...]:
+        allowed_days = self._intervention_eligible_days.get(
+            reference.activity_id, frozenset()
+        )
+        return tuple(
+            (route_index, stop_index)
+            for route_index, route in enumerate(solution.routes)
+            if (
+                reference.kind not in {'pickup', 'delivery'}
+                or self._vehicle_package_compatibility.get(
+                    (route.vehicle_id, reference.activity_id), True
+                )
+            )
+            and (
+                reference.kind != 'intervention'
+                or not allowed_days
+                or route.day_index in allowed_days
+            )
+            for stop_index in range(len(stops_by_route[route_index]) + 1)
+        )
+
+    def _new_activity_stops(
+        self,
+        reference: ActivityRef,
+        context: CandidateContext,
+        limit: int,
+    ) -> tuple[ActivityStop, ...]:
+        if reference.kind != 'intervention':
+            return (ActivityStop(reference, frozenset(), 0.0, 0.0, 0.0, False),)
+        intervention = self._interventions.get(reference.activity_id)
+        if intervention is None or intervention.minimum_team_size > len(self._people):
+            return ()
+        required = self._required_qualifications.get(reference.activity_id, frozenset())
+        sizes = tuple(range(intervention.minimum_team_size, len(self._people) + 1))
+        teams: list[frozenset[str]] = []
+        seen: set[frozenset[str]] = set()
+        attempts = max(limit * 64, 64)
+        for _ in range(attempts):
+            size = choose_uniformly(sizes, context.random_source)
+            team = frozenset(
+                randomized_sample(self._people, size, context.random_source)
+            )
+            if team in seen:
+                continue
+            seen.add(team)
+            coverage = set().union(
+                *(
+                    self._person_qualifications.get(person, frozenset())
+                    for person in team
+                )
+            )
+            if required <= coverage:
+                teams.append(team)
+                if len(teams) >= limit:
+                    break
+        return tuple(
+            ActivityStop(reference, team, 0.0, 0.0, 0.0, False) for team in teams
+        )
+
     def _co_location_candidates(
         self,
         solution: VrpSolution,
         target: _RelationshipTarget,
         context: CandidateContext,
-    ) -> tuple[tuple[VrpSolution, tuple[object, ...]], ...]:
-        candidates: list[tuple[VrpSolution, tuple[object, ...]]] = []
+    ) -> tuple[_ScoredCandidate, ...]:
+        candidates: list[_ScoredCandidate] = []
         removal_order = randomized_sample(
             (target.first, target.second), 2, context.random_source
         )
@@ -308,12 +458,14 @@ class RelationshipGuidedServiceRepairOperator:
             partial = [list(route.stops) for route in solution.routes]
             transfer_steps = solution.transfer_steps
             removed_ids = {reference}
-            if reference.kind == 'pickup':
-                removed_ids.add(ActivityRef('delivery', reference.activity_id))
+            package_id = reference.activity_id if reference.kind == 'pickup' else None
+            if package_id is not None:
+                removed_ids = {
+                    ActivityRef('pickup', package_id),
+                    ActivityRef('delivery', package_id),
+                }
                 transfer_steps = tuple(
-                    item
-                    for item in transfer_steps
-                    if item.package_id != reference.activity_id
+                    item for item in transfer_steps if item.package_id != package_id
                 )
             changed: dict[int, tuple[RouteStop, ...]] = {}
             for route_index, route_stops in enumerate(partial):
@@ -324,9 +476,9 @@ class RelationshipGuidedServiceRepairOperator:
                         type(stop) is ActivityStop and stop.activity_ref in removed_ids
                     )
                     and not (
-                        reference.kind == 'pickup'
+                        package_id is not None
                         and type(stop) is TransferOperationStop
-                        and stop.transfer_step_ref.package_id == reference.activity_id
+                        and stop.transfer_step_ref.package_id == package_id
                     )
                 ]
                 if tuple(route_stops) != solution.routes[route_index].stops:
@@ -339,6 +491,7 @@ class RelationshipGuidedServiceRepairOperator:
                 max_paths_per_leg=self._path_limit,
                 max_arc_expansion_steps=self._expansion_limit,
                 max_candidate_alternatives=option_budget,
+                path_search_index=self._path_search_index,
             )
             for candidate in rebuilt:
                 if transfer_steps != candidate.transfer_steps:
@@ -350,8 +503,10 @@ class RelationshipGuidedServiceRepairOperator:
                 )
                 if not evaluation.representation_valid:
                     continue
+                if context.ensure_feasible and evaluation.feasible is not True:
+                    continue
                 values = _objective_values(evaluation, len(self._objectives.objectives))
-                candidates.append((candidate, values))
+                candidates.append((candidate, values, evaluation))
         return tuple(candidates)
 
     def _rebuild_and_assess(
@@ -360,7 +515,7 @@ class RelationshipGuidedServiceRepairOperator:
         trial_stops: list[list[RouteStop]],
         target: _RelationshipTarget,
         context: CandidateContext,
-    ) -> tuple[tuple[VrpSolution, tuple[object, ...]], ...]:
+    ) -> tuple[_ScoredCandidate, ...]:
         changed = {
             index: tuple(stops)
             for index, stops in enumerate(trial_stops)
@@ -374,8 +529,9 @@ class RelationshipGuidedServiceRepairOperator:
             max_paths_per_leg=self._path_limit,
             max_arc_expansion_steps=self._expansion_limit,
             max_candidate_alternatives=1,
+            path_search_index=self._path_search_index,
         )
-        alternatives: list[tuple[VrpSolution, tuple[object, ...]]] = []
+        alternatives: list[_ScoredCandidate] = []
         for candidate in rebuilt:
             if not _pair_changed(solution, candidate, target):
                 continue
@@ -384,17 +540,30 @@ class RelationshipGuidedServiceRepairOperator:
             )
             if not evaluation.representation_valid:
                 continue
+            if context.ensure_feasible and evaluation.feasible is not True:
+                continue
+            analysis = (
+                evaluation.analysis
+                if isinstance(evaluation.analysis, VrpOperatorAnalysis)
+                else None
+            )
+            if not _precedence_satisfied(
+                _scenario_service_times_by_scenario(candidate, analysis),
+                target.first,
+                target.second,
+            ):
+                continue
             values = _objective_values(evaluation, len(self._objectives.objectives))
-            alternatives.append((candidate, values))
+            alternatives.append((candidate, values, evaluation))
         return tuple(alternatives)
 
     def _choose(
         self,
-        candidates: tuple[tuple[VrpSolution, tuple[object, ...]], ...],
+        candidates: tuple[_ScoredCandidate, ...],
         context: CandidateContext,
-    ) -> VrpSolution:
+    ) -> _ScoredCandidate:
         if self._objective_position is None:
-            return choose_uniformly(candidates, context.random_source)[0]
+            return choose_uniformly(candidates, context.random_source)
         objective = self._objectives.objectives[self._objective_position]
         best = candidates[0]
         tied = [best]
@@ -408,21 +577,17 @@ class RelationshipGuidedServiceRepairOperator:
                 tied = [candidate]
             elif comparison is ObjectiveComparison.EQUAL:
                 tied.append(candidate)
-        return choose_uniformly(tied, context.random_source)[0]
+        return choose_uniformly(tied, context.random_source)
 
 
 def _precedence_satisfied(
-    solution: VrpSolution,
-    analysis: VrpOperatorAnalysis | None,
+    scenario_times: _ScenarioTimes | None,
     before: ActivityRef,
     after: ActivityRef,
 ) -> bool:
-    if analysis is None or not analysis.scenario_evaluations:
+    if not scenario_times:
         return False
-    if not analysis.is_complete:
-        return False
-    for scenario in analysis.scenario_evaluations:
-        times = _scenario_service_times(solution, scenario)
+    for times in scenario_times:
         before_times = times.get(before)
         after_times = times.get(after)
         if before_times is None or after_times is None:
@@ -434,11 +599,32 @@ def _precedence_satisfied(
     return True
 
 
+def _scenario_service_times_by_scenario(
+    solution: VrpSolution,
+    analysis: VrpOperatorAnalysis | None,
+) -> _ScenarioTimes | None:
+    if (
+        analysis is None
+        or not analysis.is_complete
+        or not analysis.scenario_evaluations
+    ):
+        return None
+    return tuple(
+        _scenario_service_times(solution, scenario)
+        for scenario in analysis.scenario_evaluations
+    )
+
+
 def _scenario_service_times(
     solution: VrpSolution, scenario: VrpScenarioEvaluation
 ) -> dict[ActivityRef, tuple[float, float]]:
     result: dict[ActivityRef, tuple[float, float]] = {}
-    traces = {(item.vehicle_id, item.day_index): item for item in scenario.vehicle_days}
+    traces = {
+        (item.vehicle_id, item.day_index): {
+            stop.stop_index: stop for stop in item.stops
+        }
+        for item in scenario.vehicle_days
+    }
     for route in solution.routes:
         trace = traces.get((route.vehicle_id, route.day_index))
         if trace is None:
@@ -446,9 +632,7 @@ def _scenario_service_times(
         for index, stop in enumerate(route.stops):
             if type(stop) is not ActivityStop:
                 continue
-            evaluated = next(
-                (item for item in trace.stops if item.stop_index == index), None
-            )
+            evaluated = trace.get(index)
             if (
                 evaluated is not None
                 and evaluated.activity_ref == stop.activity_ref
@@ -462,84 +646,6 @@ def _scenario_service_times(
     return result
 
 
-def _eligible_positions(
-    instance: LoadedVrpInstance,
-    solution: VrpSolution,
-    stops_by_route: list[list[RouteStop]],
-    reference: ActivityRef,
-) -> tuple[_Position, ...]:
-    compatibility = {
-        (item.vehicle_id, item.package_id): item.compatible
-        for item in instance.package_data.vehicle_package_compatibility
-    }
-    allowed_intervention_days = {
-        item.day_index
-        for item in instance.intervention_data.intervention_time_windows
-        if item.intervention_id == reference.activity_id
-    }
-    return tuple(
-        (route_index, stop_index)
-        for route_index, route in enumerate(solution.routes)
-        if (
-            reference.kind not in {'pickup', 'delivery'}
-            or compatibility.get((route.vehicle_id, reference.activity_id), True)
-        )
-        and (
-            reference.kind != 'intervention'
-            or not allowed_intervention_days
-            or route.day_index in allowed_intervention_days
-        )
-        for stop_index in range(len(stops_by_route[route_index]) + 1)
-    )
-
-
-def _new_activity_stops(
-    instance: LoadedVrpInstance,
-    reference: ActivityRef,
-    context: CandidateContext,
-    limit: int,
-) -> tuple[ActivityStop, ...]:
-    if reference.kind != 'intervention':
-        return (ActivityStop(reference, frozenset(), 0.0, 0.0, 0.0, False),)
-    intervention = next(
-        (
-            item
-            for item in instance.intervention_data.interventions
-            if item.intervention_id == reference.activity_id
-        ),
-        None,
-    )
-    if intervention is None:
-        return ()
-    people = tuple(sorted(item.person_id for item in instance.personnel_data.personnel))
-    if intervention.minimum_team_size > len(people):
-        return ()
-    required = {
-        item.qualification_id
-        for item in instance.intervention_data.intervention_qualifications_required
-        if item.intervention_id == reference.activity_id
-    }
-    qualifications: dict[str, set[str]] = {}
-    for item in instance.personnel_data.personnel_intervention_qualifications:
-        qualifications.setdefault(item.person_id, set()).add(item.qualification_id)
-    sizes = tuple(range(intervention.minimum_team_size, len(people) + 1))
-    teams: list[frozenset[str]] = []
-    seen: set[frozenset[str]] = set()
-    attempts = max(limit * 64, 64)
-    for _ in range(attempts):
-        size = choose_uniformly(sizes, context.random_source)
-        team = frozenset(randomized_sample(people, size, context.random_source))
-        if team in seen:
-            continue
-        seen.add(team)
-        coverage = set().union(*(qualifications.get(person, set()) for person in team))
-        if required <= coverage:
-            teams.append(team)
-            if len(teams) >= limit:
-                break
-    return tuple(ActivityStop(reference, team, 0.0, 0.0, 0.0, False) for team in teams)
-
-
 def _activity_locations(solution: VrpSolution) -> dict[ActivityRef, _Position]:
     return {
         stop.activity_ref: (route_index, stop_index)
@@ -547,26 +653,6 @@ def _activity_locations(solution: VrpSolution) -> dict[ActivityRef, _Position]:
         for stop_index, stop in enumerate(route.stops)
         if type(stop) is ActivityStop
     }
-
-
-def _activity_node(instance: LoadedVrpInstance, reference: ActivityRef) -> str:
-    if reference.kind in {'pickup', 'delivery'}:
-        package = next(
-            item
-            for item in instance.package_data.packages
-            if item.package_id == reference.activity_id
-        )
-        return (
-            package.pickup_node_id
-            if reference.kind == 'pickup'
-            else package.delivery_node_id
-        )
-    intervention = next(
-        item
-        for item in instance.intervention_data.interventions
-        if item.intervention_id == reference.activity_id
-    )
-    return intervention.node_id
 
 
 def _reference(kind: str, activity_id: str) -> ActivityRef:

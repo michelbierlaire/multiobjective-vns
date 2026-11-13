@@ -42,7 +42,7 @@ def test_codec_exposes_stable_checkpoint_component_identity() -> None:
     codec = VrpSolutionCodec()
 
     assert codec.component_id == 'multiobjective-vns:multiday-vrp:solution-codec'
-    assert codec.configuration_id == 'multiday-vrp-solution-object-v1'
+    assert codec.configuration_id == 'multiday-vrp-solution-json-v1'
 
 
 def test_codec_satisfies_the_shared_solution_codec_protocol() -> None:
@@ -51,17 +51,20 @@ def test_codec_satisfies_the_shared_solution_codec_protocol() -> None:
     assert codec.component_id == 'multiobjective-vns:multiday-vrp:solution-codec'
 
 
-def test_capture_and_restore_return_the_exact_same_solution_object() -> None:
+def test_capture_and_restore_round_trip_all_solution_fields() -> None:
     codec = VrpSolutionCodec()
     solution = make_solution()
 
     payload = codec.capture(solution)
     restored = codec.restore(payload)
 
-    assert payload is solution
-    assert restored is solution
+    assert isinstance(payload, bytes)
+    assert codec.capture(restored) == payload
     assert restored.routes[0].stops[0].wait == -1.0
     assert restored.routes[0].start_time == float('inf')
+    assert restored.routes[0].stops[0].pre_service_wait != (
+        restored.routes[0].stops[0].pre_service_wait
+    )
 
 
 @pytest.mark.parametrize('value', [None, (), {}, 'solution'])
@@ -74,3 +77,8 @@ def test_capture_rejects_values_with_another_root_type(value: object) -> None:
 def test_restore_rejects_payloads_with_another_root_type(payload: object) -> None:
     with pytest.raises(TypeError):
         VrpSolutionCodec().restore(payload)
+
+
+def test_restore_rejects_malformed_json_bytes() -> None:
+    with pytest.raises(ValueError):
+        VrpSolutionCodec().restore(b'not json')

@@ -81,6 +81,16 @@ class _WindowPenaltyMethods(_ObjectiveAggregationMethods):
 
         return tuple(category for category in _CATEGORY_ORDER if category in active)
 
+    def _objective_categories(self, objective_id: str) -> tuple[ViolationCategory, ...]:
+        assigned = {
+            item.violation_category
+            for item in self._instance.objective_data.penalty_functions
+            if item.objective_id == objective_id and item.rule_id == ''
+        }
+        return tuple(
+            category for category in self._active_categories() if category in assigned
+        )
+
     def _window_assessments(
         self,
         objective: ObjectiveSpec,
@@ -222,6 +232,7 @@ class _WindowPenaltyMethods(_ObjectiveAggregationMethods):
         solution: VrpSolution,
         simple_rule_measures: tuple[RuleMeasure, ...],
         resource_findings: list[ResourceFinding],
+        assigned_categories: frozenset[ViolationCategory],
     ) -> None:
 
         route_by_key = {
@@ -254,53 +265,58 @@ class _WindowPenaltyMethods(_ObjectiveAggregationMethods):
                     )
                 )
 
-        for vehicle in self._instance.fleet_data.vehicles:
-            vehicle_id = vehicle.vehicle_id
+        if 'vehicle_availability' in assigned_categories:
+            for vehicle in self._instance.fleet_data.vehicles:
+                vehicle_id = vehicle.vehicle_id
 
-            vehicle_intervals = tuple(
-                item
-                for item in self._instance.fleet_data.vehicle_availability
-                if item.vehicle_id == vehicle_id
-            )
+                vehicle_intervals = tuple(
+                    item
+                    for item in self._instance.fleet_data.vehicle_availability
+                    if item.vehicle_id == vehicle_id
+                )
 
-            for day in trace.vehicle_days:
-                if day.vehicle_id == vehicle_id:
-                    amount = _outside_availability(
-                        day.duty_start_time,
-                        day.duty_end_time,
-                        tuple(
-                            (item.start_time, item.end_time)
-                            for item in vehicle_intervals
-                        ),
-                    )
+                for day in trace.vehicle_days:
+                    if day.vehicle_id == vehicle_id:
+                        amount = _outside_availability(
+                            day.duty_start_time,
+                            day.duty_end_time,
+                            tuple(
+                                (item.start_time, item.end_time)
+                                for item in vehicle_intervals
+                            ),
+                        )
 
-                    value = self._penalty_value(
-                        objective,
-                        'vehicle_availability',
-                        None,
-                        amount,
-                        scenario.scenario_id,
-                    )
-
-                    category_values['vehicle_availability'].append((None, value))
-
-                    scaled_value = (
-                        float(objective.penalty_scales.get('vehicle_availability', 0.0))
-                        * value
-                    )
-
-                    resource_findings.append(
-                        ResourceFinding(
+                        value = self._penalty_value(
+                            objective,
                             'vehicle_availability',
-                            vehicle_id,
-                            scenario.scenario_id,
-                            vehicle_id,
-                            day.day_index,
                             None,
                             amount,
-                            ((objective.objective_id, scaled_value),),
+                            scenario.scenario_id,
                         )
-                    )
+
+                        category_values['vehicle_availability'].append((None, value))
+
+                        scaled_value = (
+                            float(
+                                objective.penalty_scales.get(
+                                    'vehicle_availability', 0.0
+                                )
+                            )
+                            * value
+                        )
+
+                        resource_findings.append(
+                            ResourceFinding(
+                                'vehicle_availability',
+                                vehicle_id,
+                                scenario.scenario_id,
+                                vehicle_id,
+                                day.day_index,
+                                None,
+                                amount,
+                                ((objective.objective_id, scaled_value),),
+                            )
+                        )
 
         for person in self._instance.personnel_data.personnel:
             person_id = person.person_id
@@ -325,64 +341,73 @@ class _WindowPenaltyMethods(_ObjectiveAggregationMethods):
                 for start, end, _, _ in person_duties[person_id]
             )
 
-            value = self._penalty_value(
-                objective, 'personnel_availability', None, amount, scenario.scenario_id
-            )
-
-            category_values['personnel_availability'].append((None, value))
-
-            scaled_value = (
-                float(objective.penalty_scales.get('personnel_availability', 0.0))
-                * value
-            )
-
-            resource_findings.append(
-                ResourceFinding(
+            if 'personnel_availability' in assigned_categories:
+                value = self._penalty_value(
+                    objective,
                     'personnel_availability',
-                    person_id,
-                    scenario.scenario_id,
-                    None,
-                    None,
                     None,
                     amount,
-                    ((objective.objective_id, scaled_value),),
-                )
-            )
-
-            duties = sorted(person_duties[person_id])
-
-            for left, right in combinations(duties, 2):
-                overlap = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
-
-                measure = _positive_violation(overlap)
-
-                value = self._penalty_value(
-                    objective, 'duty_overlap', None, measure, scenario.scenario_id
+                    scenario.scenario_id,
                 )
 
-                category_values['duty_overlap'].append((None, value))
+                category_values['personnel_availability'].append((None, value))
 
                 scaled_value = (
-                    float(objective.penalty_scales.get('duty_overlap', 0.0)) * value
+                    float(objective.penalty_scales['personnel_availability']) * value
                 )
-
-                resource_id = f'{person_id}:{left[2]}:{left[3]}:{right[2]}:{right[3]}'
 
                 resource_findings.append(
                     ResourceFinding(
-                        'duty_overlap',
-                        resource_id,
+                        'personnel_availability',
+                        person_id,
                         scenario.scenario_id,
                         None,
                         None,
                         None,
-                        measure,
+                        amount,
                         ((objective.objective_id, scaled_value),),
                     )
                 )
 
+            if 'duty_overlap' in assigned_categories:
+                duties = sorted(person_duties[person_id])
+
+                for left, right in combinations(duties, 2):
+                    overlap = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+
+                    measure = _positive_violation(overlap)
+
+                    value = self._penalty_value(
+                        objective, 'duty_overlap', None, measure, scenario.scenario_id
+                    )
+
+                    category_values['duty_overlap'].append((None, value))
+
+                    scaled_value = (
+                        float(objective.penalty_scales['duty_overlap']) * value
+                    )
+
+                    resource_id = (
+                        f'{person_id}:{left[2]}:{left[3]}:{right[2]}:{right[3]}'
+                    )
+
+                    resource_findings.append(
+                        ResourceFinding(
+                            'duty_overlap',
+                            resource_id,
+                            scenario.scenario_id,
+                            None,
+                            None,
+                            None,
+                            measure,
+                            ((objective.objective_id, scaled_value),),
+                        )
+                    )
+
         if self._instance.settings.rule_treatment == 'penalty':
             for rule_measure in simple_rule_measures:
+                if rule_measure.penalty_category not in assigned_categories:
+                    continue
                 penalty = self._penalty_value(
                     objective,
                     rule_measure.penalty_category,

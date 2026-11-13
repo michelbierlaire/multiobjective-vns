@@ -12,6 +12,11 @@ from typing import Literal
 
 from multiobjective_vns.identifiers import ObjectiveId
 from multiobjective_vns.multiday_vrp.evaluation.records import VrpOperatorAnalysis
+from multiobjective_vns.multiday_vrp.extensions import (
+    LegScenarioEvaluation,
+    VehicleDayScenarioEvaluation,
+    VrpScenarioEvaluation,
+)
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
@@ -27,6 +32,8 @@ from multiobjective_vns.multiday_vrp.operators.feature_common import (
     objective_position,
 )
 from multiobjective_vns.multiday_vrp.operators.path_search import (
+    PathSearchIndex,
+    build_path_search_index,
     route_node_sequence,
     sample_loopless_paths,
 )
@@ -41,14 +48,19 @@ from multiobjective_vns.objectives import (
     ObjectiveComparison,
     ObjectiveDeclaration,
 )
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.values import finite_real, require_integer
 
 __all__ = ['AggregationContributionOperator']
 
 type AggregationMoveFamily = Literal['path', 'timing']
-type _Alternative = tuple[VrpSolution, tuple[object, ...], _TimingTarget | None]
+type _Alternative = tuple[VrpSolution, tuple[object, ...], int]
 type _TimingTarget = tuple[int, int | None, str]
 type _LegKey = tuple[int, int]
 
@@ -85,6 +97,7 @@ class AggregationContributionOperator:
         '_path_limit',
         '_expansion_limit',
         '_leave_one_out_instances',
+        '_path_search_index',
     )
 
     def __init__(
@@ -124,12 +137,13 @@ class AggregationContributionOperator:
             max_arc_expansion_steps, 'max_arc_expansion_steps', 10000
         )
         self._leave_one_out_instances = _leave_one_out_instances(instance)
+        self._path_search_index: PathSearchIndex | None = None
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Apply up to ``k`` sequential contribution-guided route moves.
 
         :param context: Base plan, size, feasibility request, and shared RNG.
-        :returns: One complete candidate and changed-unit count, or no result.
+        :returns: Ranked complete candidates and their changed-unit counts.
         :raises TypeError: If the base or assessor result violates its contract.
         :raises ValueError: If size or the objective vector is inconsistent.
         """
@@ -144,10 +158,19 @@ class AggregationContributionOperator:
         ):
             return operator_result(None, modifications=0, requested_size=size)
 
+        if self._move_family == 'path':
+            return self._path_result(base, size, context)
+        return self._timing_result(base, size, context)
+
+    def _path_result(
+        self, base: VrpSolution, size: int, context: CandidateContext
+    ) -> OperatorResult:
         working = base
         changed_units: set[tuple[object, ...]] = set()
         modifications = 0
-        for _ in range(size):
+        last_alternatives: tuple[_Alternative, ...] = ()
+
+        while modifications < size:
             current = _assess_complete(
                 self._instance,
                 self._objectives,
@@ -157,47 +180,171 @@ class AggregationContributionOperator:
             )
             if current is None:
                 break
-            analysis = _analysis(current)
             scenario_id = self._select_scenario(working, current, context)
             target_leg = _select_leg(
                 self._instance,
                 working,
-                analysis,
+                _analysis(current),
                 scenario_id,
                 changed_units,
                 context,
             )
             if target_leg is None:
                 break
-            unit: tuple[object, ...]
-            if self._move_family == 'path':
-                candidates = self._path_alternatives(working, target_leg, context)
-                unit = ('path', *target_leg)
-            else:
-                candidates = self._timing_alternatives(
-                    working, target_leg, changed_units, context
-                )
-                if not candidates:
-                    break
+            unit = ('path', *target_leg)
+            candidates = self._path_alternatives(working, target_leg, context)
             if not candidates:
                 changed_units.add(unit)
                 continue
-            selected = self._best_candidate(candidates, context)
-            candidate, _values, timing_target = selected
-            if timing_target is not None:
-                unit = ('timing', *timing_target)
-            if candidate == working:
-                changed_units.add(unit)
-                continue
-            working = candidate
+
+            last_alternatives = self._ordered_candidates(candidates, context)
             changed_units.add(unit)
             modifications += 1
+            if modifications < size:
+                working = last_alternatives[0][0]
 
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
+        if not last_alternatives:
+            return OperatorResult(candidates=())
+        return OperatorResult(
+            candidates=tuple(
+                CandidateProposal(Candidate(solution), modifications)
+                for solution, _values, _candidate_modifications in last_alternatives[
+                    : context.max_candidates
+                ]
+            )
         )
+
+    def _timing_result(
+        self, base: VrpSolution, size: int, context: CandidateContext
+    ) -> OperatorResult:
+        current = _assess_complete(
+            self._instance,
+            self._objectives,
+            self._assess_plan,
+            base,
+            ensure_feasible=False,
+        )
+        if current is None:
+            return OperatorResult(candidates=())
+        scenario_id = self._select_scenario(base, current, context)
+        target_leg = _select_leg(
+            self._instance,
+            base,
+            _analysis(current),
+            scenario_id,
+            set(),
+            context,
+        )
+        if target_leg is None:
+            return OperatorResult(candidates=())
+
+        alternatives: list[_Alternative] = []
+        seen_solutions = [base]
+        for _ in range(self._candidate_limit):
+            working = base
+            modifications = 0
+            for _ in range(size):
+                targets = self._upstream_timing_targets(working, target_leg)
+                if not targets:
+                    break
+                timing_target = choose_uniformly(targets, context.random_source)
+                delta = choose_uniformly(
+                    (-self._time_step, self._time_step), context.random_source
+                )
+                candidate = _adjust_timing(working, timing_target, cast_float(delta))
+                if candidate is None or candidate == working:
+                    continue
+                working = candidate
+                modifications += 1
+
+            if modifications == 0 or working in seen_solutions:
+                continue
+            assessed = _assess_complete(
+                self._instance,
+                self._objectives,
+                self._assess_plan,
+                working,
+                ensure_feasible=context.ensure_feasible,
+            )
+            if assessed is None or assessed.objective_values is None:
+                continue
+            seen_solutions.append(working)
+            alternatives.append((working, assessed.objective_values, modifications))
+
+        ordered = self._ordered_candidates(tuple(alternatives), context)
+        return OperatorResult(
+            candidates=tuple(
+                CandidateProposal(Candidate(solution), candidate_modifications)
+                for solution, _values, candidate_modifications in ordered[
+                    : context.max_candidates
+                ]
+            )
+        )
+
+    def _upstream_timing_targets(
+        self, solution: VrpSolution, target: _LegKey
+    ) -> tuple[_TimingTarget, ...]:
+        route_index, leg_index = target
+        route = solution.routes[route_index]
+        targets: list[_TimingTarget] = [(route_index, None, 'start_time')]
+        for stop_index in range(min(leg_index, len(route.stops))):
+            stop = route.stops[stop_index]
+            if type(stop) not in _STOP_TYPES:
+                continue
+            fields = (
+                ('wait', 'break_duration')
+                if type(stop) is DepotOnlyStop
+                else _TIMING_FIELDS
+            )
+            targets.extend((route_index, stop_index, field) for field in fields)
+        return tuple(
+            target_item
+            for target_item in targets
+            if any(
+                _timing_delta_is_valid(solution, target_item, delta)
+                for delta in (-self._time_step, self._time_step)
+            )
+        )
+
+    def _ordered_candidates(
+        self,
+        candidates: tuple[_Alternative, ...],
+        context: CandidateContext,
+    ) -> tuple[_Alternative, ...]:
+        remaining = list(candidates)
+        ordered: list[_Alternative] = []
+        objective = self._objectives.objectives[self._objective_position]
+        while remaining:
+            best = remaining[0]
+            for candidate in remaining[1:]:
+                if (
+                    objective.compare(
+                        candidate[1][self._objective_position],
+                        best[1][self._objective_position],
+                    )
+                    is ObjectiveComparison.LESS
+                ):
+                    best = candidate
+            tied = tuple(
+                candidate
+                for candidate in remaining
+                if objective.compare(
+                    candidate[1][self._objective_position],
+                    best[1][self._objective_position],
+                )
+                is ObjectiveComparison.EQUAL
+            )
+            ordered.extend(randomized_sample(tied, len(tied), context.random_source))
+            remaining = [
+                candidate
+                for candidate in remaining
+                if objective.compare(
+                    candidate[1][self._objective_position],
+                    best[1][self._objective_position],
+                )
+                is not ObjectiveComparison.EQUAL
+            ]
+        return tuple(ordered)
 
     def _select_scenario(
         self,
@@ -252,6 +399,10 @@ class AggregationContributionOperator:
         route_index, leg_index = target
         route = working.routes[route_index]
         nodes = route_node_sequence(self._instance, working, route)
+        path_search_index = self._path_search_index
+        if path_search_index is None:
+            path_search_index = build_path_search_index(self._instance)
+            self._path_search_index = path_search_index
         paths = sample_loopless_paths(
             self._instance,
             nodes[leg_index],
@@ -259,6 +410,7 @@ class AggregationContributionOperator:
             random_source=context.random_source,
             max_paths=self._path_limit,
             max_arc_expansion_steps=self._expansion_limit,
+            path_search_index=path_search_index,
         )
         alternatives: list[_Alternative] = []
         sampled_paths = randomized_sample(
@@ -280,74 +432,8 @@ class AggregationContributionOperator:
                 ensure_feasible=context.ensure_feasible,
             )
             if assessed is not None and assessed.objective_values is not None:
-                alternatives.append((candidate, assessed.objective_values, None))
+                alternatives.append((candidate, assessed.objective_values, 1))
         return tuple(alternatives)
-
-    def _timing_alternatives(
-        self,
-        working: VrpSolution,
-        target: _LegKey,
-        changed_units: set[tuple[object, ...]],
-        context: CandidateContext,
-    ) -> tuple[_Alternative, ...]:
-        route_index, leg_index = target
-        route = working.routes[route_index]
-        targets: list[_TimingTarget] = [(route_index, None, 'start_time')]
-        for stop_index in range(min(leg_index, len(route.stops))):
-            stop = route.stops[stop_index]
-            if type(stop) not in _STOP_TYPES:
-                continue
-            fields = (
-                ('wait', 'break_duration')
-                if type(stop) is DepotOnlyStop
-                else _TIMING_FIELDS
-            )
-            targets.extend((route_index, stop_index, field) for field in fields)
-        targets = [item for item in targets if ('timing', *item) not in changed_units]
-        proposals = tuple(
-            (target_item, delta)
-            for target_item in targets
-            for delta in (-self._time_step, self._time_step)
-        )
-        alternatives: list[_Alternative] = []
-        for timing_target, delta in randomized_sample(
-            proposals, self._candidate_limit, context.random_source
-        ):
-            candidate = _adjust_timing(working, timing_target, delta)
-            if candidate is None or candidate == working:
-                continue
-            assessed = _assess_complete(
-                self._instance,
-                self._objectives,
-                self._assess_plan,
-                candidate,
-                ensure_feasible=context.ensure_feasible,
-            )
-            if assessed is not None and assessed.objective_values is not None:
-                alternatives.append(
-                    (candidate, assessed.objective_values, timing_target)
-                )
-        return tuple(alternatives)
-
-    def _best_candidate(
-        self,
-        candidates: tuple[_Alternative, ...],
-        context: CandidateContext,
-    ) -> _Alternative:
-        objective = self._objectives.objectives[self._objective_position]
-        best = candidates[0]
-        tied = [best]
-        for candidate in candidates[1:]:
-            comparison = objective.compare(
-                candidate[1][self._objective_position],
-                best[1][self._objective_position],
-            )
-            if comparison is ObjectiveComparison.LESS:
-                best = candidate
-                tied = [candidate]
-            elif comparison is ObjectiveComparison.EQUAL:
-                tied.append(candidate)
-        return choose_uniformly(tied, context.random_source)
 
 
 def _analysis(evaluation: ApplicationEvaluation) -> VrpOperatorAnalysis | None:
@@ -416,27 +502,62 @@ def _scenario_leg_durations(
     solution: VrpSolution,
     analysis: VrpOperatorAnalysis,
 ) -> dict[_LegKey, dict[str, float]]:
-    by_scenario = {item.scenario_id: item for item in analysis.scenario_evaluations}
+    by_scenario: dict[str, VrpScenarioEvaluation] = {}
+    duplicate_scenarios: set[str] = set()
+    for scenario_trace in analysis.scenario_evaluations:
+        if scenario_trace.scenario_id in by_scenario:
+            duplicate_scenarios.add(scenario_trace.scenario_id)
+        else:
+            by_scenario[scenario_trace.scenario_id] = scenario_trace
+
     result: dict[_LegKey, dict[str, float]] = {}
     for scenario in instance.scenario_bank.scenarios:
-        trace = by_scenario.get(scenario.scenario_id)
-        if trace is None:
+        record = by_scenario.get(scenario.scenario_id)
+        if record is None or scenario.scenario_id in duplicate_scenarios:
             continue
-        vehicle_days = {
-            (item.vehicle_id, item.day_index): item for item in trace.vehicle_days
-        }
+
+        vehicle_days: dict[tuple[str, int], VehicleDayScenarioEvaluation] = {}
+        duplicate_vehicle_days: set[tuple[str, int]] = set()
+        for day_trace in record.vehicle_days:
+            key = (day_trace.vehicle_id, day_trace.day_index)
+            if key in vehicle_days:
+                duplicate_vehicle_days.add(key)
+            else:
+                vehicle_days[key] = day_trace
+
         for route_index, route in enumerate(solution.routes):
-            day_trace = vehicle_days.get((route.vehicle_id, route.day_index))
-            if day_trace is None:
+            day_key = (route.vehicle_id, route.day_index)
+            day_record = vehicle_days.get(day_key)
+            if day_record is None or day_key in duplicate_vehicle_days:
                 continue
-            leg_traces = {item.leg_index: item for item in day_trace.legs}
+
+            leg_traces: dict[int, LegScenarioEvaluation] = {}
+            duplicate_legs: set[int] = set()
+            for leg_trace in day_record.legs:
+                if leg_trace.leg_index in leg_traces:
+                    duplicate_legs.add(leg_trace.leg_index)
+                else:
+                    leg_traces[leg_trace.leg_index] = leg_trace
+
             for leg_index in range(len(route.legs)):
-                leg_trace = leg_traces.get(leg_index)
-                if leg_trace is None:
+                leg_record = leg_traces.get(leg_index)
+                if leg_record is None or leg_index in duplicate_legs:
                     continue
-                duration = fsum(
-                    traversal.travel_time for traversal in leg_trace.arc_traversals
-                )
+                expected_arc_ids = route.legs[leg_index].arc_ids
+                traversals = leg_record.arc_traversals
+                if (
+                    len(traversals) != len(expected_arc_ids)
+                    or tuple(item.arc_id for item in traversals) != expected_arc_ids
+                    or any(
+                        not _finite_float(item.travel_time)
+                        or cast_float(item.travel_time) < 0.0
+                        for item in traversals
+                    )
+                ):
+                    continue
+                duration = fsum(item.travel_time for item in traversals)
+                if not _finite_float(duration):
+                    continue
                 result.setdefault((route_index, leg_index), {})[
                     scenario.scenario_id
                 ] = duration
@@ -472,14 +593,14 @@ def _adjust_timing(
     route = routes[route_index]
     if stop_index is None:
         value = route.start_time + delta
-        if value < 0.0:
+        if not isfinite(value) or value < 0.0:
             return None
         routes[route_index] = replace(route, start_time=value)
         return replace(solution, routes=tuple(routes))
     stops = list(route.stops)
     stop = stops[stop_index]
     value = getattr(stop, field) + delta
-    if value < 0.0:
+    if not isfinite(value) or value < 0.0:
         return None
     updated = replace(stop, **{field: value})
     if updated.break_duration > updated.wait:
@@ -487,6 +608,24 @@ def _adjust_timing(
     stops[stop_index] = updated
     routes[route_index] = replace(route, stops=tuple(stops))
     return replace(solution, routes=tuple(routes))
+
+
+def _timing_delta_is_valid(
+    solution: VrpSolution, target: _TimingTarget, delta: float
+) -> bool:
+    route_index, stop_index, field = target
+    route = solution.routes[route_index]
+    if stop_index is None:
+        value = route.start_time + delta
+        return isfinite(value) and value >= 0.0
+
+    stop = route.stops[stop_index]
+    value = getattr(stop, field) + delta
+    if not isfinite(value) or value < 0.0:
+        return False
+    break_duration = value if field == 'break_duration' else stop.break_duration
+    wait = value if field == 'wait' else stop.wait
+    return break_duration <= wait
 
 
 def _bounded_limit(value: int, name: str, maximum: int) -> int:

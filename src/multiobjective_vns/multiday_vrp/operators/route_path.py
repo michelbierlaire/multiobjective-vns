@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, replace
+from functools import cmp_to_key
 from math import inf, isfinite
 from typing import Protocol
 
@@ -29,7 +30,12 @@ from multiobjective_vns.multiday_vrp.operators.path_search import (
 from multiobjective_vns.multiday_vrp.solution import RouteLeg, VrpSolution
 from multiobjective_vns.objectives import ObjectiveComparison, ObjectiveDeclaration
 from multiobjective_vns.random_source import RandomSource
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.values import require_integer
 
@@ -134,10 +140,11 @@ class RouteLegRerouteOperator:
             _objective_index(objective_declaration, objective_id)
 
     def call(self, context: CandidateContext) -> OperatorResult:
-        """Replace up to ``k`` distinct paths and count changed legs.
+        """Replace up to ``k`` distinct paths and return ranked alternatives.
 
         :param context: Base plan, requested size, feasibility, and shared RNG.
-        :returns: The changed plan and leg count, or a zero-count result.
+        :returns: Up to ``context.max_candidates`` feasible plans in random or
+            objective-ranked order, each with its changed-leg count.
         :raises TypeError: If the base or evaluation callback is malformed.
         :raises ValueError: If size or a callback result violates its contract.
         """
@@ -150,6 +157,7 @@ class RouteLegRerouteOperator:
             max_candidate_alternatives=self._candidate_limit,
             max_paths_per_leg=self._path_limit,
             max_arc_expansion_steps=self._expansion_limit,
+            max_returned_candidates=context.max_candidates,
             objective_id=self._objective_id,
             additive_path_cost=None,
         )
@@ -208,7 +216,8 @@ class ObjectiveSpecificShortestPathOperator:
         """Replace up to ``k`` distinct legs with objective-focused paths.
 
         :param context: Base plan, requested size, feasibility, and shared RNG.
-        :returns: The changed plan and leg count, or a zero-count result.
+        :returns: Up to ``context.max_candidates`` ranked feasible plans, or
+            an empty candidate list when no requested move is feasible.
         :raises TypeError: If the base or evaluation callback is malformed.
         :raises ValueError: If size, objective values, or arc costs are invalid.
         """
@@ -221,6 +230,7 @@ class ObjectiveSpecificShortestPathOperator:
             max_candidate_alternatives=self._candidate_limit,
             max_paths_per_leg=self._path_limit,
             max_arc_expansion_steps=self._expansion_limit,
+            max_returned_candidates=context.max_candidates,
             objective_id=self._objective_id,
             additive_path_cost=self._additive_path_cost,
         )
@@ -236,6 +246,7 @@ def _run_path_search(
     max_candidate_alternatives: int,
     max_paths_per_leg: int,
     max_arc_expansion_steps: int,
+    max_returned_candidates: int,
     objective_id: ObjectiveId | None,
     additive_path_cost: AdditivePathCostCallback | None,
 ) -> OperatorResult:
@@ -249,6 +260,7 @@ def _run_path_search(
         for leg_index in range(len(route.legs))
     ]
     modifications = 0
+    latest_candidates: tuple[VrpSolution, ...] = ()
     for _ in range(size):
         if not remaining_legs:
             break
@@ -266,15 +278,20 @@ def _run_path_search(
             max_candidate_alternatives=max_candidate_alternatives,
             max_paths_per_leg=max_paths_per_leg,
             max_arc_expansion_steps=max_arc_expansion_steps,
+            max_returned_candidates=max_returned_candidates,
         )
         if not candidates:
             continue
         working = candidates[0]
+        latest_candidates = candidates
         modifications += 1
-    return operator_result(
-        working if modifications else None,
-        modifications=modifications,
-        requested_size=size,
+    if not modifications:
+        return operator_result(None, modifications=0, requested_size=size)
+    return OperatorResult(
+        candidates=tuple(
+            CandidateProposal(Candidate(candidate), modifications)
+            for candidate in latest_candidates
+        )
     )
 
 
@@ -291,6 +308,7 @@ def _leg_candidates(
     max_candidate_alternatives: int,
     max_paths_per_leg: int,
     max_arc_expansion_steps: int,
+    max_returned_candidates: int,
 ) -> tuple[VrpSolution, ...]:
     route_index, leg_index = leg_key
     route = working.routes[route_index]
@@ -352,7 +370,7 @@ def _leg_candidates(
     if objective_id is None or not candidates:
         return randomized_sample(
             tuple(candidate for candidate, _ in candidates),
-            1,
+            max_returned_candidates,
             context.random_source,
         )
     objective_index = _objective_index(objectives, objective_id)
@@ -362,16 +380,51 @@ def _leg_candidates(
         if evaluation.objective_values is None:
             raise ValueError('valid candidate assessment requires objective values')
         scored.append((candidate, evaluation.objective_values[objective_index]))
-    best = scored[0][1]
-    best_candidates = [scored[0][0]]
-    for candidate, value in scored[1:]:
-        comparison = objective.compare(value, best)
+
+    if max_returned_candidates == 1:
+        best_value = scored[0][1]
+        best_candidates = [scored[0][0]]
+        for candidate, value in scored[1:]:
+            comparison = objective.compare(value, best_value)
+            if comparison is ObjectiveComparison.LESS:
+                best_value = value
+                best_candidates = [candidate]
+            elif comparison is ObjectiveComparison.EQUAL:
+                best_candidates.append(candidate)
+        return (choose_uniformly(best_candidates, context.random_source),)
+
+    def compare_scored(
+        left: tuple[VrpSolution, object], right: tuple[VrpSolution, object]
+    ) -> int:
+        comparison = objective.compare(left[1], right[1])
         if comparison is ObjectiveComparison.LESS:
-            best = value
-            best_candidates = [candidate]
-        elif comparison is ObjectiveComparison.EQUAL:
-            best_candidates.append(candidate)
-    return (choose_uniformly(best_candidates, context.random_source),)
+            return -1
+        if comparison is ObjectiveComparison.GREATER:
+            return 1
+        return 0
+
+    ordered = sorted(scored, key=cmp_to_key(compare_scored))
+    ranked_candidates: list[VrpSolution] = []
+    group_start = 0
+    while (
+        group_start < len(ordered) and len(ranked_candidates) < max_returned_candidates
+    ):
+        group_end = group_start + 1
+        while (
+            group_end < len(ordered)
+            and objective.compare(ordered[group_start][1], ordered[group_end][1])
+            is ObjectiveComparison.EQUAL
+        ):
+            group_end += 1
+        ranked_candidates.extend(
+            randomized_sample(
+                tuple(candidate for candidate, _ in ordered[group_start:group_end]),
+                max_returned_candidates - len(ranked_candidates),
+                context.random_source,
+            )
+        )
+        group_start = group_end
+    return tuple(ranked_candidates[:max_returned_candidates])
 
 
 def _assess_candidate(

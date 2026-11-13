@@ -23,6 +23,7 @@ from multiobjective_vns.knapsack.operators.exchange import ExchangeItemsOperator
 from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.values import finite_real, require_integer
@@ -216,8 +217,10 @@ class ProfiledCapacityRepairOperator:
                 break
 
         if modifications == 0:
-            return OperatorResult(m=0, candidate=None)
+            return OperatorResult(candidates=())
         result = tuple(working)
         if context.ensure_feasible and not knapsack_is_feasible(self._instance, result):
-            return OperatorResult(m=0, candidate=None)
-        return OperatorResult(m=modifications, candidate=Candidate(result))
+            return OperatorResult(candidates=())
+        return OperatorResult(
+            candidates=(CandidateProposal(Candidate(result), modifications),)
+        )

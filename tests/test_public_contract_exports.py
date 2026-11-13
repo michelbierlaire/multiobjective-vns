@@ -4,6 +4,8 @@ Created: 2026-10-29T13:19:17+00:00
 Author: Michel Bierlaire, EPFL
 """
 
+from inspect import Parameter, signature
+
 import multiobjective_vns as package
 from multiobjective_vns import (
     ActivePoolDecision,
@@ -18,6 +20,7 @@ from multiobjective_vns import (
     Candidate,
     CandidateContext,
     CandidateOutcome,
+    CandidateProposal,
     Checkpoint,
     CheckpointComponent,
     CheckpointRestoreError,
@@ -40,6 +43,10 @@ from multiobjective_vns import (
     LogFinalizationError,
     MultiobjectiveVNS,
     MultiobjectiveVNSConfig,
+    ObjectiveBoundCount,
+    ObjectiveBoundEventFinding,
+    ObjectiveBoundFinding,
+    ObjectiveBoundReport,
     ObjectiveDeclaration,
     OperatorChoiceCategory,
     OperatorRegistration,
@@ -55,6 +62,7 @@ from multiobjective_vns import (
     SolutionRecord,
     StatePayload,
     TerminationReason,
+    ViewerExportScope,
     multiobjective_vns,
 )
 
@@ -64,6 +72,7 @@ def test_core_contracts_are_available_from_the_public_package() -> None:
     assert Candidate is not None
     assert CandidateContext is not None
     assert CandidateOutcome is not None
+    assert CandidateProposal is not None
     assert OperatorResult is not None
     assert ApplicationEvaluation is not None
     assert ApplicationAssessment is not None
@@ -78,6 +87,10 @@ def test_core_contracts_are_available_from_the_public_package() -> None:
     assert BudgetLimits is not None
     assert MultiobjectiveVNSConfig is not None
     assert ObjectiveDeclaration is not None
+    assert ObjectiveBoundFinding is not None
+    assert ObjectiveBoundCount is not None
+    assert ObjectiveBoundEventFinding is not None
+    assert ObjectiveBoundReport is not None
     assert CodecPayload is not None
     assert StatePayload is not None
     assert ArchiveDecision is not None
@@ -101,11 +114,22 @@ def test_core_contracts_are_available_from_the_public_package() -> None:
     assert Executor is not None
     assert CheckpointStore is not None
     assert RunLogger is not None
+    assert ViewerExportScope is not None
     assert SolutionFormatter is not None
     assert ComponentRegistrationError is not None
     assert ComponentSetupError is not None
     assert CheckpointRestoreError is not None
     assert ResumeCompatibilityError is not None
+
+
+def test_candidate_limit_is_required_by_the_public_constructors() -> None:
+    assert (
+        signature(MultiobjectiveVNSConfig)
+        .parameters['max_candidates_per_attempt']
+        .default
+        is Parameter.empty
+    )
+    assert signature(MultiobjectiveVNS).parameters['config'].default is Parameter.empty
     assert InitialSolutionsError is not None
     assert LogFinalizationError is not None
     assert MultiobjectiveVNS is not None

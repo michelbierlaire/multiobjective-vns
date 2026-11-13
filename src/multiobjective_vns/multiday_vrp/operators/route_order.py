@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from itertools import combinations
+from math import isfinite
 from typing import ClassVar
 
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
@@ -26,7 +27,13 @@ from multiobjective_vns.multiday_vrp.operators.path_search import (
 )
 from multiobjective_vns.multiday_vrp.solution import RouteStop, VrpSolution
 from multiobjective_vns.objectives import ObjectiveDeclaration
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.random_source import RandomSource
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.values import require_integer
 
 __all__ = [
@@ -63,6 +70,62 @@ def _two_opt_targets(solution: VrpSolution, _size: int) -> tuple[RouteTarget, ..
         for start in range(len(route.stops))
         for end in range(start + 1, len(route.stops))
     )
+
+
+def _sample_two_opt_targets(
+    solution: VrpSolution, count: int, random_source: RandomSource
+) -> tuple[RouteTarget, ...]:
+    """Sample 2-opt targets without materializing the quadratic target list."""
+    available = sum(
+        len(route.stops) * (len(route.stops) - 1) // 2 for route in solution.routes
+    )
+    sample_count = require_integer(count, name='count', minimum=0)
+    selected_count = min(sample_count, available)
+    swaps: dict[int, int] = {}
+    selected: list[RouteTarget] = []
+    for position in range(selected_count):
+        remaining = available - position
+        if remaining == 1:
+            selected_index = swaps.get(position, position)
+        else:
+            draw = random_source.random()
+            if type(draw) is not float:
+                raise TypeError('RandomSource.random() must return a Python float')
+            if not isfinite(draw) or not 0.0 <= draw < 1.0:
+                raise ValueError('RandomSource.random() must return a float in [0, 1)')
+            offset = min(int(draw * remaining), remaining - 1)
+            selected_position = position + offset
+            selected_index = swaps.get(selected_position, selected_position)
+            swaps[selected_position] = swaps.get(position, position)
+            swaps[position] = selected_index
+        selected.append(_two_opt_target_at(solution, selected_index))
+    return tuple(selected)
+
+
+def _two_opt_target_at(solution: VrpSolution, target_index: int) -> RouteTarget:
+    """Return the target at an index in `_two_opt_targets` order."""
+    index = require_integer(target_index, name='target_index', minimum=0)
+    for route_index, route in enumerate(solution.routes):
+        stop_count = len(route.stops)
+        route_target_count = stop_count * (stop_count - 1) // 2
+        if index >= route_target_count:
+            index -= route_target_count
+            continue
+
+        lower = 0
+        upper = stop_count - 1
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+            targets_before_start = middle * (2 * stop_count - middle - 1) // 2
+            if targets_before_start <= index:
+                lower = middle
+            else:
+                upper = middle - 1
+        start = lower
+        targets_before_start = start * (2 * stop_count - start - 1) // 2
+        end = start + 1 + index - targets_before_start
+        return route_index, start, end
+    raise ValueError('target_index is outside the 2-opt target range')
 
 
 def _build_two_opt(
@@ -120,6 +183,67 @@ def _build_relocate(
     return tuple(candidates)
 
 
+def _relocate_alternative_targets(
+    solution: VrpSolution, target: RouteTarget
+) -> tuple[RouteTarget, ...]:
+    """Return the first insertion gap for every distinct relocation plan."""
+    source_index, stop_index = target
+    source_route = solution.routes[source_index]
+    stop = source_route.stops[stop_index]
+    reduced_source = (
+        *source_route.stops[:stop_index],
+        *source_route.stops[stop_index + 1 :],
+    )
+    insertion_targets: list[RouteTarget] = []
+    for destination_index, destination_route in enumerate(solution.routes):
+        destination_stops = (
+            reduced_source
+            if destination_index == source_index
+            else destination_route.stops
+        )
+        for insertion_index in range(len(destination_stops) + 1):
+            if insertion_index and destination_stops[insertion_index - 1] == stop:
+                continue
+            insertion_targets.append((destination_index, insertion_index))
+    return tuple(insertion_targets)
+
+
+def _build_relocate_candidate(
+    solution: VrpSolution,
+    target: RouteTarget,
+    insertion_target: RouteTarget,
+) -> VrpSolution:
+    """Build one relocation plan from its source and insertion positions."""
+    source_index, stop_index = target
+    destination_index, insertion_index = insertion_target
+    source_route = solution.routes[source_index]
+    stop = source_route.stops[stop_index]
+    reduced_source = (
+        *source_route.stops[:stop_index],
+        *source_route.stops[stop_index + 1 :],
+    )
+    if destination_index == source_index:
+        new_stops = (
+            *reduced_source[:insertion_index],
+            stop,
+            *reduced_source[insertion_index:],
+        )
+        return _replace_stops(solution, {source_index: new_stops})
+    destination_stops = solution.routes[destination_index].stops
+    new_destination = (
+        *destination_stops[:insertion_index],
+        stop,
+        *destination_stops[insertion_index:],
+    )
+    return _replace_stops(
+        solution,
+        {
+            source_index: reduced_source,
+            destination_index: new_destination,
+        },
+    )
+
+
 def _or_opt_targets(solution: VrpSolution, size: int) -> tuple[RouteTarget, ...]:
     return tuple(
         (route_index, start)
@@ -157,6 +281,65 @@ def _build_or_opt(
     return tuple(candidates)
 
 
+def _or_opt_alternative_targets(
+    solution: VrpSolution, target: RouteTarget, size: int
+) -> tuple[RouteTarget, ...]:
+    """Return first insertion gaps for distinct Or-opt plan alternatives."""
+    source_index, start = target
+    source_route = solution.routes[source_index]
+    block = source_route.stops[start : start + size]
+    reduced_source = (*source_route.stops[:start], *source_route.stops[start + size :])
+    insertion_targets: list[RouteTarget] = []
+    for destination_index, destination_route in enumerate(solution.routes):
+        if source_route.day_index != destination_route.day_index:
+            continue
+        destination_base = (
+            reduced_source
+            if destination_index == source_index
+            else destination_route.stops
+        )
+        seen_sequences: set[tuple[RouteStop, ...]] = set()
+        for insertion_index in range(len(destination_base) + 1):
+            candidate_stops = (
+                *destination_base[:insertion_index],
+                *block,
+                *destination_base[insertion_index:],
+            )
+            if candidate_stops in seen_sequences:
+                continue
+            seen_sequences.add(candidate_stops)
+            insertion_targets.append((destination_index, insertion_index))
+    return tuple(insertion_targets)
+
+
+def _build_or_opt_candidate(
+    solution: VrpSolution,
+    target: RouteTarget,
+    size: int,
+    insertion_target: RouteTarget,
+) -> VrpSolution:
+    """Build one Or-opt plan from its source block and insertion gap."""
+    source_index, start = target
+    destination_index, insertion_index = insertion_target
+    source_route = solution.routes[source_index]
+    block = source_route.stops[start : start + size]
+    reduced_source = (*source_route.stops[:start], *source_route.stops[start + size :])
+    destination_base = (
+        reduced_source
+        if destination_index == source_index
+        else solution.routes[destination_index].stops
+    )
+    destination_stops = (
+        *destination_base[:insertion_index],
+        *block,
+        *destination_base[insertion_index:],
+    )
+    replacements = {destination_index: destination_stops}
+    if destination_index != source_index:
+        replacements[source_index] = reduced_source
+    return _replace_stops(solution, replacements)
+
+
 def _exchange_targets(solution: VrpSolution, _size: int) -> tuple[RouteTarget, ...]:
     positions = tuple(
         (route_index, stop_index)
@@ -171,6 +354,57 @@ def _exchange_targets(solution: VrpSolution, _size: int) -> tuple[RouteTarget, .
         if solution.routes[left_route].day_index
         == solution.routes[right_route].day_index
     )
+
+
+def _exchange_target_count(solution: VrpSolution) -> int:
+    """Count same-day stop pairs without materializing the pair list."""
+    counts_by_day: dict[int, int] = {}
+    for route in solution.routes:
+        counts_by_day[route.day_index] = counts_by_day.get(route.day_index, 0) + len(
+            route.stops
+        )
+    return sum(count * (count - 1) // 2 for count in counts_by_day.values())
+
+
+def _exchange_target_at(solution: VrpSolution, target_index: int) -> RouteTarget:
+    """Return a same-day stop pair at its filtered combinations-order index."""
+    index = require_integer(target_index, name='target_index', minimum=0)
+    positions_by_day: dict[int, list[RouteTarget]] = {}
+    ordered_positions: list[tuple[RouteTarget, int, int]] = []
+    for route_index, route in enumerate(solution.routes):
+        day_positions = positions_by_day.setdefault(route.day_index, [])
+        for stop_index in range(len(route.stops)):
+            target = (route_index, stop_index)
+            day_rank = len(day_positions)
+            day_positions.append(target)
+            ordered_positions.append((target, route.day_index, day_rank))
+
+    for left, day_index, day_rank in ordered_positions:
+        day_positions = positions_by_day[day_index]
+        following_count = len(day_positions) - day_rank - 1
+        if index < following_count:
+            right = day_positions[day_rank + 1 + index]
+            return (*left, *right)
+        index -= following_count
+    raise ValueError('target_index is outside the Exchange target range')
+
+
+def _sample_exchange_target(
+    solution: VrpSolution, random_source: RandomSource
+) -> RouteTarget | None:
+    """Select one same-day stop pair with the shared random stream."""
+    target_count = _exchange_target_count(solution)
+    if target_count == 0:
+        return None
+    if target_count == 1:
+        return _exchange_target_at(solution, 0)
+    draw = random_source.random()
+    if type(draw) is not float:
+        raise TypeError('RandomSource.random() must return a Python float')
+    if not isfinite(draw) or not 0.0 <= draw < 1.0:
+        raise ValueError('RandomSource.random() must return a float in [0, 1)')
+    target_index = min(int(draw * target_count), target_count - 1)
+    return _exchange_target_at(solution, target_index)
 
 
 def _build_exchange(
@@ -204,6 +438,47 @@ def _two_opt_star_targets(solution: VrpSolution, _size: int) -> tuple[RouteTarge
     )
 
 
+def _two_opt_star_target_count(solution: VrpSolution) -> int:
+    """Count same-day route-cut pairs without materializing every target."""
+    return sum(
+        (len(solution.routes[left].stops) + 1) * (len(solution.routes[right].stops) + 1)
+        for left, right in _same_day_route_pairs(solution)
+    )
+
+
+def _two_opt_star_target_at(solution: VrpSolution, target_index: int) -> RouteTarget:
+    """Return a 2-opt* target at its materialized pair-and-cut order index."""
+    index = require_integer(target_index, name='target_index', minimum=0)
+    for left, right in _same_day_route_pairs(solution):
+        left_cut_count = len(solution.routes[left].stops) + 1
+        right_cut_count = len(solution.routes[right].stops) + 1
+        pair_target_count = left_cut_count * right_cut_count
+        if index >= pair_target_count:
+            index -= pair_target_count
+            continue
+        left_cut, right_cut = divmod(index, right_cut_count)
+        return left, right, left_cut, right_cut
+    raise ValueError('target_index is outside the 2-opt* target range')
+
+
+def _sample_two_opt_star_target(
+    solution: VrpSolution, random_source: RandomSource
+) -> RouteTarget | None:
+    """Select one same-day route-cut pair with the shared random stream."""
+    target_count = _two_opt_star_target_count(solution)
+    if target_count == 0:
+        return None
+    if target_count == 1:
+        return _two_opt_star_target_at(solution, 0)
+    draw = random_source.random()
+    if type(draw) is not float:
+        raise TypeError('RandomSource.random() must return a Python float')
+    if not isfinite(draw) or not 0.0 <= draw < 1.0:
+        raise ValueError('RandomSource.random() must return a float in [0, 1)')
+    target_index = min(int(draw * target_count), target_count - 1)
+    return _two_opt_star_target_at(solution, target_index)
+
+
 def _build_two_opt_star(
     solution: VrpSolution, target: RouteTarget, _size: int
 ) -> tuple[VrpSolution, ...]:
@@ -214,8 +489,8 @@ def _build_two_opt_star(
         _replace_stops(
             solution,
             {
-                left_index: (*left[: left_cut + 1], *right[right_cut + 1 :]),
-                right_index: (*right[: right_cut + 1], *left[left_cut + 1 :]),
+                left_index: (*left[:left_cut], *right[right_cut:]),
+                right_index: (*right[:right_cut], *left[left_cut:]),
             },
         ),
     )
@@ -227,6 +502,206 @@ def _swap_star_targets(solution: VrpSolution, _size: int) -> tuple[RouteTarget, 
         for left, right in _same_day_route_pairs(solution)
         for left_stop in range(len(solution.routes[left].stops))
         for right_stop in range(len(solution.routes[right].stops))
+    )
+
+
+def _swap_star_target_count(solution: VrpSolution) -> int:
+    """Count same-day cross-route stop pairs without materializing them."""
+    return sum(
+        len(solution.routes[left].stops) * len(solution.routes[right].stops)
+        for left, right in _same_day_route_pairs(solution)
+    )
+
+
+def _swap_star_target_at(solution: VrpSolution, target_index: int) -> RouteTarget:
+    """Return a SWAP* stop pair at its materialized target-order index."""
+    index = require_integer(target_index, name='target_index', minimum=0)
+    for left, right in _same_day_route_pairs(solution):
+        right_stop_count = len(solution.routes[right].stops)
+        pair_target_count = len(solution.routes[left].stops) * right_stop_count
+        if index >= pair_target_count:
+            index -= pair_target_count
+            continue
+        left_stop, right_stop = divmod(index, right_stop_count)
+        return left, left_stop, right, right_stop
+    raise ValueError('target_index is outside the SWAP* target range')
+
+
+def _sample_index_positions(
+    population_size: int, count: int, random_source: RandomSource
+) -> tuple[int, ...]:
+    """Sample integer positions without allocating the full index range."""
+    available = require_integer(population_size, name='population_size', minimum=0)
+    sample_count = require_integer(count, name='count', minimum=0)
+    selected_count = min(sample_count, available)
+    swaps: dict[int, int] = {}
+    selected: list[int] = []
+    for position in range(selected_count):
+        remaining = available - position
+        if remaining == 1:
+            selected_index = swaps.get(position, position)
+        else:
+            draw = random_source.random()
+            if type(draw) is not float:
+                raise TypeError('RandomSource.random() must return a Python float')
+            if not isfinite(draw) or not 0.0 <= draw < 1.0:
+                raise ValueError('RandomSource.random() must return a float in [0, 1)')
+            selected_position = position + min(int(draw * remaining), remaining - 1)
+            selected_index = swaps.get(selected_position, selected_position)
+            swaps[selected_position] = swaps.get(position, position)
+            swaps[position] = selected_index
+        selected.append(selected_index)
+    return tuple(selected)
+
+
+def _sample_swap_star_target(
+    solution: VrpSolution, random_source: RandomSource
+) -> RouteTarget | None:
+    """Select one same-day cross-route stop pair with the shared RNG."""
+    target_count = _swap_star_target_count(solution)
+    if target_count == 0:
+        return None
+    target_index = _sample_index_positions(target_count, 1, random_source)[0]
+    return _swap_star_target_at(solution, target_index)
+
+
+def _single_stop_insertion_indices(
+    stops: tuple[RouteStop, ...],
+    inserted_stop: RouteStop,
+    excluded_index: int,
+) -> tuple[int, ...]:
+    """Return first allowed gaps for distinct single-stop insertion results."""
+    insertion_indices: list[int] = []
+    index = 0
+    while index <= len(stops):
+        if index < len(stops) and stops[index] == inserted_stop:
+            run_end = index + 1
+            while run_end < len(stops) and stops[run_end] == inserted_stop:
+                run_end += 1
+            first_allowed = index + 1 if index == excluded_index else index
+            if first_allowed <= run_end:
+                insertion_indices.append(first_allowed)
+            index = run_end + 1
+            continue
+        if index != excluded_index:
+            insertion_indices.append(index)
+        index += 1
+    return tuple(insertion_indices)
+
+
+def _restoring_insertion_option(
+    original_stops: tuple[RouteStop, ...],
+    removed_index: int,
+    inserted_stop: RouteStop,
+    insertion_indices: tuple[int, ...],
+) -> int | None:
+    """Return the insertion-option index that restores the original route."""
+    if original_stops[removed_index] != inserted_stop:
+        return None
+    run_start = removed_index
+    while run_start and original_stops[run_start - 1] == inserted_stop:
+        run_start -= 1
+    run_end = removed_index + 1
+    while run_end < len(original_stops) and original_stops[run_end] == inserted_stop:
+        run_end += 1
+    return next(
+        (
+            option_index
+            for option_index, insertion_index in enumerate(insertion_indices)
+            if run_start <= insertion_index < run_end
+        ),
+        None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SwapStarInsertionPool:
+    left_indices: tuple[int, ...]
+    right_indices: tuple[int, ...]
+    excluded_pair_index: int | None
+
+    @property
+    def alternative_count(self) -> int:
+        count = len(self.left_indices) * len(self.right_indices)
+        return count - int(self.excluded_pair_index is not None)
+
+    def target_at(self, target_index: int) -> tuple[int, int]:
+        index = require_integer(target_index, name='target_index', minimum=0)
+        if index >= self.alternative_count:
+            raise ValueError('target_index is outside the SWAP* insertion range')
+        if self.excluded_pair_index is not None and index >= self.excluded_pair_index:
+            index += 1
+        right_count = len(self.right_indices)
+        left_option, right_option = divmod(index, right_count)
+        return self.left_indices[left_option], self.right_indices[right_option]
+
+
+def _swap_star_insertion_pool(
+    solution: VrpSolution, target: RouteTarget
+) -> _SwapStarInsertionPool:
+    """Describe unique insertion pairs while excluding the unchanged plan."""
+    left_index, left_stop_index, right_index, right_stop_index = target
+    left_route = solution.routes[left_index]
+    right_route = solution.routes[right_index]
+    left_stop = left_route.stops[left_stop_index]
+    right_stop = right_route.stops[right_stop_index]
+    left_reduced = (
+        *left_route.stops[:left_stop_index],
+        *left_route.stops[left_stop_index + 1 :],
+    )
+    right_reduced = (
+        *right_route.stops[:right_stop_index],
+        *right_route.stops[right_stop_index + 1 :],
+    )
+    left_indices = _single_stop_insertion_indices(
+        left_reduced, right_stop, right_stop_index
+    )
+    right_indices = _single_stop_insertion_indices(
+        right_reduced, left_stop, left_stop_index
+    )
+    left_restore = _restoring_insertion_option(
+        left_route.stops, left_stop_index, right_stop, left_indices
+    )
+    right_restore = _restoring_insertion_option(
+        right_route.stops, right_stop_index, left_stop, right_indices
+    )
+    excluded_pair_index = (
+        left_restore * len(right_indices) + right_restore
+        if left_restore is not None and right_restore is not None
+        else None
+    )
+    return _SwapStarInsertionPool(left_indices, right_indices, excluded_pair_index)
+
+
+def _build_swap_star_candidate(
+    solution: VrpSolution,
+    target: RouteTarget,
+    insertion_target: tuple[int, int],
+) -> VrpSolution:
+    """Build one SWAP* plan from its source pair and insertion positions."""
+    left_index, left_stop_index, right_index, right_stop_index = target
+    left_insert, right_insert = insertion_target
+    left_route = solution.routes[left_index]
+    right_route = solution.routes[right_index]
+    left_stop = left_route.stops[left_stop_index]
+    right_stop = right_route.stops[right_stop_index]
+    left_reduced = (
+        *left_route.stops[:left_stop_index],
+        *left_route.stops[left_stop_index + 1 :],
+    )
+    right_reduced = (
+        *right_route.stops[:right_stop_index],
+        *right_route.stops[right_stop_index + 1 :],
+    )
+    new_left = (*left_reduced[:left_insert], right_stop, *left_reduced[left_insert:])
+    new_right = (
+        *right_reduced[:right_insert],
+        left_stop,
+        *right_reduced[right_insert:],
+    )
+    return _replace_stops(
+        solution,
+        {left_index: new_left, right_index: new_right},
     )
 
 
@@ -381,6 +856,11 @@ class _RouteOrderOperator:
                 break
             working = candidate
             modifications += 1
+        if self._definition in (_EXCHANGE, _TWO_OPT_STAR, _SWAP_STAR) and all(
+            current.stops == original.stops
+            for current, original in zip(working.routes, base.routes, strict=True)
+        ):
+            return operator_result(None, modifications=0, requested_size=size)
         return operator_result(
             working if modifications else None,
             modifications=modifications,
@@ -388,17 +868,87 @@ class _RouteOrderOperator:
         )
 
     def _apply_one(
-        self, working: VrpSolution, context: CandidateContext, size: int
+        self,
+        working: VrpSolution,
+        context: CandidateContext,
+        size: int,
+        *,
+        target: RouteTarget | None = None,
     ) -> VrpSolution | None:
-        targets = self._definition.targets(working, size)
-        if not targets:
-            return None
-        target = choose_uniformly(targets, context.random_source)
-        proposals = randomized_sample(
-            _unique_solutions(self._definition.build(working, target, size)),
-            self._candidate_limit,
-            context.random_source,
-        )
+        if target is None:
+            if self._definition is _EXCHANGE:
+                selected_target = _sample_exchange_target(
+                    working, context.random_source
+                )
+                if selected_target is None:
+                    return None
+            elif self._definition is _TWO_OPT_STAR:
+                selected_target = _sample_two_opt_star_target(
+                    working, context.random_source
+                )
+                if selected_target is None:
+                    return None
+            elif self._definition is _SWAP_STAR:
+                selected_target = _sample_swap_star_target(
+                    working, context.random_source
+                )
+                if selected_target is None:
+                    return None
+            else:
+                targets = self._definition.targets(working, size)
+                if not targets:
+                    return None
+                selected_target = choose_uniformly(targets, context.random_source)
+        else:
+            selected_target = target
+        if self._definition is _RELOCATE:
+            insertion_targets = _relocate_alternative_targets(working, selected_target)
+            proposals = tuple(
+                _build_relocate_candidate(working, selected_target, insertion_target)
+                for insertion_target in randomized_sample(
+                    insertion_targets,
+                    self._candidate_limit,
+                    context.random_source,
+                )
+            )
+        elif self._definition is _OR_OPT:
+            insertion_targets = _or_opt_alternative_targets(
+                working, selected_target, size
+            )
+            proposals = tuple(
+                _build_or_opt_candidate(
+                    working, selected_target, size, insertion_target
+                )
+                for insertion_target in randomized_sample(
+                    insertion_targets,
+                    self._candidate_limit,
+                    context.random_source,
+                )
+            )
+        elif self._definition is _SWAP_STAR:
+            insertion_pool = _swap_star_insertion_pool(working, selected_target)
+            proposals = tuple(
+                _build_swap_star_candidate(
+                    working, selected_target, insertion_pool.target_at(index)
+                )
+                for index in _sample_index_positions(
+                    insertion_pool.alternative_count,
+                    self._candidate_limit,
+                    context.random_source,
+                )
+            )
+        else:
+            built_plans = self._definition.build(working, selected_target, size)
+            proposal_plans = (
+                built_plans
+                if self._definition is _TWO_OPT
+                else _unique_solutions(built_plans)
+            )
+            proposals = randomized_sample(
+                proposal_plans,
+                self._candidate_limit,
+                context.random_source,
+            )
         alternatives: list[VrpSolution] = []
         for proposal in proposals:
             changed_stops = {
@@ -445,6 +995,80 @@ class TwoOptOperator(_RouteOrderOperator):
     """Reverse one contiguous stop subsequence at a time."""
 
     _definition = _TWO_OPT
+
+    def call(self, context: CandidateContext) -> OperatorResult:
+        """Return a randomized, duplicate-free batch of 2-opt candidates.
+
+        Each candidate starts from the supplied base and applies up to ``k``
+        sequential reversals. The first reversal target is distinct across
+        trials; the shared random source determines their order. Candidate
+        generation stops when the requested batch is full or the bounded
+        target sample is exhausted.
+
+        :param context: Base solution, size, feasibility request, RNG, and
+            maximum candidate count.
+        :returns: Up to ``context.max_candidates`` distinct proposals in
+            randomized target order.
+        :raises TypeError: If the base, context, or an assessment is malformed.
+        :raises ValueError: If ``k`` exceeds this Operator's registered limit.
+        """
+        size = validate_neighborhood_size(context.k, self._maximum_size)
+        base = require_vrp_base(context)
+        if context.ensure_feasible and not candidate_is_eligible(
+            self._instance,
+            self._objectives,
+            base,
+            ensure_feasible=True,
+            assess_plan=self._assess_plan,
+        ):
+            return OperatorResult(candidates=())
+
+        target_count = sum(
+            len(route.stops) * (len(route.stops) - 1) // 2 for route in base.routes
+        )
+        if not target_count:
+            return OperatorResult(candidates=())
+        sampled_target_count = min(
+            target_count, max(context.max_candidates, self._candidate_limit)
+        )
+        trial_targets = _sample_two_opt_targets(
+            base, sampled_target_count, context.random_source
+        )
+
+        proposals: list[CandidateProposal] = []
+        seen_solutions = [base]
+        for first_target in trial_targets:
+            working = base
+            modifications = 0
+            for move_index in range(size):
+                target = (
+                    first_target
+                    if move_index == 0
+                    else _sample_two_opt_targets(working, 1, context.random_source)[0]
+                )
+                candidate = self._apply_one(
+                    working,
+                    context,
+                    size,
+                    target=target,
+                )
+                if candidate is None:
+                    break
+                working = candidate
+                modifications += 1
+
+            if modifications == 0 or working in seen_solutions:
+                continue
+            seen_solutions.append(working)
+            proposals.append(
+                CandidateProposal(
+                    candidate=Candidate(solution=working), m=modifications
+                )
+            )
+            if len(proposals) == context.max_candidates:
+                break
+
+        return OperatorResult(candidates=tuple(proposals))
 
 
 class RelocateOperator(_RouteOrderOperator):

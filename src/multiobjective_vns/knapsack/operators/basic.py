@@ -70,7 +70,7 @@ class AddItemsOperator:
         base = require_base(context, self._instance)
         base_feasible = knapsack_is_feasible(self._instance, base)
         if context.ensure_feasible and not base_feasible:
-            return OperatorResult(m=0, candidate=None)
+            return OperatorResult(candidates=())
 
         positions = randomized_sample(
             (index for index in self._eligible_positions if base[index] == 0),

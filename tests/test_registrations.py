@@ -6,10 +6,17 @@ Author: Michel Bierlaire, EPFL
 
 import pytest
 
+from multiobjective_vns import (
+    OperatorCompositionRegistration as PublicOperatorCompositionRegistration,
+)
 from multiobjective_vns.exceptions import ComponentRegistrationError
 from multiobjective_vns.random_source import RandomSource
 from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
-from multiobjective_vns.registrations import OperatorGroup, OperatorRegistration
+from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
+    OperatorGroup,
+    OperatorRegistration,
+)
 
 
 class TestRandomSource:
@@ -28,7 +35,7 @@ class TestRandomSource:
 
 class TestOperator:
     def call(self, context: CandidateContext) -> OperatorResult:
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
 
 
 class StatefulTestOperator(TestOperator):
@@ -66,6 +73,34 @@ def test_operator_registration_exposes_declared_contract() -> None:
     assert source.random() == 0.5
     assert registration.max_neighborhood_size == 5
     assert group.operator_ids == frozenset({'swap', 'repair'})
+
+
+def test_pre_registered_composition_has_its_own_identity_and_ordered_components() -> (
+    None
+):
+    composition = OperatorCompositionRegistration(
+        operator_id='repair-after-move',
+        configuration_id='repair-after-move-v1',
+        first_operator_id='move',
+        second_operator_id='repair',
+    )
+
+    assert composition.operator_id == 'repair-after-move'
+    assert composition.configuration_id == 'repair-after-move-v1'
+    assert composition.first_operator_id == 'move'
+    assert composition.second_operator_id == 'repair'
+    assert PublicOperatorCompositionRegistration is OperatorCompositionRegistration
+
+
+def test_pre_registered_composition_allows_an_ordered_self_pair() -> None:
+    composition = OperatorCompositionRegistration(
+        operator_id='repeat',
+        configuration_id='repeat-v1',
+        first_operator_id='same',
+        second_operator_id='same',
+    )
+
+    assert composition.first_operator_id == composition.second_operator_id
 
 
 def test_invalid_operator_registration_uses_named_error() -> None:

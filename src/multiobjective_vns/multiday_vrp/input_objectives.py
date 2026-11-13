@@ -303,7 +303,7 @@ def _validate_objectives(
     events: VrpEventData,
     registry: VrpExtensionRegistry,
     filename: str,
-) -> None:
+) -> str | None:
     for objective in data.objectives:
         objective_id = objective.objective_id
         if (
@@ -339,12 +339,24 @@ def _validate_objectives(
                 column='penalty_aggregation.id',
                 reason=f'unknown penalty aggregation {objective.penalty_aggregation.id!r}',
             )
-        missing_scales = active_categories - objective.penalty_scales.keys()
+        assigned_categories = {
+            item.violation_category
+            for item in data.penalty_functions
+            if item.objective_id == objective_id and item.rule_id == ''
+        }
+        missing_scales = assigned_categories - objective.penalty_scales.keys()
         if missing_scales:
             raise VrpInputError(
                 file=filename,
                 column='penalty_scales',
-                reason=f'missing active category scale {min(missing_scales)!r}',
+                reason=f'missing assigned category scale {min(missing_scales)!r}',
+            )
+        unused_scales = objective.penalty_scales.keys() - assigned_categories
+        if unused_scales:
+            raise VrpInputError(
+                file=filename,
+                column='penalty_scales',
+                reason=f'category {min(unused_scales)!r} has no objective binding',
             )
         if objective.base_measure_id in {
             'event_count',
@@ -373,14 +385,56 @@ def _validate_objectives(
         for item in data.penalty_functions
         if item.rule_id == ''
     }
-    for objective in data.objectives:
-        for category in active_categories:
-            if (objective.objective_id, category) not in category_level:
-                raise VrpInputError(
-                    file=filename,
-                    column='penalty_functions',
-                    reason=f'objective {objective.objective_id!r} requires a category-level {category!r} binding',
-                )
+    bound_categories = {category for _, category in category_level}
+    missing_categories = active_categories - bound_categories
+    if missing_categories:
+        raise VrpInputError(
+            file=filename,
+            column='penalty_functions',
+            reason=f'active category {min(missing_categories)!r} needs an objective binding',
+        )
+
+    time_window_violation_objective_id: str | None = None
+    time_window_categories = {'early_window', 'late_window'}
+    if time_window_categories <= active_categories:
+        objectives_by_window_category = {
+            category: tuple(
+                objective_id
+                for objective_id, bound_category in category_level
+                if bound_category == category
+            )
+            for category in time_window_categories
+        }
+        early_objectives = objectives_by_window_category['early_window']
+        late_objectives = objectives_by_window_category['late_window']
+        if (
+            len(early_objectives) != 1
+            or len(late_objectives) != 1
+            or early_objectives[0] != late_objectives[0]
+        ):
+            raise VrpInputError(
+                file=filename,
+                column='penalty_functions',
+                reason=(
+                    'early_window and late_window must be assigned together to '
+                    'exactly one objective'
+                ),
+            )
+        time_window_violation_objective_id = early_objectives[0]
+        window_objective = next(
+            item
+            for item in data.objectives
+            if item.objective_id == time_window_violation_objective_id
+        )
+        if window_objective.base_measure_id != 'zero':
+            raise VrpInputError(
+                file=filename,
+                column='base_measure_id',
+                reason=(
+                    'the objective receiving early_window and late_window '
+                    'must use the zero base measure'
+                ),
+            )
     for function in data.penalty_functions:
         if function.function_id != 'linear' and not _find_registration(
             registry.penalty_functions, function.function_id
@@ -411,6 +465,7 @@ def _validate_objectives(
                     column='parameters',
                     reason='linear penalty accepts only rate',
                 )
+    return time_window_violation_objective_id
 
 
 def _active_penalty_categories(

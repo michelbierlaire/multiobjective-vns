@@ -11,7 +11,7 @@ from multiobjective_vns.callbacks import ApplicationEvaluator
 from multiobjective_vns.components import ComponentIdentity
 from multiobjective_vns.config import FeedbackSelectionMode
 from multiobjective_vns.events import AlgorithmEvent
-from multiobjective_vns.identifiers import InvocationId, SolutionId
+from multiobjective_vns.identifiers import InvocationId, ProblemInstanceId, SolutionId
 from multiobjective_vns.objectives import ObjectiveDeclaration
 from multiobjective_vns.records.policies import InvocationCounters
 from multiobjective_vns.records.results import (
@@ -19,6 +19,7 @@ from multiobjective_vns.records.results import (
     LogFinalizationResult,
     PromotedCompositionReport,
     RunLog,
+    ViewerExportScope,
 )
 from multiobjective_vns.records.state import (
     Checkpoint,
@@ -65,6 +66,19 @@ class RunLogger(ComponentIdentity, Protocol):
 
     def append(self, events: tuple[AlgorithmEvent, ...]) -> None:
         """Atomically append one complete event batch."""
+
+    def publish_view(
+        self,
+        invocation_id: InvocationId,
+        problem_instance_id: ProblemInstanceId,
+        committed_state: SearchState,
+        commit_sequence: int,
+        objective_declaration: ObjectiveDeclaration,
+        scope: ViewerExportScope,
+        is_final: bool,
+        solution_formatter: SolutionFormatter | None,
+    ) -> Path:
+        """Atomically publish one committed registry or Pareto viewer export."""
 
     def finalize(
         self,

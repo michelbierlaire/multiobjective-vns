@@ -11,6 +11,9 @@ from multiobjective_vns.records import PromotedCompositionReport as RecordsRepor
 from multiobjective_vns.records.reporting import (
     ChoiceStatistics,
     ModificationCountFrequency,
+    ObjectiveBoundCount,
+    ObjectiveBoundEventFinding,
+    ObjectiveBoundReport,
     ParetoSolutionReport,
     PromotedCompositionReport,
     ReportDiagnostic,
@@ -41,22 +44,42 @@ def test_report_diagnostic_requires_fields_for_its_kind() -> None:
         )
 
 
+def test_objective_bound_reporting_records_and_diagnostic_are_structured() -> None:
+    report = ObjectiveBoundReport('cost', '10')
+    finding = ObjectiveBoundEventFinding('cost', '12', '10')
+    count = ObjectiveBoundCount('cost', 3)
+    diagnostic = ReportDiagnostic(
+        kind=ReportDiagnosticKind.OBJECTIVE_BOUND_FORMAT_FAILURE,
+        source='cost-component',
+        solution_id=None,
+        objective_id='cost',
+        reason='configured bound formatting failed',
+    )
+
+    assert report.formatted_upper_bound == '10'
+    assert finding.objective_value == '12'
+    assert count.count == 3
+    assert diagnostic.kind is ReportDiagnosticKind.OBJECTIVE_BOUND_FORMAT_FAILURE
+
+
 def test_choice_statistics_record_attempts_and_modification_counts() -> None:
     statistics = ChoiceStatistics(
         choice_id=ChoiceId.for_operator('swap'),
         k=2,
         modification_count_definition='number of changed item decisions',
         attempt_count=2,
-        archive_admission_count=1,
-        archive_reward_total=0.75,
+        candidate_count=3,
+        admitting_attempt_count=1,
+        archive_admission_count=2,
         modification_count_frequencies=(
             ModificationCountFrequency(m=0, count=1),
-            ModificationCountFrequency(m=2, count=1),
+            ModificationCountFrequency(m=2, count=3),
         ),
     )
 
     assert statistics.admission_rate == 0.5
-    assert statistics.archive_reward_rate == 0.375
+    assert statistics.candidate_count == 3
+    assert statistics.archive_admission_count == 2
     assert ParetoSolutionReport(SolutionId(1), (3, 7), 'sample').description == 'sample'
 
 

@@ -7,6 +7,7 @@ Author: Michel Bierlaire, EPFL
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cmp_to_key
 
 from multiobjective_vns.identifiers import ObjectiveId
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
@@ -14,6 +15,8 @@ from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
     choose_uniformly,
     operator_result,
+    randomized_order,
+    randomized_sample,
     require_vrp_base,
     validate_neighborhood_size,
 )
@@ -22,16 +25,18 @@ from multiobjective_vns.multiday_vrp.operators.feature_common import (
     objective_position,
 )
 from multiobjective_vns.multiday_vrp.operators.personnel_features import (
-    _eligible_teams,
+    _eligible_teams_for_route,
     _seat_feasible,
 )
 from multiobjective_vns.multiday_vrp.operators.personnel_repair_support import (
     DutyTarget,
     PersonnelRepairMode,
     RepairTarget,
-    qualified_drivers,
+    _continuity_index,
+    _ContinuityIndex,
+    _staff_continuity_replacement_compatible,
     repair_score,
-    skill_violations,
+    restricted_calendar_people,
 )
 from multiobjective_vns.multiday_vrp.operators.personnel_repair_targets import (
     select_targets,
@@ -41,7 +46,13 @@ from multiobjective_vns.multiday_vrp.solution import (
     VrpSolution,
 )
 from multiobjective_vns.objectives import ObjectiveComparison, ObjectiveDeclaration
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.random_source import RandomSource
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.values import require_integer
 
@@ -84,6 +95,14 @@ class PersonnelRepairOperator:
         '_objective_position',
         '_maximum_size',
         '_candidate_limit',
+        '_qualified_drivers_by_vehicle',
+        '_qualified_driver_sets_by_vehicle',
+        '_seat_capacity_by_vehicle',
+        '_restricted_personnel_ids',
+        '_personnel_ids',
+        '_qualifications_by_person',
+        '_minimum_team_size_by_intervention',
+        '_required_qualifications_by_intervention',
     )
 
     def __init__(
@@ -126,6 +145,46 @@ class PersonnelRepairOperator:
         )
         if self._candidate_limit > 32:
             raise ValueError('max_candidate_alternatives must be at most 32')
+        self._qualified_drivers_by_vehicle = _qualified_driver_index(instance)
+        self._qualified_driver_sets_by_vehicle = {
+            vehicle_id: frozenset(person_ids)
+            for vehicle_id, person_ids in self._qualified_drivers_by_vehicle.items()
+        }
+        self._seat_capacity_by_vehicle = {
+            item.vehicle_id: item.seat_capacity for item in instance.fleet_data.vehicles
+        }
+        self._personnel_ids = tuple(
+            sorted(person.person_id for person in instance.personnel_data.personnel)
+        )
+        qualifications_by_person: dict[str, set[str]] = {}
+        for (
+            qualification
+        ) in instance.personnel_data.personnel_intervention_qualifications:
+            qualifications_by_person.setdefault(qualification.person_id, set()).add(
+                qualification.qualification_id
+            )
+        self._qualifications_by_person = {
+            person_id: frozenset(qualifications)
+            for person_id, qualifications in qualifications_by_person.items()
+        }
+        self._minimum_team_size_by_intervention = {
+            item.intervention_id: item.minimum_team_size
+            for item in instance.intervention_data.interventions
+        }
+        required_qualifications: dict[str, set[str]] = {}
+        for item in instance.intervention_data.intervention_qualifications_required:
+            required_qualifications.setdefault(item.intervention_id, set()).add(
+                item.qualification_id
+            )
+        self._required_qualifications_by_intervention = {
+            intervention_id: frozenset(qualifications)
+            for intervention_id, qualifications in required_qualifications.items()
+        }
+        self._restricted_personnel_ids = (
+            restricted_calendar_people(instance)
+            if mode == 'availability'
+            else frozenset()
+        )
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Change up to ``k`` person-duty assignments and return a full plan."""
@@ -134,44 +193,127 @@ class PersonnelRepairOperator:
         working = base
         working_evaluation = self._stored_base_evaluation(context, base)
         completed_targets: set[DutyTarget] = set()
+        completed_skill_routes: set[int] = set()
         exhausted_targets: set[DutyTarget] = set()
         modifications = 0
+        assessed_alternatives = 0
+        availability_alternatives: tuple[_Alternative, ...] = ()
+        continuity_alternatives: tuple[_Alternative, ...] = ()
+        work_rule_alternatives: tuple[_Alternative, ...] = ()
 
         while modifications < size:
             if working_evaluation is None:
                 working_evaluation = self._assess(working)
+            continuity = (
+                _continuity_index(self._instance, working)
+                if self._mode == 'staff_continuity'
+                else None
+            )
             targets = tuple(
                 target
-                for target in self._targets(working, working_evaluation)
-                if target.duty not in completed_targets
+                for target in self._targets(
+                    working,
+                    working_evaluation,
+                    continuity_index=continuity,
+                    random_source=context.random_source,
+                )
+                if (
+                    target.duty.route_index not in completed_skill_routes
+                    if self._mode == 'skill_guided'
+                    else target.duty not in completed_targets
+                )
                 and target.duty not in exhausted_targets
             )
             if not targets:
                 break
             target = choose_uniformly(targets, context.random_source)
-            alternatives = self._replacement_alternatives(working, target.duty, context)
+            remaining_steps = size - modifications
+            remaining_budget = self._candidate_limit - assessed_alternatives
+            if remaining_budget <= 0:
+                break
+            per_step_limit = max(1, remaining_budget // remaining_steps)
+            alternatives = self._replacement_alternatives(
+                working,
+                target.duty,
+                context,
+                max_alternatives=per_step_limit,
+                continuity_index=continuity,
+            )
             if not alternatives:
                 exhausted_targets.add(target.duty)
                 continue
 
+            assessed_alternatives += len(alternatives)
             evaluated = self._assess_alternatives(alternatives)
-            evaluated = self._keep_improving_alternatives(
-                evaluated, target, working, working_evaluation
-            )
             if not evaluated:
                 exhausted_targets.add(target.duty)
                 continue
 
-            selected = self._select_alternative(evaluated, target, context)
+            if self._mode in {'availability', 'staff_continuity'}:
+                eligible = evaluated
+                if context.ensure_feasible:
+                    feasible = tuple(
+                        item for item in eligible if item.evaluation.feasible is True
+                    )
+                    if feasible:
+                        eligible = feasible
+                if self._mode == 'availability':
+                    availability_alternatives = self._order_objective_alternatives(
+                        eligible, context
+                    )
+                    selected = availability_alternatives[0]
+                else:
+                    continuity_alternatives = (
+                        self._order_objective_alternatives(eligible, context)
+                        if self._objective_position is not None
+                        else randomized_order(eligible, context.random_source)
+                    )
+                    selected = continuity_alternatives[0]
+            elif self._mode == 'work_rule':
+                work_rule_alternatives = self._order_work_rule_alternatives(
+                    evaluated, target, context
+                )
+                selected = work_rule_alternatives[0]
+            else:
+                selected = self._select_alternative(evaluated, context)
             working = selected.solution
             working_evaluation = selected.evaluation
-            completed_targets.add(target.duty)
+            if self._mode == 'skill_guided':
+                completed_skill_routes.add(target.duty.route_index)
+            else:
+                completed_targets.add(target.duty)
             modifications += 1
 
         if modifications == 0 or working_evaluation is None:
             return operator_result(None, modifications=0, requested_size=size)
         if context.ensure_feasible and working_evaluation.feasible is not True:
             return operator_result(None, modifications=0, requested_size=size)
+        if self._mode == 'availability':
+            return OperatorResult(
+                candidates=tuple(
+                    CandidateProposal(Candidate(item.solution), modifications)
+                    for item in availability_alternatives[: context.max_candidates]
+                )
+            )
+        if self._mode == 'staff_continuity':
+            return OperatorResult(
+                candidates=tuple(
+                    CandidateProposal(Candidate(item.solution), modifications)
+                    for item in continuity_alternatives[: context.max_candidates]
+                )
+            )
+        if self._mode == 'work_rule':
+            qualifying = work_rule_alternatives
+            if context.ensure_feasible:
+                qualifying = tuple(
+                    item for item in qualifying if item.evaluation.feasible is True
+                )
+            return OperatorResult(
+                candidates=tuple(
+                    CandidateProposal(Candidate(item.solution), modifications)
+                    for item in qualifying[: context.max_candidates]
+                )
+            )
         return operator_result(
             working,
             modifications=modifications,
@@ -200,9 +342,45 @@ class PersonnelRepairOperator:
         self,
         solution: VrpSolution,
         evaluation: ApplicationEvaluation | None,
+        *,
+        continuity_index: _ContinuityIndex | None = None,
+        random_source: RandomSource | None = None,
     ) -> tuple[RepairTarget, ...]:
+        if self._mode == 'skill_guided':
+            violating = tuple(
+                index
+                for index, route in enumerate(solution.routes)
+                if route.driver_id
+                not in self._qualified_driver_sets_by_vehicle[route.vehicle_id]
+            )
+            if violating:
+                route_indices = violating
+            elif solution.routes:
+                counts = tuple(
+                    len(self._qualified_drivers_by_vehicle[route.vehicle_id])
+                    for route in solution.routes
+                )
+                minimum = min(counts)
+                route_indices = tuple(
+                    index for index, count in enumerate(counts) if count == minimum
+                )
+            else:
+                route_indices = ()
+            return tuple(
+                RepairTarget(
+                    DutyTarget(index, solution.routes[index].driver_id, 'driver')
+                )
+                for index in route_indices
+            )
         return select_targets(
-            self._instance, self._mode, solution, evaluation, self._objective_id
+            self._instance,
+            self._mode,
+            solution,
+            evaluation,
+            self._objective_id,
+            restricted_personnel_ids=self._restricted_personnel_ids,
+            continuity_index=continuity_index,
+            random_source=random_source,
         )
 
     def _replacement_alternatives(
@@ -210,23 +388,35 @@ class PersonnelRepairOperator:
         solution: VrpSolution,
         duty: DutyTarget,
         context: CandidateContext,
+        *,
+        max_alternatives: int | None = None,
+        continuity_index: _ContinuityIndex | None = None,
     ) -> tuple[VrpSolution, ...]:
+        candidate_limit = (
+            self._candidate_limit
+            if max_alternatives is None
+            else min(self._candidate_limit, max_alternatives)
+        )
+        if candidate_limit < 1:
+            return ()
         route = solution.routes[duty.route_index]
-        replace_team = self._mode != 'skill_guided'
+        continuity = continuity_index
+        if self._mode == 'staff_continuity' and continuity is None:
+            continuity = _continuity_index(self._instance, solution)
+        replace_team = duty.role == 'team'
         affected_stops = tuple(
             stop_index
             for stop_index, stop in enumerate(route.stops)
             if replace_team
             and type(stop) is ActivityStop
             and duty.person_id in stop.team_member_ids
+            and (duty.activity_ref is None or stop.activity_ref == duty.activity_ref)
         )
 
         if duty.role == 'driver':
             driver_options = tuple(
                 person_id
-                for person_id in qualified_drivers(
-                    self._instance, solution, duty.route_index
-                )
+                for person_id in self._qualified_drivers_by_vehicle[route.vehicle_id]
                 if person_id != duty.person_id
             )
         else:
@@ -235,14 +425,21 @@ class PersonnelRepairOperator:
             return ()
 
         team_domains: list[tuple[int, tuple[frozenset[str], ...]]] = []
+        affected_stop_set = frozenset(affected_stops)
+        unchanged_crew = {route.driver_id}
+        for stop_index, stop in enumerate(route.stops):
+            if stop_index not in affected_stop_set and type(stop) is ActivityStop:
+                unchanged_crew.update(stop.team_member_ids)
         for stop_index in affected_stops:
             stop = route.stops[stop_index]
             assert type(stop) is ActivityStop
-            teams = _eligible_teams(
-                self._instance,
-                stop.activity_ref.activity_id,
+            teams = self._replacement_team_options(
+                stop,
+                duty.person_id,
+                frozenset(unchanged_crew),
+                self._seat_capacity_by_vehicle[route.vehicle_id],
                 random_source=context.random_source,
-                max_samples=max(64, self._candidate_limit * 16),
+                max_candidates=candidate_limit,
             )
             alternatives = tuple(
                 team
@@ -255,7 +452,31 @@ class PersonnelRepairOperator:
 
         result: list[VrpSolution] = []
         seen: set[tuple[str, tuple[tuple[int, tuple[str, ...]], ...]]] = set()
-        attempt_limit = max(self._candidate_limit * 32, self._candidate_limit)
+        if self._mode == 'skill_guided':
+            team_members = {
+                person_id
+                for stop in route.stops
+                if type(stop) is ActivityStop
+                for person_id in stop.team_member_ids
+            }
+            seat_capacity = self._seat_capacity_by_vehicle[route.vehicle_id]
+            seat_feasible_drivers = tuple(
+                person_id
+                for person_id in driver_options
+                if len(team_members | {person_id}) <= seat_capacity
+            )
+            sampled_drivers = randomized_sample(
+                seat_feasible_drivers,
+                min(candidate_limit, len(seat_feasible_drivers)),
+                context.random_source,
+            )
+            for driver_id in sampled_drivers:
+                routes = list(solution.routes)
+                routes[duty.route_index] = replace(route, driver_id=driver_id)
+                result.append(replace(solution, routes=tuple(routes)))
+            return tuple(result)
+
+        attempt_limit = max(candidate_limit * 32, candidate_limit)
         for _ in range(attempt_limit):
             driver_id = choose_uniformly(driver_options, context.random_source)
             team_changes = tuple(
@@ -288,10 +509,52 @@ class PersonnelRepairOperator:
                 self._instance, candidate, duty.route_index
             ):
                 continue
+            if self._mode == 'staff_continuity':
+                assert continuity is not None
+                if not _staff_continuity_replacement_compatible(
+                    self._instance,
+                    solution,
+                    candidate,
+                    duty,
+                    continuity,
+                ):
+                    continue
             result.append(candidate)
-            if len(result) >= self._candidate_limit:
+            if len(result) >= candidate_limit:
                 break
         return tuple(result)
+
+    def _replacement_team_options(
+        self,
+        stop: ActivityStop,
+        person_id: str,
+        unchanged_crew: frozenset[str],
+        seat_capacity: int,
+        *,
+        random_source: RandomSource,
+        max_candidates: int,
+    ) -> tuple[frozenset[str], ...]:
+        intervention_id = stop.activity_ref.activity_id
+        minimum_team_size = self._minimum_team_size_by_intervention.get(intervention_id)
+        if minimum_team_size is None:
+            return ()
+        people = tuple(
+            candidate for candidate in self._personnel_ids if candidate != person_id
+        )
+        return _eligible_teams_for_route(
+            minimum_team_size,
+            self._required_qualifications_by_intervention.get(
+                intervention_id, frozenset()
+            ),
+            people,
+            self._qualifications_by_person,
+            unchanged_crew,
+            seat_capacity,
+            stop.team_member_ids,
+            random_source=random_source,
+            max_candidates=max_candidates,
+            max_samples=max(64, max_candidates * 16),
+        )
 
     def _assess_alternatives(
         self, alternatives: tuple[VrpSolution, ...]
@@ -303,44 +566,17 @@ class PersonnelRepairOperator:
                 result.append(_Alternative(candidate, evaluation))
         return tuple(result)
 
-    def _keep_improving_alternatives(
+    def _repair_score(
         self,
-        alternatives: tuple[_Alternative, ...],
+        solution: VrpSolution,
+        evaluation: ApplicationEvaluation | None,
         target: RepairTarget,
-        current_solution: VrpSolution,
-        current: ApplicationEvaluation | None,
-    ) -> tuple[_Alternative, ...]:
-        if not alternatives:
-            return ()
-        if self._mode == 'availability':
-            return alternatives
-        if self._mode == 'work_rule' and target.finding is None:
-            return alternatives
-        current_score = repair_score(
-            self._instance, self._mode, current_solution, current, target
-        )
-        scored = tuple(
-            (
-                item,
-                repair_score(
-                    self._instance, self._mode, item.solution, item.evaluation, target
-                ),
-            )
-            for item in alternatives
-        )
-        best = min(score for _, score in scored)
-        if best < current_score:
-            return tuple(item for item, score in scored if score == best)
-        if self._mode == 'skill_guided' and not skill_violations(
-            self._instance, current_solution
-        ):
-            return alternatives
-        return ()
+    ) -> float:
+        return repair_score(self._instance, self._mode, solution, evaluation, target)
 
     def _select_alternative(
         self,
         alternatives: tuple[_Alternative, ...],
-        target: RepairTarget,
         context: CandidateContext,
     ) -> _Alternative:
         ranked = alternatives
@@ -350,28 +586,61 @@ class PersonnelRepairOperator:
             )
             if feasible:
                 ranked = feasible
-        if self._mode in {'skill_guided', 'staff_continuity', 'work_rule'}:
-            scores = tuple(
-                repair_score(
-                    self._instance, self._mode, item.solution, item.evaluation, target
-                )
-                for item in ranked
-            )
-            best_score = min(scores)
-            ranked = tuple(
-                item
-                for item, score in zip(ranked, scores, strict=True)
-                if score == best_score
-            )
         if self._objective_position is not None and len(ranked) > 1:
             ranked = self._best_by_objective(ranked)
         return choose_uniformly(ranked, context.random_source)
+
+    def _order_work_rule_alternatives(
+        self,
+        alternatives: tuple[_Alternative, ...],
+        target: RepairTarget,
+        context: CandidateContext,
+    ) -> tuple[_Alternative, ...]:
+        feasible = tuple(
+            item for item in alternatives if item.evaluation.feasible is True
+        )
+        infeasible = tuple(
+            item for item in alternatives if item.evaluation.feasible is not True
+        )
+        ordered_feasible = (
+            self._order_objective_alternatives(feasible, context) if feasible else ()
+        )
+        if target.finding is None:
+            ordered_infeasible = randomized_order(infeasible, context.random_source)
+        else:
+            scored = tuple(
+                (
+                    item,
+                    self._repair_score(item.solution, item.evaluation, target),
+                )
+                for item in infeasible
+            )
+            ranked = sorted(scored, key=lambda pair: pair[1])
+            ordered: list[_Alternative] = []
+            group_start = 0
+            while group_start < len(ranked):
+                group_end = group_start + 1
+                while (
+                    group_end < len(ranked)
+                    and ranked[group_end][1] == ranked[group_start][1]
+                ):
+                    group_end += 1
+                ordered.extend(
+                    randomized_order(
+                        tuple(item for item, _score in ranked[group_start:group_end]),
+                        context.random_source,
+                    )
+                )
+                group_start = group_end
+            ordered_infeasible = tuple(ordered)
+        return (*ordered_feasible, *ordered_infeasible)
 
     def _best_by_objective(
         self, alternatives: tuple[_Alternative, ...]
     ) -> tuple[_Alternative, ...]:
         assert self._objective_position is not None
-        objective = self._objectives.objectives[self._objective_position]
+        objective_position = self._objective_position
+        objective = self._objectives.objectives[objective_position]
         best = alternatives[0]
         tied = [best]
         for candidate in alternatives[1:]:
@@ -389,3 +658,76 @@ class PersonnelRepairOperator:
             elif comparison is ObjectiveComparison.EQUAL:
                 tied.append(candidate)
         return tuple(tied)
+
+    def _order_objective_alternatives(
+        self,
+        alternatives: tuple[_Alternative, ...],
+        context: CandidateContext,
+    ) -> tuple[_Alternative, ...]:
+        assert self._objective_position is not None
+        objective_position = self._objective_position
+        objective = self._objectives.objectives[objective_position]
+
+        def compare(left: _Alternative, right: _Alternative) -> int:
+            left_values = left.evaluation.objective_values
+            right_values = right.evaluation.objective_values
+            if left_values is None or right_values is None:
+                raise ValueError('valid VRP assessment requires objective values')
+            result = objective.compare(
+                left_values[objective_position],
+                right_values[objective_position],
+            )
+            if result is ObjectiveComparison.LESS:
+                return -1
+            if result is ObjectiveComparison.GREATER:
+                return 1
+            return 0
+
+        ranked = sorted(alternatives, key=cmp_to_key(compare))
+        ordered: list[_Alternative] = []
+        group_start = 0
+        while group_start < len(ranked):
+            group_end = group_start + 1
+            while (
+                group_end < len(ranked)
+                and compare(ranked[group_start], ranked[group_end]) == 0
+            ):
+                group_end += 1
+            ordered.extend(
+                randomized_order(ranked[group_start:group_end], context.random_source)
+            )
+            group_start = group_end
+        return tuple(ordered)
+
+
+def _qualified_driver_index(instance: LoadedVrpInstance) -> dict[str, tuple[str, ...]]:
+    """Build each vehicle's stable list of authorized, skill-qualified drivers."""
+    required_by_vehicle: dict[str, set[str]] = {
+        vehicle.vehicle_id: set() for vehicle in instance.fleet_data.vehicles
+    }
+    for vehicle_skill in instance.fleet_data.vehicle_driving_skills:
+        required_by_vehicle.setdefault(vehicle_skill.vehicle_id, set()).add(
+            vehicle_skill.skill_id
+        )
+
+    skills_by_person: dict[str, set[str]] = {}
+    for person_skill in instance.personnel_data.personnel_driving_skills:
+        skills_by_person.setdefault(person_skill.person_id, set()).add(
+            person_skill.skill_id
+        )
+
+    authorized_people = tuple(
+        sorted(
+            person.person_id
+            for person in instance.personnel_data.personnel
+            if person.authorized_driver
+        )
+    )
+    return {
+        vehicle_id: tuple(
+            person_id
+            for person_id in authorized_people
+            if required <= skills_by_person.get(person_id, set())
+        )
+        for vehicle_id, required in required_by_vehicle.items()
+    }

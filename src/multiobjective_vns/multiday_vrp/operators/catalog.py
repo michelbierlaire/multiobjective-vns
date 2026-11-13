@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
 from multiobjective_vns.callbacks import Operator
+from multiobjective_vns.candidate_batch import CandidateBatchAdapter
 from multiobjective_vns.identifiers import (
     ObjectiveId,
     ProblemInstanceId,
     identifier_text,
 )
+from multiobjective_vns.multiday_vrp.identity import VrpSolutionIdentity
 from multiobjective_vns.multiday_vrp.input_records import (
     LoadedVrpInstance,
     VrpFeatureId,
@@ -86,11 +88,35 @@ from multiobjective_vns.multiday_vrp.operators.schedule_features import (
 from multiobjective_vns.multiday_vrp.operators.service_coverage import (
     ServiceCoverageChangeOperator,
 )
+from multiobjective_vns.multiday_vrp.operators.service_window_cluster import (
+    WindowCompatiblePackageClusterReassignmentOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_ejection_chain import (
+    WindowPrioritizedEjectionChainConsolidationOperator,
+)
 from multiobjective_vns.multiday_vrp.operators.service_window_regret import (
     TimeWindowRegretBasedReinsertionOperator,
 )
 from multiobjective_vns.multiday_vrp.operators.service_window_repair import (
     TimeWindowFocusedDestroyRepairOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_route_cluster import (
+    SpatialTimeWindowRouteClusterRebuildOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_schedule import (
+    TimeWindowScheduleComplianceOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_structural import (
+    SlackGuidedOrOptRelocationOperator,
+    WindowFeasibleSwapStarOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_tour import (
+    ObjectiveGuidedBacktrackingTourConstructionOperator,
+    ObjectiveGuidedFeasibleDeliveryEdgeExchangeOperator,
+    ObjectiveGuidedTourRegretInsertionOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.spatial_strip_sweep import (
+    DaganzoStripSweepRouteRebuildOperator,
 )
 from multiobjective_vns.multiday_vrp.operators.timing import TimingAdjustmentOperator
 from multiobjective_vns.multiday_vrp.operators.tool_capacity import (
@@ -117,13 +143,17 @@ from multiobjective_vns.multiday_vrp.operators.vehicle_route_split import (
     VehicleRouteSplitOperator,
 )
 from multiobjective_vns.objectives import ObjectiveDeclaration
-from multiobjective_vns.registrations import OperatorRegistration
+from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
+    OperatorRegistration,
+)
 from multiobjective_vns.values import FiniteReal, finite_real, require_integer
 
 VrpOperatorSpecId: TypeAlias = str
 _TargetMode: TypeAlias = Literal['independent', 'objective', 'both']
 
 __all__ = [
+    'VrpOperatorCatalog',
     'VrpOperatorCatalogSettings',
     'VrpOperatorId',
     'VrpOperatorSpecId',
@@ -172,6 +202,7 @@ class VrpOperatorCatalogSettings:
     :param time_step: Positive step used by timing Operators.
     :param objective_targets: Unique selected objective IDs, or ``None`` for all.
     :param max_candidate_alternatives: Complete alternatives assessed per move.
+    :param max_ejection_chain_depth: Maximum displaced units in a consolidation chain.
     :param max_paths_per_leg: Maximum sampled paths for one leg endpoint pair.
     :param max_arc_expansion_steps: Search bound for a sampled path.
     """
@@ -180,6 +211,7 @@ class VrpOperatorCatalogSettings:
     time_step: FiniteReal = 1.0
     objective_targets: tuple[ObjectiveId, ...] | None = None
     max_candidate_alternatives: int = 32
+    max_ejection_chain_depth: int = 3
     max_paths_per_leg: int = 32
     max_arc_expansion_steps: int = 10000
 
@@ -201,12 +233,39 @@ class VrpOperatorCatalogSettings:
             require_integer(value, name=name, minimum=1)
             if value > maximum:
                 raise ValueError(f'{name} must be at most {maximum}')
+        require_integer(
+            self.max_ejection_chain_depth,
+            name='max_ejection_chain_depth',
+            minimum=1,
+        )
         if self.objective_targets is not None:
             if type(self.objective_targets) is not tuple:
                 raise TypeError('objective_targets must be a tuple or None')
             texts = tuple(identifier_text(value) for value in self.objective_targets)
             if len(set(texts)) != len(texts):
                 raise ValueError('objective_targets must be unique')
+
+
+@dataclass(frozen=True, slots=True)
+class VrpOperatorCatalog:
+    """Ordinary VRP Operators and composites prepared before search."""
+
+    operators: tuple[OperatorRegistration, ...]
+    pre_registered_compositions: tuple[OperatorCompositionRegistration, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operators, tuple) or any(
+            not isinstance(item, OperatorRegistration) for item in self.operators
+        ):
+            raise TypeError('operators must be a tuple of OperatorRegistration')
+        if not isinstance(self.pre_registered_compositions, tuple) or any(
+            not isinstance(item, OperatorCompositionRegistration)
+            for item in self.pre_registered_compositions
+        ):
+            raise TypeError(
+                'pre_registered_compositions must be a tuple of '
+                'OperatorCompositionRegistration'
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,18 +330,36 @@ _SPECS: tuple[_Specification, ...] = (
         'number of free-insertion exchanges',
     ),
     _Specification(
-        'vrp.generic.vehicle_route_consolidation',
+        'vrp.generic.vehicle_route_consolidation_best_insertion',
         'both',
         (),
-        (),
+        ('variable_active_vehicle_count', 'multi_day_planning'),
         False,
         'number of vehicle-day route records removed',
         True,
     ),
     _Specification(
-        'vrp.generic.vehicle_elimination_destroy_and_repair',
+        'vrp.generic.vehicle_route_consolidation_regret_insertion',
         'both',
         (),
+        ('variable_active_vehicle_count', 'multi_day_planning'),
+        False,
+        'number of vehicle-day route records removed',
+        True,
+    ),
+    _Specification(
+        'vrp.generic.vehicle_elimination_best_insertion',
+        'both',
+        ('variable_active_vehicle_count',),
+        (),
+        False,
+        'number of vehicle IDs eliminated',
+        True,
+    ),
+    _Specification(
+        'vrp.generic.vehicle_elimination_regret_insertion',
+        'both',
+        ('variable_active_vehicle_count',),
         (),
         False,
         'number of vehicle IDs eliminated',
@@ -292,7 +369,7 @@ _SPECS: tuple[_Specification, ...] = (
         'vrp.generic.vehicle_route_split',
         'both',
         (),
-        (),
+        ('variable_active_vehicle_count', 'multi_day_planning'),
         False,
         'number of vehicle-day route records created',
         True,
@@ -544,6 +621,15 @@ _SPECS: tuple[_Specification, ...] = (
         uses_time_step=True,
     ),
     _Specification(
+        'vrp.service_windows.schedule_compliance_repair',
+        'objective',
+        ('restrictive_service_windows',),
+        (),
+        False,
+        'number of route start-time and pre-service-wait fields changed',
+        uses_time_step=True,
+    ),
+    _Specification(
         'vrp.service_windows.activity_relocation',
         'objective',
         ('restrictive_service_windows',),
@@ -577,6 +663,86 @@ _SPECS: tuple[_Specification, ...] = (
         (),
         False,
         'number of time-windowed service units relocated',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.short_tour_regret_insertion',
+        'objective',
+        ('restrictive_service_windows', 'package_pickup_delivery'),
+        (),
+        False,
+        'number of delivery stops whose tour positions changed',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.backtracking_tour_insertion',
+        'objective',
+        ('restrictive_service_windows', 'package_pickup_delivery'),
+        (),
+        False,
+        'number of delivery positions changed in the reconstructed route',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.window_feasible_delivery_edge_exchange',
+        'objective',
+        ('restrictive_service_windows', 'package_pickup_delivery'),
+        (),
+        False,
+        'number of delivery stops changed by an edge-exchange move',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.window_compatible_package_cluster_reassignment',
+        'both',
+        ('restrictive_service_windows',),
+        (),
+        False,
+        'number of package-chain repair units reassigned',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.spatial_time_window_route_cluster_rebuild',
+        'both',
+        ('restrictive_service_windows', 'package_pickup_delivery'),
+        (),
+        False,
+        'number of selected customer groups with a package-chain reassignment',
+    ),
+    _Specification(
+        'vrp.service_windows.slack_guided_or_opt_relocation',
+        'both',
+        ('restrictive_service_windows',),
+        (),
+        False,
+        'number of stop occurrences moved in the selected block',
+        True,
+    ),
+    _Specification(
+        'vrp.spatial.daganzo_strip_sweep_route_rebuild',
+        'both',
+        ('planar_node_coordinates', 'package_pickup_delivery'),
+        (),
+        False,
+        'number of selected routes whose package assignment, delivery order, or path changed',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.window_feasible_swap_star',
+        'both',
+        ('restrictive_service_windows',),
+        (),
+        False,
+        'number of repair-unit pair exchanges completed',
+        True,
+    ),
+    _Specification(
+        'vrp.service_windows.ejection_chain_route_consolidation',
+        'both',
+        ('restrictive_service_windows',),
+        (),
+        False,
+        'number of source vehicle-day route records removed',
         True,
     ),
     _Specification(
@@ -759,6 +925,22 @@ _SPECS: tuple[_Specification, ...] = (
     ),
 )
 
+_WINDOW_OBJECTIVE_SPEC_IDS = frozenset(
+    {
+        'vrp.service_windows.schedule_compliance_repair',
+        'vrp.service_windows.activity_relocation',
+        'vrp.service_windows.route_leg_rerouting',
+        'vrp.service_windows.destroy_and_repair',
+        'vrp.service_windows.regret_based_reinsertion',
+        'vrp.service_windows.short_tour_regret_insertion',
+        'vrp.service_windows.backtracking_tour_insertion',
+        'vrp.service_windows.window_feasible_delivery_edge_exchange',
+        'vrp.service_windows.slack_guided_or_opt_relocation',
+        'vrp.service_windows.window_feasible_swap_star',
+        'vrp.service_windows.ejection_chain_route_consolidation',
+    }
+)
+
 
 def build_default_vrp_operator_catalog(
     instance: LoadedVrpInstance,
@@ -769,7 +951,7 @@ def build_default_vrp_operator_catalog(
     additive_path_costs: Mapping[ObjectiveId, AdditivePathCostRegistration]
     | None = None,
     settings: VrpOperatorCatalogSettings = VrpOperatorCatalogSettings(),
-) -> tuple[OperatorRegistration, ...]:
+) -> VrpOperatorCatalog:
     """Build deterministic registrations for the implemented default VRP catalog.
 
     :param instance: Validated, normalized VRP application data.
@@ -778,7 +960,7 @@ def build_default_vrp_operator_catalog(
     :param assess_plan: Shared complete-plan assessment callback.
     :param additive_path_costs: Optional objective-specific additive path callbacks.
     :param settings: Catalog limits and selected objective targets.
-    :returns: Ordered stateless Operator registrations.
+    :returns: Ordinary registrations and pre-registered composite Operators.
     :raises TypeError: If inputs or setting records have unsupported types.
     :raises ValueError: If IDs, targets, registrations, or active catalog coverage
         are inconsistent.
@@ -791,6 +973,7 @@ def build_default_vrp_operator_catalog(
         raise TypeError('assess_plan must be callable')
     if not isinstance(settings, VrpOperatorCatalogSettings):
         raise TypeError('settings must be VrpOperatorCatalogSettings')
+    solution_identity = VrpSolutionIdentity(instance)
     instance_text = identifier_text(problem_instance_id)
     objective_by_text = {
         identifier_text(objective.objective_id): objective.objective_id
@@ -815,6 +998,15 @@ def build_default_vrp_operator_catalog(
     for spec in _SPECS:
         if not _spec_is_active(spec, active_features):
             continue
+        if spec.spec_id in _WINDOW_OBJECTIVE_SPEC_IDS:
+            window_objective_id = instance.time_window_violation_objective_id
+            if window_objective_id is None:
+                continue
+            if identifier_text(window_objective_id) not in objective_by_text:
+                raise ValueError(
+                    'the instance time-window objective must appear in '
+                    'objective_declaration'
+                )
         applicable_objectives = _applicable_objectives(
             spec,
             instance,
@@ -840,12 +1032,122 @@ def build_default_vrp_operator_catalog(
                     instance_text,
                     settings,
                     callbacks,
+                    solution_identity,
                 )
             )
     texts = tuple(identifier_text(item.operator_id) for item in registrations)
     if len(texts) != len(set(texts)):
         raise ValueError('generated Operator IDs and text forms must be unique')
-    return tuple(registrations)
+    registrations_by_id = {item.operator_id: item for item in registrations}
+    compositions: list[OperatorCompositionRegistration] = []
+    if 'restrictive_service_windows' in active_features:
+        two_opt_registration = registrations_by_id.get(
+            VrpOperatorId('vrp.generic.two_opt', None)
+        )
+        if two_opt_registration is not None:
+            for objective_id in (None, *selected_objectives):
+                cluster_registration = registrations_by_id.get(
+                    VrpOperatorId(
+                        'vrp.service_windows.spatial_time_window_route_cluster_rebuild',
+                        objective_id,
+                    )
+                )
+                if cluster_registration is None:
+                    continue
+                composite_spec_id = (
+                    'vrp.composite.spatial_time_window_route_cluster_rebuild_'
+                    'then_two_opt'
+                )
+                composite_id = VrpOperatorId(composite_spec_id, objective_id)
+                objective_text = (
+                    None if objective_id is None else identifier_text(objective_id)
+                )
+                configuration_values = (
+                    'vrp-pre-registered-composite-v1',
+                    composite_spec_id,
+                    objective_text,
+                    instance_text,
+                    identifier_text(cluster_registration.operator_id),
+                    identifier_text(cluster_registration.configuration_id),
+                    identifier_text(two_opt_registration.operator_id),
+                    identifier_text(two_opt_registration.configuration_id),
+                    settings.max_neighborhood_size,
+                    settings.max_candidate_alternatives,
+                )
+                compositions.append(
+                    OperatorCompositionRegistration(
+                        operator_id=composite_id,
+                        configuration_id='vrp-composition-config:'
+                        + json.dumps(
+                            configuration_values,
+                            ensure_ascii=True,
+                            separators=(',', ':'),
+                        ),
+                        first_operator_id=cluster_registration.operator_id,
+                        second_operator_id=two_opt_registration.operator_id,
+                    )
+                )
+        composite_families = (
+            (
+                'vrp.composite.vehicle_route_consolidation_best_then_window_repair',
+                'vrp.generic.vehicle_route_consolidation_best_insertion',
+            ),
+            (
+                'vrp.composite.vehicle_route_consolidation_regret_then_window_repair',
+                'vrp.generic.vehicle_route_consolidation_regret_insertion',
+            ),
+            (
+                'vrp.composite.vehicle_route_split_then_window_repair',
+                'vrp.generic.vehicle_route_split',
+            ),
+        )
+        for objective_id in selected_objectives:
+            schedule_id = VrpOperatorId(
+                'vrp.service_windows.schedule_compliance_repair', objective_id
+            )
+            schedule_registration = registrations_by_id.get(schedule_id)
+            if schedule_registration is None:
+                continue
+            for composite_spec_id, first_spec_id in composite_families:
+                first_id = VrpOperatorId(first_spec_id, objective_id)
+                first_registration = registrations_by_id.get(first_id)
+                if first_registration is None:
+                    continue
+                composite_id = VrpOperatorId(composite_spec_id, objective_id)
+                objective_text = identifier_text(objective_id)
+                configuration_values = (
+                    'vrp-pre-registered-composite-v1',
+                    composite_spec_id,
+                    objective_text,
+                    instance_text,
+                    identifier_text(first_registration.operator_id),
+                    identifier_text(first_registration.configuration_id),
+                    identifier_text(schedule_registration.operator_id),
+                    identifier_text(schedule_registration.configuration_id),
+                    settings.max_neighborhood_size,
+                    settings.max_candidate_alternatives,
+                )
+                compositions.append(
+                    OperatorCompositionRegistration(
+                        operator_id=composite_id,
+                        configuration_id='vrp-composition-config:'
+                        + json.dumps(
+                            configuration_values,
+                            ensure_ascii=True,
+                            separators=(',', ':'),
+                        ),
+                        first_operator_id=first_registration.operator_id,
+                        second_operator_id=schedule_registration.operator_id,
+                    )
+                )
+    composition_texts = tuple(
+        identifier_text(item.operator_id) for item in compositions
+    )
+    if len(composition_texts) != len(set(composition_texts)):
+        raise ValueError('generated composite Operator IDs must be unique')
+    if set(texts) & set(composition_texts):
+        raise ValueError('ordinary and composite Operator IDs must be distinct')
+    return VrpOperatorCatalog(tuple(registrations), tuple(compositions))
 
 
 def _validated_path_costs(
@@ -894,6 +1196,25 @@ def _applicable_objectives(
     selected: tuple[ObjectiveId, ...],
     declaration: ObjectiveDeclaration,
 ) -> tuple[ObjectiveId, ...]:
+    if spec.spec_id in {
+        'vrp.service_windows.short_tour_regret_insertion',
+        'vrp.service_windows.backtracking_tour_insertion',
+        'vrp.service_windows.window_feasible_delivery_edge_exchange',
+    }:
+        window_objective_id = instance.time_window_violation_objective_id
+        return tuple(
+            objective_id
+            for objective_id in selected
+            if objective_id != window_objective_id
+        )
+    if spec.spec_id in {
+        'vrp.service_windows.activity_relocation',
+        'vrp.service_windows.route_leg_rerouting',
+        'vrp.service_windows.destroy_and_repair',
+        'vrp.service_windows.regret_based_reinsertion',
+    }:
+        window_objective_id = instance.time_window_violation_objective_id
+        return () if window_objective_id is None else (window_objective_id,)
     if spec.spec_id != 'vrp.network_events.event_objective_route_reroute':
         return selected
     allowed = {
@@ -947,20 +1268,32 @@ def _create_operator(
         return TwoOptStarOperator(instance, objectives, assess_plan, **common)
     if spec_id == 'vrp.generic.swap_star_free_insertion_exchange':
         return SwapStarOperator(instance, objectives, assess_plan, **common)
-    if spec_id == 'vrp.generic.vehicle_route_consolidation':
+    if spec_id in {
+        'vrp.generic.vehicle_route_consolidation_best_insertion',
+        'vrp.generic.vehicle_route_consolidation_regret_insertion',
+    }:
         return VehicleRouteConsolidationOperator(
             instance,
             objectives,
             assess_plan,
             objective_id=objective_id,
+            insertion_strategy=(
+                'best' if spec_id.endswith('_best_insertion') else 'regret'
+            ),
             **path,
         )
-    if spec_id == 'vrp.generic.vehicle_elimination_destroy_and_repair':
+    if spec_id in {
+        'vrp.generic.vehicle_elimination_best_insertion',
+        'vrp.generic.vehicle_elimination_regret_insertion',
+    }:
         return VehicleEliminationDestroyRepairOperator(
             instance,
             objectives,
             assess_plan,
             objective_id=objective_id,
+            insertion_strategy=(
+                'best' if spec_id.endswith('_best_insertion') else 'regret'
+            ),
             **path,
         )
     if spec_id == 'vrp.generic.vehicle_route_split':
@@ -993,6 +1326,7 @@ def _create_operator(
             assess_plan,
             time_step=settings.time_step,
             max_neighborhood_size=settings.max_neighborhood_size,
+            max_candidate_alternatives=settings.max_candidate_alternatives,
         )
     if spec_id == 'vrp.generic.driver_reassignment':
         return DriverReassignmentOperator(instance, objectives, assess_plan, **common)
@@ -1189,6 +1523,17 @@ def _create_operator(
             objective_id,
             settings,
         )
+    if spec_id == 'vrp.service_windows.schedule_compliance_repair':
+        assert objective_id is not None
+        return TimeWindowScheduleComplianceOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            time_step=settings.time_step,
+            max_neighborhood_size=settings.max_neighborhood_size,
+            max_candidate_alternatives=settings.max_candidate_alternatives,
+        )
     if spec_id == 'vrp.service_windows.activity_relocation':
         assert objective_id is not None
         return ActivityRelocationOperator(
@@ -1216,6 +1561,88 @@ def _create_operator(
             objectives,
             assess_plan,
             objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.short_tour_regret_insertion':
+        assert objective_id is not None
+        return ObjectiveGuidedTourRegretInsertionOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.backtracking_tour_insertion':
+        assert objective_id is not None
+        return ObjectiveGuidedBacktrackingTourConstructionOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.window_feasible_delivery_edge_exchange':
+        assert objective_id is not None
+        return ObjectiveGuidedFeasibleDeliveryEdgeExchangeOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.window_compatible_package_cluster_reassignment':
+        return WindowCompatiblePackageClusterReassignmentOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.spatial_time_window_route_cluster_rebuild':
+        return SpatialTimeWindowRouteClusterRebuildOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **common,
+        )
+    if spec_id == 'vrp.spatial.daganzo_strip_sweep_route_rebuild':
+        return DaganzoStripSweepRouteRebuildOperator(
+            instance,
+            objectives,
+            assess_plan,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.slack_guided_or_opt_relocation':
+        assert instance.time_window_violation_objective_id is not None
+        return SlackGuidedOrOptRelocationOperator(
+            instance,
+            objectives,
+            assess_plan,
+            window_objective_id=instance.time_window_violation_objective_id,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.window_feasible_swap_star':
+        assert instance.time_window_violation_objective_id is not None
+        return WindowFeasibleSwapStarOperator(
+            instance,
+            objectives,
+            assess_plan,
+            window_objective_id=instance.time_window_violation_objective_id,
+            objective_id=objective_id,
+            **path,
+        )
+    if spec_id == 'vrp.service_windows.ejection_chain_route_consolidation':
+        assert instance.time_window_violation_objective_id is not None
+        return WindowPrioritizedEjectionChainConsolidationOperator(
+            instance,
+            objectives,
+            assess_plan,
+            window_objective_id=instance.time_window_violation_objective_id,
+            objective_id=objective_id,
+            max_ejection_chain_depth=settings.max_ejection_chain_depth,
             **path,
         )
     if spec_id == 'vrp.interventions.intervention_relocation':
@@ -1386,12 +1813,14 @@ def _make_registration(
     instance_text: str,
     settings: VrpOperatorCatalogSettings,
     path_costs: Mapping[ObjectiveId, AdditivePathCostRegistration],
+    solution_identity: VrpSolutionIdentity,
 ) -> OperatorRegistration:
     operator_id = VrpOperatorId(spec.spec_id, objective_id)
     objective_text = None if objective_id is None else identifier_text(objective_id)
     callback = None if objective_id is None else path_costs.get(objective_id)
     config_values: list[object] = [
-        'vrp-default-catalog-v1',
+        'vrp-default-catalog-candidate-batch-v3',
+        solution_identity.configuration_id,
         spec.spec_id,
         objective_text,
         instance_text,
@@ -1406,11 +1835,28 @@ def _make_registration(
         config_values.extend(
             (settings.max_paths_per_leg, settings.max_arc_expansion_steps)
         )
+    if spec.spec_id == 'vrp.service_windows.ejection_chain_route_consolidation':
+        config_values.append(settings.max_ejection_chain_depth)
+    if spec.spec_id == 'vrp.spatial.daganzo_strip_sweep_route_rebuild':
+        config_values.append(
+            {
+                'geometry_version': 'daganzo-strip-sweep-v1',
+                'orientations': 8,
+                'width_multipliers': [0.5, 0.75, 1.0, 1.5, 2.0],
+                'lateral_offsets': [0.0, 0.5],
+                'degenerate_geometry': 'farthest-pair-or-stable-id-order-v1',
+            }
+        )
     if spec.spec_id == 'vrp.generic.objective_specific_shortest_path':
         config_values.append(
             None
             if callback is None
             else [callback.provider_id, callback.configuration_id]
+        )
+    registered_operator: Operator = operator
+    if not isinstance(operator, DaganzoStripSweepRouteRebuildOperator):
+        registered_operator = CandidateBatchAdapter(
+            operator, equivalent=solution_identity.equivalent
         )
     return OperatorRegistration(
         operator_id=operator_id,
@@ -1420,7 +1866,7 @@ def _make_registration(
             ensure_ascii=True,
             separators=(',', ':'),
         ),
-        operator=operator,
+        operator=registered_operator,
         initial_state=None,
         max_neighborhood_size=settings.max_neighborhood_size,
         feasibility_restoration=spec.restoration,

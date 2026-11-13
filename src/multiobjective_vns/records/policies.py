@@ -97,7 +97,7 @@ class ArchiveRequest:
 
 @dataclass(frozen=True, slots=True)
 class ArchiveDecision:
-    """Exact Pareto archive admission and removal result."""
+    """Unique-vector Pareto admission and removal result."""
 
     admit: bool
     remove_ids: tuple[SolutionId, ...]
@@ -351,55 +351,58 @@ class ChoiceSelectionRequest:
 
 @dataclass(frozen=True, slots=True)
 class FeedbackObservation:
-    """One committed attempt's result, reward, and associated diagnostics."""
+    """Outcomes, modification counts, and failures from one committed attempt."""
 
     choice_id: ChoiceId
     k: int
-    m: int | None
+    modification_counts: tuple[int, ...] | None
     outcomes: tuple[CandidateOutcome, ...]
     failures: tuple[ComponentFailure, ...]
-    stagnation_attempts: int
-    archive_reward: FiniteReal
+    archive_admission_count: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.choice_id, ChoiceId):
             raise TypeError('choice_id must be a ChoiceId')
         require_integer(self.k, name='k', minimum=1)
-        if self.m is not None:
-            require_integer(self.m, name='m', minimum=0)
-            if self.m > self.k:
-                raise ValueError('m cannot exceed k')
+        if self.modification_counts is not None:
+            if not isinstance(self.modification_counts, tuple):
+                raise TypeError('modification_counts must be a tuple or None')
+            for count in self.modification_counts:
+                require_integer(count, name='modification count', minimum=1)
+                if count > self.k:
+                    raise ValueError('modification counts cannot exceed k')
         if not isinstance(self.outcomes, tuple) or any(
             not isinstance(outcome, CandidateOutcome) for outcome in self.outcomes
         ):
             raise TypeError('outcomes must be a tuple of CandidateOutcome records')
-        if len(self.outcomes) > 1:
-            raise ValueError('one attempt can submit at most one candidate')
         if any(outcome.choice_id != self.choice_id for outcome in self.outcomes):
             raise ValueError('feedback outcomes must match the observed choice')
-        if self.m in (None, 0) and self.outcomes:
-            raise ValueError(
-                'attempts without a modification have no candidate outcome'
-            )
+        if self.modification_counts is None and self.outcomes:
+            raise ValueError('a failed choice call has no candidate outcomes')
+        indexes = tuple(outcome.candidate_index for outcome in self.outcomes)
+        if any(index is None for index in indexes) or indexes != tuple(
+            range(1, len(indexes) + 1)
+        ):
+            raise ValueError('feedback outcomes must have ordered candidate indexes')
+        if self.modification_counts is not None and len(self.outcomes) > len(
+            self.modification_counts
+        ):
+            raise ValueError('outcomes cannot exceed returned candidate proposals')
         if not isinstance(self.failures, tuple) or any(
             not isinstance(failure, ComponentFailure) for failure in self.failures
         ):
             raise TypeError('failures must be a tuple of ComponentFailure records')
         require_integer(
-            self.stagnation_attempts,
-            name='stagnation_attempts',
+            self.archive_admission_count,
+            name='archive_admission_count',
             minimum=0,
         )
-        reward = finite_real(self.archive_reward, name='archive_reward')
-        if not 0.0 <= reward <= 1.0:
-            raise ValueError('archive_reward must be in [0, 1]')
-        has_admission = any(
+        actual_admissions = sum(
             outcome.disposition is SearchDisposition.ARCHIVED
             for outcome in self.outcomes
         )
-        if not has_admission and reward != 0.0:
-            raise ValueError('archive_reward must be zero without an archive admission')
-        object.__setattr__(self, 'archive_reward', reward)
+        if self.archive_admission_count != actual_admissions:
+            raise ValueError('archive_admission_count must match archived outcomes')
 
 
 __all__ = [

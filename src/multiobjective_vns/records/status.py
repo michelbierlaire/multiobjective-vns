@@ -35,7 +35,9 @@ class SearchDisposition(StrEnum):
     REGISTERED = 'registered'
     DUPLICATE = 'duplicate'
     DOMINATED = 'dominated'
+    OBJECTIVE_VECTOR_DUPLICATE = 'objective_vector_duplicate'
     ARCHIVED = 'archived'
+    OBJECTIVE_BOUND_EXCEEDED = 'objective_bound_exceeded'
 
 
 class ArchiveStatus(StrEnum):
@@ -43,6 +45,7 @@ class ArchiveStatus(StrEnum):
 
     PARETO_OPTIMAL = 'Pareto optimal'
     DOMINATED = 'Dominated'
+    OBJECTIVE_VECTOR_DUPLICATE = 'Objective-vector duplicate'
     REJECTED = 'Rejected'
 
 

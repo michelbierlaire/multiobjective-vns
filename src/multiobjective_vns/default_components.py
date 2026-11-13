@@ -7,8 +7,9 @@ Author: Michel Bierlaire, EPFL
 from __future__ import annotations
 
 import random
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Mapping
+from math import exp
 from typing import cast
 
 from multiobjective_vns.callbacks import ApplicationEvaluator, StatePayload
@@ -25,9 +26,9 @@ from multiobjective_vns.records.policies import (
     BaseSelectionRequest,
     BudgetDecision,
     BudgetRequest,
-    ChoiceDescriptor,
     ChoiceSelectionRequest,
     FeedbackObservation,
+    OperatorChoiceCategory,
 )
 from multiobjective_vns.records.results import ExecutionResult
 
@@ -99,46 +100,67 @@ class ParetoArchivePolicy:
     """Apply exact Pareto admission and removal under declared objectives."""
 
     component_id = 'multiobjective-vns:archive-policy'
-    configuration_id = 'multiobjective-vns:archive-policy-v1'
+    configuration_id = 'multiobjective-vns:archive-policy-v2'
 
     def decide(self, request: ArchiveRequest) -> ArchiveDecision:
-        """Return the exact nondominated archive decision."""
-        dominated_by_existing = any(
-            self._dominates(
-                entry.objective_values,
-                request.candidate.objective_values,
-                request.objective_declaration,
+        """Keep one representative for each nondominated objective vector."""
+        comparisons = tuple(
+            (
+                entry.solution_id,
+                self._compare_vectors(
+                    entry.objective_values,
+                    request.candidate.objective_values,
+                    request.objective_declaration,
+                ),
             )
             for entry in request.current_archive
         )
-        if dominated_by_existing:
+        if any(
+            self._dominates_comparisons(vector_comparisons)
+            or all(
+                comparison is ObjectiveComparison.EQUAL
+                for comparison in vector_comparisons
+            )
+            for _, vector_comparisons in comparisons
+        ):
             return ArchiveDecision(False, ())
         remove_ids = tuple(
-            entry.solution_id
-            for entry in request.current_archive
-            if self._dominates(
-                request.candidate.objective_values,
-                entry.objective_values,
-                request.objective_declaration,
+            solution_id
+            for solution_id, vector_comparisons in comparisons
+            if self._dominates_comparisons(
+                tuple(self._reverse(comparison) for comparison in vector_comparisons)
             )
         )
         return ArchiveDecision(True, remove_ids)
 
     @staticmethod
-    def _dominates(
+    def _compare_vectors(
         left: tuple[object, ...], right: tuple[object, ...], declaration: object
-    ) -> bool:
+    ) -> tuple[ObjectiveComparison, ...]:
         objectives = declaration.objectives  # type: ignore[attr-defined]
-        comparisons = tuple(
+        return tuple(
             objective.compare(left_value, right_value)
             for objective, left_value, right_value in zip(
                 objectives, left, right, strict=True
             )
         )
+
+    @staticmethod
+    def _dominates_comparisons(
+        comparisons: tuple[ObjectiveComparison, ...],
+    ) -> bool:
         return all(
             comparison in (ObjectiveComparison.LESS, ObjectiveComparison.EQUAL)
             for comparison in comparisons
         ) and any(comparison is ObjectiveComparison.LESS for comparison in comparisons)
+
+    @staticmethod
+    def _reverse(comparison: ObjectiveComparison) -> ObjectiveComparison:
+        if comparison is ObjectiveComparison.LESS:
+            return ObjectiveComparison.GREATER
+        if comparison is ObjectiveComparison.GREATER:
+            return ObjectiveComparison.LESS
+        return ObjectiveComparison.EQUAL
 
 
 class RetainingExplorationPolicy:
@@ -199,104 +221,142 @@ class DefaultBudgetPolicy:
 
 
 class DefaultFeedbackPolicy:
-    """Track difficulty-weighted rewards and sample from recent evidence."""
+    """Track admission scores and sample with a softmax probability floor."""
 
     component_id = 'multiobjective-vns:feedback-policy'
-    configuration_id = 'multiobjective-vns:feedback-policy-v2'
+    configuration_id = 'multiobjective-vns:feedback-policy-v4'
 
     def __init__(self, config: MultiobjectiveVNSConfig) -> None:
         self._config = config
         self._attempts: defaultdict[ChoiceId, int] = defaultdict(int)
+        self._admitting_attempts: defaultdict[ChoiceId, int] = defaultdict(int)
         self._admissions: defaultdict[ChoiceId, int] = defaultdict(int)
+        self._candidate_counts: defaultdict[ChoiceId, int] = defaultdict(int)
         self._m_counts: defaultdict[tuple[ChoiceId, int, int | None], int] = (
             defaultdict(int)
         )
         self._tracked: set[ChoiceId] = set()
-        self._reward_history: deque[tuple[ChoiceId, float]] = deque()
-        self._recent_attempts: defaultdict[ChoiceId, int] = defaultdict(int)
-        self._recent_reward_totals: defaultdict[ChoiceId, float] = defaultdict(float)
+        self._scores: defaultdict[ChoiceId, int] = defaultdict(int)
 
     def observe(self, observation: FeedbackObservation) -> None:
-        """Update counts for one candidate-attempt commit."""
+        """Update one choice score and its committed invocation statistics."""
         self._tracked.add(observation.choice_id)
         self._attempts[observation.choice_id] += 1
-        if observation.outcomes and any(
-            outcome.disposition is not None and outcome.disposition.value == 'archived'
-            for outcome in observation.outcomes
-        ):
-            self._admissions[observation.choice_id] += 1
-        self._m_counts[(observation.choice_id, observation.k, observation.m)] += 1
-        reward = float(observation.archive_reward)
-        self._reward_history.append((observation.choice_id, reward))
-        self._recent_attempts[observation.choice_id] += 1
-        self._recent_reward_totals[observation.choice_id] += reward
-        while len(self._reward_history) > self._config.feedback_recent_attempt_window:
-            expired_choice, expired_reward = self._reward_history.popleft()
-            self._recent_attempts[expired_choice] -= 1
-            self._recent_reward_totals[expired_choice] = max(
-                0.0,
-                self._recent_reward_totals[expired_choice] - expired_reward,
+        if observation.archive_admission_count:
+            self._admitting_attempts[observation.choice_id] += 1
+            self._admissions[observation.choice_id] += (
+                observation.archive_admission_count
             )
+            self._scores[observation.choice_id] += 1
+        else:
+            self._scores[observation.choice_id] = max(
+                0, self._scores[observation.choice_id] - 1
+            )
+        if observation.modification_counts is None:
+            self._m_counts[(observation.choice_id, observation.k, None)] += 1
+        elif not observation.modification_counts:
+            self._m_counts[(observation.choice_id, observation.k, 0)] += 1
+        else:
+            self._candidate_counts[observation.choice_id] += len(
+                observation.modification_counts
+            )
+            for count in observation.modification_counts:
+                self._m_counts[(observation.choice_id, observation.k, count)] += 1
 
     def distribution(self, request: ChoiceSelectionRequest) -> Mapping[ChoiceId, float]:
-        """Return the configured random or performance-matching distribution."""
+        """Return a uniform or softmax distribution with the configured floor."""
         count = len(request.choices)
         if self._config.feedback_selection_mode == 'uniform':
             return {choice.choice_id: 1.0 / count for choice in request.choices}
 
-        scores: dict[ChoiceId, float] = {}
+        epsilon = float(self._config.feedback_epsilon)
+        if count * epsilon >= 1.0:
+            raise ValueError(
+                'feedback_epsilon must be strictly below 1 / n '
+                f'for performance matching (n={count})'
+            )
+
+        scores: dict[ChoiceId, int] = {}
         for choice in request.choices:
             choice_id = choice.choice_id
-            prior_reward = self._prior_reward(choice)
-            prior_weight = float(self._config.feedback_prior_attempts)
-            score = (
-                self._recent_reward_totals[choice_id] + prior_weight * prior_reward
-            ) / (self._recent_attempts[choice_id] + prior_weight)
-            scores[choice_id] = score
-        score_total = sum(scores.values())
-        if score_total == 0.0:
-            return {choice.choice_id: 1.0 / count for choice in request.choices}
-        epsilon = float(self._config.feedback_epsilon)
+            group_prior = int(
+                request.category is OperatorChoiceCategory.COMPOSITION
+                and bool(choice.shared_group_ids)
+            )
+            scores[choice_id] = self._scores[choice_id] + group_prior
+
+        maximum_score = max(scores.values())
+        mu = float(self._config.feedback_mu)
+        weights: dict[ChoiceId, float] = {}
+        for choice_id, score in scores.items():
+            score_gap = maximum_score - score
+            if score_gap == 0 or mu == 0.0:
+                weights[choice_id] = 1.0
+                continue
+            try:
+                exponent = -mu * score_gap
+            except OverflowError:
+                weights[choice_id] = 0.0
+                continue
+            weights[choice_id] = 0.0 if exponent < -745.0 else exp(exponent)
+
+        weight_total = sum(weights.values())
         return {
-            choice_id: epsilon / count + (1.0 - epsilon) * score / score_total
-            for choice_id, score in scores.items()
+            choice_id: epsilon + (1.0 - count * epsilon) * weight / weight_total
+            for choice_id, weight in weights.items()
         }
 
     def reset(self) -> None:
         """Clear counts while preserving the tracked choice portfolio."""
         self._attempts.clear()
+        self._admitting_attempts.clear()
         self._admissions.clear()
+        self._candidate_counts.clear()
         self._m_counts.clear()
-        self._reward_history.clear()
-        self._recent_attempts.clear()
-        self._recent_reward_totals.clear()
+        self._scores = defaultdict(int, {choice: 0 for choice in self._tracked})
 
     def capture_state(self) -> object:
-        """Capture tracked choices and all per-choice counts."""
+        """Capture scores, counters, and modification-count frequencies."""
         return (
+            tuple(sorted(self._tracked, key=lambda item: str(item.to_json_value()))),
+            tuple(sorted(self._scores.items(), key=lambda item: str(item[0]))),
+            tuple(sorted(self._attempts.items(), key=lambda item: str(item[0]))),
             tuple(
-                sorted(self._tracked, key=lambda item: item.to_json_value().__repr__())
+                sorted(self._admitting_attempts.items(), key=lambda item: str(item[0]))
             ),
-            tuple((choice, count) for choice, count in self._attempts.items()),
-            tuple((choice, count) for choice, count in self._admissions.items()),
+            tuple(sorted(self._admissions.items(), key=lambda item: str(item[0]))),
+            tuple(
+                sorted(self._candidate_counts.items(), key=lambda item: str(item[0]))
+            ),
             tuple(
                 (choice, k, m, count)
-                for (choice, k, m), count in self._m_counts.items()
+                for (choice, k, m), count in sorted(
+                    self._m_counts.items(),
+                    key=lambda item: (str(item[0][0]), item[0][1], str(item[0][2])),
+                )
             ),
-            tuple(self._reward_history),
         )
 
     def restore_state(self, payload: object) -> None:
         """Restore a state produced by :meth:`capture_state`."""
-        if not isinstance(payload, tuple) or len(payload) != 5:
+        if not isinstance(payload, tuple) or len(payload) != 7:
             raise ValueError('invalid feedback state payload')
-        tracked, attempts, admissions, m_counts, reward_history = payload
+        tracked, scores, attempts, admitting, admissions, candidate_counts, m_counts = (
+            payload
+        )
         self._tracked = set(cast(tuple[ChoiceId, ...], tracked))
+        self._scores = defaultdict(int, cast(tuple[tuple[ChoiceId, int], ...], scores))
         self._attempts = defaultdict(
             int, cast(tuple[tuple[ChoiceId, int], ...], attempts)
         )
+        self._admitting_attempts = defaultdict(
+            int, cast(tuple[tuple[ChoiceId, int], ...], admitting)
+        )
         self._admissions = defaultdict(
             int, cast(tuple[tuple[ChoiceId, int], ...], admissions)
+        )
+        self._candidate_counts = defaultdict(
+            int, cast(tuple[tuple[ChoiceId, int], ...], candidate_counts)
         )
         restored_m_counts = cast(
             tuple[tuple[ChoiceId, int, int | None, int], ...], m_counts
@@ -305,22 +365,25 @@ class DefaultFeedbackPolicy:
             int,
             {(choice_id, k, m): count for choice_id, k, m, count in restored_m_counts},
         )
-        self._reward_history = deque(
-            cast(tuple[tuple[ChoiceId, float], ...], reward_history)
-        )
-        if len(self._reward_history) > self._config.feedback_recent_attempt_window:
-            raise ValueError('feedback history exceeds its configured window')
-        self._recent_attempts = defaultdict(int)
-        self._recent_reward_totals = defaultdict(float)
-        for choice_id, reward in self._reward_history:
-            if not isinstance(choice_id, ChoiceId) or not 0.0 <= reward <= 1.0:
-                raise ValueError('invalid recent feedback reward')
-            self._recent_attempts[choice_id] += 1
-            self._recent_reward_totals[choice_id] += reward
+        if not self._tracked.issuperset(self._scores):
+            raise ValueError('feedback scores contain an untracked choice')
+        if any(score < 0 for score in self._scores.values()):
+            raise ValueError('feedback scores must be nonnegative')
 
     def statistics(
         self,
-    ) -> tuple[tuple[ChoiceId, int, int, tuple[tuple[int, int | None, int], ...]], ...]:
+    ) -> tuple[
+        tuple[
+            ChoiceId,
+            int,
+            int,
+            int,
+            int,
+            tuple[tuple[int, int | None, int], ...],
+            int,
+        ],
+        ...,
+    ]:
         """Return counts for each tracked choice in stable choice order."""
         result = []
         for choice in sorted(self._tracked, key=lambda item: str(item.to_json_value())):
@@ -330,16 +393,17 @@ class DefaultFeedbackPolicy:
                 if choice_id == choice
             )
             result.append(
-                (choice, self._attempts[choice], self._admissions[choice], counts)
+                (
+                    choice,
+                    self._attempts[choice],
+                    self._admitting_attempts[choice],
+                    self._admissions[choice],
+                    self._candidate_counts[choice],
+                    counts,
+                    self._scores[choice],
+                )
             )
         return tuple(result)
-
-    def _prior_reward(self, descriptor: ChoiceDescriptor) -> float:
-        if len(descriptor.operator_ids) == 1:
-            return float(self._config.standalone_prior_reward)
-        if descriptor.shared_group_ids:
-            return float(self._config.grouped_composition_prior_reward)
-        return float(self._config.ungrouped_composition_prior_reward)
 
 
 DEFAULT_POLICIES: tuple[type[object], ...] = (

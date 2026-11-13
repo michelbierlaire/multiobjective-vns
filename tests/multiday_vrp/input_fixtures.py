@@ -102,7 +102,7 @@ base_measure_id = 'vehicles_used'
 base_measure_parameters = {}
 aggregation = { id = 'weighted_mean' }
 penalty_aggregation = { id = 'sum' }
-penalty_scales = { vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0 }
+        penalty_scales = { vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0 }
 
 [[penalty_functions]]
 objective_id = 'vehicles-used'
@@ -124,7 +124,87 @@ violation_category = 'duty_overlap'
 rule_id = ''
 function_id = 'linear'
 parameters = { rate = 1.0 }
+
 """,
         encoding='utf-8',
     )
     return instance / 'instance.toml'
+
+
+def write_pickup_symmetry_bundle(root: Path) -> Path:
+    """Write a minimal instance with two declared interchangeable pickups.
+
+    :param root: Temporary directory receiving the bundle.
+    :returns: Path to the written instance manifest.
+    """
+    manifest = write_minimal_vrp_bundle(root)
+    instance_dir = manifest.parent
+    source = manifest.read_text(encoding='utf-8')
+    source = source.replace(
+        '[files]\n',
+        """[[pickup_symmetry_groups]]
+group_id = 'same-pickup'
+package_ids = ['package-a', 'package-b']
+
+[files]
+packages = 'packages.csv'
+package_time_windows = 'package-time-windows.csv'
+vehicle_package_compatibility = 'vehicle-package-compatibility.csv'
+""",
+    )
+    manifest.write_text(source, encoding='utf-8')
+    (instance_dir / 'packages.csv').write_text(
+        'package_id,pickup_node_id,delivery_node_id,load,'
+        'pickup_service_duration,delivery_service_duration,max_transfers,'
+        'transfer_out_service_duration,transfer_in_service_duration\n'
+        'package-a,node-a,node-b,1.0,0.0,0.0,0,0.0,0.0\n'
+        'package-b,node-a,node-b,1.0,0.0,0.0,0,0.0,0.0\n',
+        encoding='utf-8',
+    )
+    (instance_dir / 'package-time-windows.csv').write_text(
+        'package_id,activity,window_index,start_time,end_time\n'
+        'package-a,pickup,1,2025-01-02T00:00:00+01:00,'
+        '2025-01-02T00:00:00+01:00\n'
+        'package-a,delivery,1,2025-01-02T00:00:00+01:00,'
+        '2025-01-03T00:00:00+01:00\n'
+        'package-b,pickup,1,2025-01-02T00:00:00+01:00,'
+        '2025-01-02T00:00:00+01:00\n'
+        'package-b,delivery,1,2025-01-02T00:00:00+01:00,'
+        '2025-01-03T00:00:00+01:00\n',
+        encoding='utf-8',
+    )
+    (instance_dir / 'vehicle-package-compatibility.csv').write_text(
+        'vehicle_id,package_id,compatible\n'
+        'vehicle-1,package-a,true\n'
+        'vehicle-1,package-b,true\n',
+        encoding='utf-8',
+    )
+    objectives = instance_dir / 'objectives.toml'
+    with objectives.open('a', encoding='utf-8') as file:
+        file.write(
+            """
+
+[[objectives]]
+objective_id = 'window-penalty'
+base_measure_id = 'zero'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'window-penalty'
+violation_category = 'early_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+
+[[penalty_functions]]
+objective_id = 'window-penalty'
+violation_category = 'late_window'
+rule_id = ''
+function_id = 'linear'
+parameters = { rate = 1.0 }
+"""
+        )
+    return manifest

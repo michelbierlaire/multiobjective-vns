@@ -7,13 +7,14 @@ Author: Michel Bierlaire, EPFL
 from __future__ import annotations
 
 from dataclasses import replace
+from math import isfinite
+from typing import cast
 
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
     candidate_is_eligible,
     choose_uniformly,
-    operator_result,
     require_vrp_base,
     validate_neighborhood_size,
 )
@@ -26,7 +27,12 @@ from multiobjective_vns.multiday_vrp.solution import (
 )
 from multiobjective_vns.objectives import ObjectiveDeclaration
 from multiobjective_vns.random_source import RandomSource
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.values import finite_real, require_integer
 
 __all__ = ['TimingAdjustmentOperator']
@@ -46,6 +52,7 @@ class TimingAdjustmentOperator:
         '_assess_plan',
         '_time_step',
         '_maximum_size',
+        '_candidate_limit',
     )
 
     def __init__(
@@ -56,6 +63,7 @@ class TimingAdjustmentOperator:
         *,
         time_step: float,
         max_neighborhood_size: int,
+        max_candidate_alternatives: int = 32,
     ) -> None:
         self._instance = instance
         self._objectives = objective_declaration
@@ -68,6 +76,13 @@ class TimingAdjustmentOperator:
             name='max_neighborhood_size',
             minimum=1,
         )
+        self._candidate_limit = require_integer(
+            max_candidate_alternatives,
+            name='max_candidate_alternatives',
+            minimum=1,
+        )
+        if self._candidate_limit > 32:
+            raise ValueError('max_candidate_alternatives must be at most 32')
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Apply up to ``k`` sequential timing-field changes.
@@ -79,30 +94,44 @@ class TimingAdjustmentOperator:
         """
         size = validate_neighborhood_size(context.k, self._maximum_size)
         base = require_vrp_base(context)
-        working = base
-        modifications = 0
-        for _ in range(size):
-            targets = _changeable_targets(working, self._time_step)
-            if not targets:
-                break
-            target = choose_uniformly(targets, context.random_source)
-            direction = -1.0 if _draw(context.random_source) < 0.5 else 1.0
-            candidate = _adjust(working, target, direction * self._time_step)
-            if candidate is None or not candidate_is_eligible(
+        initial_targets = _changeable_targets(base, self._time_step)
+        if not initial_targets:
+            return OperatorResult(candidates=())
+        proposals: list[CandidateProposal] = []
+        seen_solutions = {base}
+        for _ in range(self._candidate_limit):
+            working = base
+            modifications = 0
+            for step_index in range(size):
+                targets = (
+                    initial_targets
+                    if step_index == 0
+                    else _changeable_targets(working, self._time_step)
+                )
+                if not targets:
+                    break
+                target = choose_uniformly(targets, context.random_source)
+                direction = -1.0 if _draw(context.random_source) < 0.5 else 1.0
+                candidate = _adjust(working, target, direction * self._time_step)
+                if candidate is None:
+                    continue
+                working = candidate
+                modifications += 1
+            if not modifications or working in seen_solutions:
+                continue
+            seen_solutions.add(working)
+            if not candidate_is_eligible(
                 self._instance,
                 self._objectives,
-                candidate,
+                working,
                 ensure_feasible=context.ensure_feasible,
                 assess_plan=self._assess_plan,
             ):
                 continue
-            working = candidate
-            modifications += 1
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
-        )
+            proposals.append(CandidateProposal(Candidate(working), modifications))
+            if len(proposals) >= context.max_candidates:
+                break
+        return OperatorResult(candidates=tuple(proposals[: context.max_candidates]))
 
 
 def _changeable_targets(
@@ -112,7 +141,7 @@ def _changeable_targets(
     for route_index, route in enumerate(solution.routes):
         start_target = (route_index, None, 'start_time')
         if any(
-            _adjust(solution, start_target, direction * time_step) is not None
+            _can_adjust(solution, start_target, direction * time_step)
             for direction in (-1.0, 1.0)
         ):
             targets.append(start_target)
@@ -127,7 +156,7 @@ def _changeable_targets(
             for field in fields:
                 target = (route_index, stop_index, field)
                 if any(
-                    _adjust(solution, target, direction * time_step) is not None
+                    _can_adjust(solution, target, direction * time_step)
                     for direction in (-1.0, 1.0)
                 ):
                     targets.append(target)
@@ -138,26 +167,40 @@ def _adjust(
     solution: VrpSolution, target: _TimingTarget, delta: float
 ) -> VrpSolution | None:
     route_index, stop_index, field_name = target
+    if not _can_adjust(solution, target, delta):
+        return None
     routes = list(solution.routes)
     route = routes[route_index]
     if stop_index is None:
         value = route.start_time + delta
-        if value < 0.0:
-            return None
         routes[route_index] = replace(route, start_time=value)
         return replace(solution, routes=tuple(routes))
 
     stops = list(route.stops)
     stop: RouteStop = stops[stop_index]
     value = getattr(stop, field_name) + delta
-    if value < 0.0:
-        return None
     updated_stop = replace(stop, **{field_name: value})
-    if updated_stop.break_duration > updated_stop.wait:
-        return None
     stops[stop_index] = updated_stop
     routes[route_index] = replace(route, stops=tuple(stops))
     return replace(solution, routes=tuple(routes))
+
+
+def _can_adjust(solution: VrpSolution, target: _TimingTarget, delta: float) -> bool:
+    route_index, stop_index, field_name = target
+    route = solution.routes[route_index]
+    if stop_index is None:
+        value = route.start_time + delta
+        return isfinite(value) and value >= 0.0
+
+    stop = route.stops[stop_index]
+    value = cast(float, getattr(stop, field_name)) + delta
+    if not isfinite(value) or value < 0.0:
+        return False
+    if field_name == 'wait':
+        return stop.break_duration <= value
+    if field_name == 'break_duration':
+        return value <= stop.wait
+    return True
 
 
 def _draw(random_source: RandomSource) -> float:

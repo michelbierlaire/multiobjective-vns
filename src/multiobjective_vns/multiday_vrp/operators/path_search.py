@@ -7,8 +7,9 @@ Author: Michel Bierlaire, EPFL
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.common import randomized_order
@@ -41,6 +42,28 @@ class _SearchFrame:
     next_arc_index: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class PathSearchIndex:
+    """Immutable node and sorted outgoing-arc index for repeated path searches."""
+
+    known_nodes: frozenset[str]
+    outgoing_arcs: Mapping[str, tuple[tuple[str, str], ...]]
+
+
+def build_path_search_index(instance: LoadedVrpInstance) -> PathSearchIndex:
+    """Build reusable network lookups for bounded directed path searches."""
+    outgoing: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for arc in instance.network_data.arcs:
+        outgoing[arc.tail_node_id].append((arc.arc_id, arc.head_node_id))
+    sorted_outgoing = {
+        node_id: tuple(sorted(arcs)) for node_id, arcs in outgoing.items()
+    }
+    return PathSearchIndex(
+        frozenset(record.node_id for record in instance.network_data.nodes),
+        MappingProxyType(sorted_outgoing),
+    )
+
+
 def sample_loopless_paths(
     instance: LoadedVrpInstance,
     origin_node_id: str,
@@ -49,6 +72,7 @@ def sample_loopless_paths(
     random_source: RandomSource,
     max_paths: int,
     max_arc_expansion_steps: int,
+    path_search_index: PathSearchIndex | None = None,
 ) -> tuple[tuple[str, ...], ...]:
     """Sample bounded directed loopless paths in randomized depth-first order.
 
@@ -63,8 +87,10 @@ def sample_loopless_paths(
     :param random_source: Shared search random source.
     :param max_paths: Maximum number of paths to return.
     :param max_arc_expansion_steps: Maximum outgoing-arc considerations.
+    :param path_search_index: Reusable network lookup, when available.
     :returns: Distinct arc-ID paths in randomized depth-first order.
-    :raises TypeError: If either limit is not an integer excluding bool.
+    :raises TypeError: If either limit is not an integer excluding bool or the
+        supplied path index has the wrong type.
     :raises ValueError: If a limit is nonpositive or an endpoint is unknown.
     """
     path_limit = require_integer(max_paths, name='max_paths', minimum=1)
@@ -73,15 +99,20 @@ def sample_loopless_paths(
         name='max_arc_expansion_steps',
         minimum=1,
     )
-    known_nodes = {record.node_id for record in instance.network_data.nodes}
-    if origin_node_id not in known_nodes or destination_node_id not in known_nodes:
+    search_index = (
+        build_path_search_index(instance)
+        if path_search_index is None
+        else path_search_index
+    )
+    if not isinstance(search_index, PathSearchIndex):
+        raise TypeError('path_search_index must be a PathSearchIndex or None')
+    if (
+        origin_node_id not in search_index.known_nodes
+        or destination_node_id not in search_index.known_nodes
+    ):
         raise ValueError('route path endpoints must be known network nodes')
     if origin_node_id == destination_node_id:
         return ((),)
-
-    outgoing: dict[str, list[tuple[str, str]]] = {}
-    for arc in instance.network_data.arcs:
-        outgoing.setdefault(arc.tail_node_id, []).append((arc.arc_id, arc.head_node_id))
 
     paths: list[tuple[str, ...]] = []
     stack = [_SearchFrame(origin_node_id, (origin_node_id,), ())]
@@ -101,7 +132,7 @@ def sample_loopless_paths(
                 current.arc_path,
                 tuple(
                     randomized_order(
-                        tuple(sorted(outgoing.get(current.node_id, ()))),
+                        search_index.outgoing_arcs.get(current.node_id, ()),
                         random_source,
                     )
                 ),
@@ -214,13 +245,18 @@ def rebuild_changed_routes(
     max_paths_per_leg: int,
     max_arc_expansion_steps: int,
     max_candidate_alternatives: int,
+    path_search_index: PathSearchIndex | None = None,
+    path_options_cache: MutableMapping[tuple[str, str], tuple[tuple[str, ...], ...]]
+    | None = None,
 ) -> tuple[VrpSolution, ...]:
     """Rebuild changed route legs and sample complete path assignments.
 
     Existing legs are retained wherever their ordered endpoint pair remains
     unchanged. Every new endpoint pair receives bounded loopless paths from
     :func:`sample_loopless_paths`; complete assignments are sampled uniformly
-    without replacement from their Cartesian product.
+    without replacement from their Cartesian product. A supplied path-search
+    index and path-options cache can be reused across alternatives generated
+    for one instance with the same path limits.
     """
     path_limit = require_integer(max_paths_per_leg, name='max_paths_per_leg', minimum=1)
     expansion_limit = require_integer(
@@ -232,6 +268,9 @@ def rebuild_changed_routes(
         max_candidate_alternatives,
         name='max_candidate_alternatives',
         minimum=1,
+    )
+    sampled_paths_by_endpoints = (
+        {} if path_options_cache is None else path_options_cache
     )
     provisional_routes = list(solution.routes)
     for route_index, stops in stops_by_route_index.items():
@@ -245,6 +284,7 @@ def rebuild_changed_routes(
 
     path_dimensions: list[tuple[int, int, tuple[tuple[str, ...], ...]]] = []
     leg_blueprints: dict[int, list[tuple[str, ...] | None]] = {}
+    search_index = path_search_index
     for route_index in sorted(stops_by_route_index):
         original_route = solution.routes[route_index]
         candidate_route = provisional_solution.routes[route_index]
@@ -267,14 +307,19 @@ def rebuild_changed_routes(
             if old_by_endpoints[key]:
                 blueprint.append(old_by_endpoints[key].pop(0))
                 continue
-            paths = sample_loopless_paths(
-                instance,
-                origin,
-                destination,
-                random_source=random_source,
-                max_paths=path_limit,
-                max_arc_expansion_steps=expansion_limit,
-            )
+            if search_index is None:
+                search_index = build_path_search_index(instance)
+            if key not in sampled_paths_by_endpoints:
+                sampled_paths_by_endpoints[key] = sample_loopless_paths(
+                    instance,
+                    origin,
+                    destination,
+                    random_source=random_source,
+                    max_paths=path_limit,
+                    max_arc_expansion_steps=expansion_limit,
+                    path_search_index=search_index,
+                )
+            paths = sampled_paths_by_endpoints[key]
             if not paths:
                 return ()
             blueprint.append(None)

@@ -12,6 +12,7 @@ from multiobjective_vns.knapsack.instance import KnapsackInstance
 from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.values import require_integer
@@ -71,10 +72,11 @@ def randomized_sample(
 def result_for(solution: tuple[int, ...], modification_count: int) -> OperatorResult:
     """Create the candidate result for a positive modification count."""
     if modification_count == 0:
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
     return OperatorResult(
-        m=modification_count,
-        candidate=Candidate(solution=solution),
+        candidates=(
+            CandidateProposal(Candidate(solution=solution), modification_count),
+        )
     )
 
 
@@ -86,7 +88,7 @@ def finish_with_feasibility(
 ) -> OperatorResult:
     """Return a candidate only when changes occurred and feasibility is met."""
     if modification_count == 0:
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
     if ensure_feasible and not knapsack_is_feasible(instance, solution):
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
     return result_for(solution, modification_count)

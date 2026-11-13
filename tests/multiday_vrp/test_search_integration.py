@@ -16,6 +16,7 @@ from multiobjective_vns import (
     TerminationReason,
 )
 from multiobjective_vns.callbacks import SolutionIdentity
+from multiobjective_vns.candidate_batch import CandidateBatchAdapter
 from multiobjective_vns.identifiers import (
     ComponentConfigurationId,
     ComponentId,
@@ -42,7 +43,10 @@ from multiobjective_vns.random_source import RandomSource
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.records.policies import InvocationCounters
 from multiobjective_vns.records.status import ApplicationAssessment, SearchDisposition
-from multiobjective_vns.registrations import OperatorRegistration
+from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
+    OperatorRegistration,
+)
 
 from .input_fixtures import write_minimal_vrp_bundle
 from .test_universal_route_order import _test_plan
@@ -84,26 +88,36 @@ def _assessor(evaluator: VrpApplicationEvaluator) -> VrpPlanAssessor:
     return cast(VrpPlanAssessor, assess)
 
 
+def _operator_implementation(operator: object) -> object:
+    if isinstance(operator, CandidateBatchAdapter):
+        return operator.delegate
+    return operator
+
+
 def _search(
     instance: LoadedVrpInstance,
     registrations: tuple[OperatorRegistration, ...],
     *,
     config: MultiobjectiveVNSConfig,
+    pre_registered_compositions: tuple[OperatorCompositionRegistration, ...] = (),
 ) -> MultiobjectiveVNS:
     return MultiobjectiveVNS(
         solution_codec=VrpSolutionCodec(),
         solution_identity=cast(SolutionIdentity, _StructuralIdentity()),
         objective_declaration=build_vrp_objective_declaration(instance),
         operators=registrations,
+        pre_registered_compositions=pre_registered_compositions,
         application_evaluator=VrpApplicationEvaluator(instance),
         problem_instance_id=cast(ProblemInstanceId, instance.instance_id),
         config=config,
         random_source=cast(RandomSource, _ZeroRandomSource()),
+        promoted_composition_catalog_path=None,
     )
 
 
 def _one_attempt_config() -> MultiobjectiveVNSConfig:
     return MultiobjectiveVNSConfig(
+        max_candidates_per_attempt=1,
         max_neighborhood_size=1,
         feedback_selection_mode='uniform',
         random_seed=0,
@@ -125,12 +139,13 @@ def test_simple_instance_factory_and_search_use_only_universal_choices(
     instance = load_vrp_instance(write_minimal_vrp_bundle(tmp_path))
     objectives = build_vrp_objective_declaration(instance)
     evaluator = VrpApplicationEvaluator(instance)
-    registrations = build_default_vrp_operator_catalog(
+    catalog = build_default_vrp_operator_catalog(
         instance,
         problem_instance_id=cast(ProblemInstanceId, instance.instance_id),
         objective_declaration=objectives,
         assess_plan=_assessor(evaluator),
     )
+    registrations = catalog.operators
 
     specs = {_operator_spec(item) for item in registrations}
     assert 'vrp.generic.two_opt' in specs
@@ -138,7 +153,12 @@ def test_simple_instance_factory_and_search_use_only_universal_choices(
     assert not any('.package_' in spec for spec in specs)
     assert not any('.service_windows.' in spec for spec in specs)
 
-    search = _search(instance, registrations, config=_one_attempt_config())
+    search = _search(
+        instance,
+        registrations,
+        config=_one_attempt_config(),
+        pre_registered_compositions=catalog.pre_registered_compositions,
+    )
     result = search.run(
         initial_solutions=(VrpSolution((), ()),),
         log_directory=tmp_path / 'simple-logs',
@@ -167,12 +187,13 @@ def test_richer_instance_enables_feature_choices_and_runs_a_catalog_operator(
 
     objectives = build_vrp_objective_declaration(instance)
     evaluator = VrpApplicationEvaluator(instance)
-    registrations = build_default_vrp_operator_catalog(
+    catalog = build_default_vrp_operator_catalog(
         instance,
         problem_instance_id=cast(ProblemInstanceId, instance.instance_id),
         objective_declaration=objectives,
         assess_plan=_assessor(evaluator),
     )
+    registrations = catalog.operators
     specs = {_operator_spec(item) for item in registrations}
     assert 'vrp.multiple_tours.split_tour' in specs
     assert 'vrp.multiple_tours.merge_tours' in specs
@@ -190,10 +211,12 @@ def test_richer_instance_enables_feature_choices_and_runs_a_catalog_operator(
     assert split_registrations
     assert merge_registrations
     assert all(
-        isinstance(item.operator, SplitTourOperator) for item in split_registrations
+        isinstance(_operator_implementation(item.operator), SplitTourOperator)
+        for item in split_registrations
     )
     assert all(
-        isinstance(item.operator, MergeToursOperator) for item in merge_registrations
+        isinstance(_operator_implementation(item.operator), MergeToursOperator)
+        for item in merge_registrations
     )
     assert 'vrp.depot_visits.depot_visit_insertion' in specs
     assert 'vrp.depot_visits.depot_visit_removal' in specs
@@ -201,7 +224,9 @@ def test_richer_instance_enables_feature_choices_and_runs_a_catalog_operator(
     two_opt_registration = next(
         item for item in registrations if _operator_spec(item) == 'vrp.generic.two_opt'
     )
-    assert isinstance(two_opt_registration.operator, TwoOptOperator)
+    assert isinstance(
+        _operator_implementation(two_opt_registration.operator), TwoOptOperator
+    )
     search = _search(
         instance,
         (two_opt_registration,),

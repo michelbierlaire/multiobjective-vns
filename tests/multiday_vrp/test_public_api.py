@@ -11,6 +11,7 @@ from multiobjective_vns.multiday_vrp import (
     ActivityStop,
     DepotOnlyStop,
     HardFeasibilityFinding,
+    NodeCoordinateRecord,
     RouteLeg,
     TransferOperationStop,
     TransferStep,
@@ -21,10 +22,15 @@ from multiobjective_vns.multiday_vrp import (
     VrpFeatureId,
     VrpInputError,
     VrpObjectiveFunction,
+    VrpOperatorCatalog,
     VrpSolution,
     VrpSolutionCodec,
+    VrpSpatialData,
     build_vrp_objective_declaration,
     load_vrp_instance,
+)
+from multiobjective_vns.multiday_vrp.operators import (
+    DaganzoStripSweepRouteRebuildOperator,
 )
 
 
@@ -49,3 +55,9 @@ def test_solution_record_types_are_exported_from_the_application_subpackage() ->
     assert VrpApplicationEvaluator.__name__ == 'VrpApplicationEvaluator'
     assert HardFeasibilityFinding.__name__ == 'HardFeasibilityFinding'
     assert VrpObjectiveFunction.__name__ == 'VrpObjectiveFunction'
+    assert VrpOperatorCatalog.__name__ == 'VrpOperatorCatalog'
+    assert NodeCoordinateRecord.__name__ == 'NodeCoordinateRecord'
+    assert VrpSpatialData.__name__ == 'VrpSpatialData'
+    assert DaganzoStripSweepRouteRebuildOperator.__name__ == (
+        'DaganzoStripSweepRouteRebuildOperator'
+    )

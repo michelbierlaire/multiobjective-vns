@@ -29,8 +29,11 @@ from multiobjective_vns.multiday_vrp.input_objectives import (
 from multiobjective_vns.multiday_vrp.input_records import (
     LoadedScenarioBank,
     LoadedVrpInstance,
+    PackageTimeWindowRecord,
+    PickupSymmetryGroup,
     VrpInstanceSettings,
     VrpObjectiveData,
+    VrpPackageData,
 )
 from multiobjective_vns.multiday_vrp.input_rules import (
     _parse_settings_and_event_objectives,
@@ -44,6 +47,7 @@ from multiobjective_vns.multiday_vrp.input_schema import (
     SIMPLE_RULES,
     UNIT_SECONDS,
 )
+from multiobjective_vns.multiday_vrp.input_spatial import _parse_spatial_data
 from multiobjective_vns.multiday_vrp.input_tables import _parse_tables
 from multiobjective_vns.multiday_vrp.input_utils import (
     read_toml_table,
@@ -176,6 +180,26 @@ def load_vrp_instance(
         duration_scale=duration_scale,
         horizon=horizon,
     )
+    spatial_data = _parse_spatial_data(
+        manifest,
+        tables['node_coordinates'],
+        paths['node_coordinates'],
+        network_data,
+        package_data,
+        intervention_data,
+    )
+    pickup_symmetry_groups = _parse_pickup_symmetry_groups(
+        manifest.get('pickup_symmetry_groups'), package_data, manifest_path.name
+    )
+    if (
+        settings.exact_active_vehicle_count is not None
+        and settings.exact_active_vehicle_count > len(fleet_data.vehicles)
+    ):
+        raise VrpInputError(
+            file=manifest_path.name,
+            column='exact_active_vehicle_count',
+            reason='must not exceed the number of vehicles',
+        )
     event_data = _parse_settings_and_event_objectives(
         tables, paths, objective_data, event_data
     )
@@ -216,7 +240,7 @@ def load_vrp_instance(
     active_categories = _active_penalty_categories(
         settings, package_data, intervention_data, network_data, personnel_data
     )
-    _validate_objectives(
+    time_window_violation_objective_id = _validate_objectives(
         objective_data,
         active_categories,
         event_data,
@@ -234,6 +258,7 @@ def load_vrp_instance(
         event_data,
         objective_data,
         settings,
+        spatial_data,
     )
     instance = LoadedVrpInstance(
         format_version=1,
@@ -241,14 +266,17 @@ def load_vrp_instance(
         scenario_bank=scenario_bank,
         settings=settings,
         network_data=network_data,
+        spatial_data=spatial_data,
         fleet_data=fleet_data,
         package_data=package_data,
+        pickup_symmetry_groups=pickup_symmetry_groups,
         intervention_data=intervention_data,
         personnel_data=personnel_data,
         activity_relations=relations,
         work_rule_data=work_rules,
         event_data=event_data,
         objective_data=objective_data,
+        time_window_violation_objective_id=time_window_violation_objective_id,
         application_data=application_data,
         hos_configuration=hos_configuration,
         hos_rule_definitions=(),
@@ -275,6 +303,161 @@ def _validate_manifest_shape(manifest: _Table, filename: str) -> None:
     if extra:
         key = min(extra)
         raise VrpInputError(file=filename, column=key, reason='unknown key')
+
+
+def _parse_pickup_symmetry_groups(
+    value: object,
+    package_data: VrpPackageData,
+    filename: str,
+) -> tuple[PickupSymmetryGroup, ...]:
+    if value is None:
+        return ()
+    if type(value) is not list:
+        raise VrpInputError(
+            file=filename,
+            column='pickup_symmetry_groups',
+            reason='pickup symmetry groups must be an array of tables',
+        )
+
+    packages = {package.package_id: package for package in package_data.packages}
+    windows_by_package: dict[str, list[PackageTimeWindowRecord]] = {}
+    for window in package_data.package_time_windows:
+        if window.activity == 'pickup':
+            windows_by_package.setdefault(window.package_id, []).append(window)
+
+    groups: list[PickupSymmetryGroup] = []
+    group_ids: set[str] = set()
+    member_ids: set[str] = set()
+    for index, raw_group in enumerate(value, start=1):
+        column = f'pickup_symmetry_groups[{index}]'
+        if type(raw_group) is not dict:
+            raise VrpInputError(
+                file=filename,
+                column=column,
+                reason='pickup symmetry group must be a table',
+            )
+        group = cast(dict[str, object], raw_group)
+        if set(group) != {'group_id', 'package_ids'}:
+            raise VrpInputError(
+                file=filename,
+                column=column,
+                reason='pickup symmetry group must contain group_id and package_ids',
+            )
+        group_id_value = group['group_id']
+        if type(group_id_value) is not str:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.group_id',
+                reason='pickup symmetry group ID must be a string',
+            )
+        group_id = _id_value(group_id_value, filename, index, f'{column}.group_id')
+        if group_id in group_ids:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.group_id',
+                reason=f'duplicate pickup symmetry group ID {group_id!r}',
+            )
+        package_ids_value = group['package_ids']
+        if type(package_ids_value) is not list:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.package_ids',
+                reason='pickup symmetry package_ids must be an array',
+            )
+        package_ids: list[str] = []
+        for package_index, package_id_value in enumerate(package_ids_value, start=1):
+            if type(package_id_value) is not str:
+                raise VrpInputError(
+                    file=filename,
+                    column=f'{column}.package_ids[{package_index}]',
+                    reason='package ID must be a string',
+                )
+            package_ids.append(
+                _id_value(
+                    package_id_value,
+                    filename,
+                    index,
+                    f'{column}.package_ids[{package_index}]',
+                )
+            )
+        if len(package_ids) < 2:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.package_ids',
+                reason='pickup symmetry group needs at least two packages',
+            )
+        if len(package_ids) != len(set(package_ids)):
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.package_ids',
+                reason='pickup symmetry group package IDs must be distinct',
+            )
+        unknown_ids = tuple(
+            package_id for package_id in package_ids if package_id not in packages
+        )
+        if unknown_ids:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.package_ids',
+                reason=f'pickup symmetry group has unknown package {unknown_ids[0]!r}',
+            )
+        overlap = member_ids.intersection(package_ids)
+        if overlap:
+            raise VrpInputError(
+                file=filename,
+                column=f'{column}.package_ids',
+                reason=(
+                    f'package {min(overlap)!r} belongs to multiple pickup symmetry groups'
+                ),
+            )
+
+        reference = packages[package_ids[0]]
+        reference_windows = _pickup_window_signature(package_ids[0], windows_by_package)
+        for package_id in package_ids[1:]:
+            package = packages[package_id]
+            if package.pickup_node_id != reference.pickup_node_id:
+                raise VrpInputError(
+                    file=filename,
+                    column=f'{column}.package_ids',
+                    reason='pickup symmetry group members must have the same pickup node',
+                )
+            if package.pickup_service_duration != reference.pickup_service_duration:
+                raise VrpInputError(
+                    file=filename,
+                    column=f'{column}.package_ids',
+                    reason=(
+                        'pickup symmetry group members must have the same '
+                        'pickup service duration'
+                    ),
+                )
+            if (
+                _pickup_window_signature(package_id, windows_by_package)
+                != reference_windows
+            ):
+                raise VrpInputError(
+                    file=filename,
+                    column=f'{column}.package_ids',
+                    reason=(
+                        'pickup symmetry group members must have the same '
+                        'pickup-window alternatives'
+                    ),
+                )
+
+        groups.append(PickupSymmetryGroup(group_id, tuple(package_ids)))
+        group_ids.add(group_id)
+        member_ids.update(package_ids)
+    return tuple(groups)
+
+
+def _pickup_window_signature(
+    package_id: str,
+    windows_by_package: dict[str, list[PackageTimeWindowRecord]],
+) -> tuple[tuple[int, float, float], ...]:
+    windows = windows_by_package.get(package_id, [])
+    return tuple(
+        (window.window_index, window.start_time, window.end_time)
+        for window in sorted(windows, key=lambda item: item.window_index)
+    )
 
 
 def _validate_file_map(files: dict[str, object], filename: str) -> None:
@@ -323,6 +506,23 @@ def _parse_settings(
             column='staff_depot_mode',
             reason="must be 'available_at_assignment' or 'depot_continuity'",
         )
+    raw_exact_vehicle_count = manifest.get('exact_active_vehicle_count')
+    if raw_exact_vehicle_count is not None and type(raw_exact_vehicle_count) is not int:
+        raise VrpInputError(
+            file=filename,
+            column='exact_active_vehicle_count',
+            reason='must be an integer',
+        )
+    if raw_exact_vehicle_count is None:
+        exact_active_vehicle_count = None
+    else:
+        exact_active_vehicle_count = raw_exact_vehicle_count
+        if exact_active_vehicle_count < 0:
+            raise VrpInputError(
+                file=filename,
+                column='exact_active_vehicle_count',
+                reason='must be nonnegative',
+            )
     rule_treatment = _toml_string(manifest, 'rule_treatment', filename)
     if rule_treatment not in {'penalty', 'compliance'}:
         raise VrpInputError(
@@ -365,6 +565,7 @@ def _parse_settings(
         load_unit=load_unit,
         service_coverage_mode=service_coverage_mode,
         staff_depot_mode=staff_depot_mode,
+        exact_active_vehicle_count=exact_active_vehicle_count,
         rule_treatment=rule_treatment,
         active_simple_rules=frozenset(rules),
         hos_regime_id=hos_regime_id,

@@ -32,5 +32,5 @@ class ExactFlipOperator:
             working[position] = 1 - working[position]
         result = tuple(working)
         if context.ensure_feasible and not knapsack_is_feasible(self._instance, result):
-            return OperatorResult(m=0, candidate=None)
+            return OperatorResult(candidates=())
         return result_for(result, context.k)

@@ -8,7 +8,10 @@ from dataclasses import dataclass
 
 from multiobjective_vns.identifiers import ChoiceId, SolutionId
 from multiobjective_vns.random_source import RandomSource
-from multiobjective_vns.records.evaluation import EvaluationRecord
+from multiobjective_vns.records.evaluation import (
+    EvaluationRecord,
+    ObjectiveBoundFinding,
+)
 from multiobjective_vns.records.failures import ComponentFailure
 from multiobjective_vns.records.status import (
     ApplicationAssessment,
@@ -29,18 +32,29 @@ class Candidate:
 
 
 @dataclass(frozen=True, slots=True)
-class OperatorResult:
-    """Modification count and candidate from one Operator call."""
+class CandidateProposal:
+    """One candidate and its actual modification count."""
 
+    candidate: Candidate
     m: int
-    candidate: Candidate | None
 
     def __post_init__(self) -> None:
-        require_integer(self.m, name='m', minimum=0)
-        if self.candidate is not None and not isinstance(self.candidate, Candidate):
-            raise TypeError('candidate must be a Candidate or None')
-        if (self.m == 0) != (self.candidate is None):
-            raise ValueError('candidate must be None exactly when m is zero')
+        if not isinstance(self.candidate, Candidate):
+            raise TypeError('candidate must be a Candidate')
+        require_integer(self.m, name='m', minimum=1)
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorResult:
+    """Ordered candidate proposals returned by one Operator call."""
+
+    candidates: tuple[CandidateProposal, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidates, tuple) or any(
+            not isinstance(proposal, CandidateProposal) for proposal in self.candidates
+        ):
+            raise TypeError('candidates must be a tuple of CandidateProposal')
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,16 +76,22 @@ class CandidateContext:
     operator_state: object | None
     random_source: RandomSource
     base_evaluation: EvaluationRecord | None = None
+    max_candidates: int = 1
 
     def __post_init__(self) -> None:
         require_integer(self.k, name='k', minimum=1)
+        require_integer(self.max_candidates, name='max_candidates', minimum=1)
         if not isinstance(self.ensure_feasible, bool):
             raise TypeError('ensure_feasible must be bool')
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateOutcome:
-    """Stable outcome of one initial or final Operator-candidate submission."""
+    """Stable outcome of one initial or final Operator-candidate submission.
+
+    ``objective_bound_findings`` repeats the stored findings for duplicates so
+    each submission occurrence has a complete caller-facing result.
+    """
 
     source: SubmissionSource
     submitted_solution: object
@@ -86,6 +106,8 @@ class CandidateOutcome:
     assessment: ApplicationAssessment | None = None
     disposition: SearchDisposition | None = None
     metadata: object | None = None
+    candidate_index: int | None = None
+    objective_bound_findings: tuple[ObjectiveBoundFinding, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, SubmissionSource):
@@ -104,6 +126,20 @@ class CandidateOutcome:
             self.disposition, SearchDisposition
         ):
             raise TypeError('disposition must be a SearchDisposition or None')
+        if not isinstance(self.objective_bound_findings, tuple) or any(
+            not isinstance(finding, ObjectiveBoundFinding)
+            for finding in self.objective_bound_findings
+        ):
+            raise TypeError(
+                'objective_bound_findings must be a tuple of ObjectiveBoundFinding'
+            )
+        if (
+            self.disposition is SearchDisposition.OBJECTIVE_BOUND_EXCEEDED
+            and not self.objective_bound_findings
+        ):
+            raise ValueError(
+                'objective_bound_exceeded outcomes require at least one finding'
+            )
 
         if self.source is SubmissionSource.INITIAL:
             if any(
@@ -115,6 +151,7 @@ class CandidateOutcome:
                     self.k,
                     self.m,
                     self.metadata,
+                    self.candidate_index,
                 )
             ):
                 raise ValueError('initial outcomes cannot carry Operator metadata')
@@ -123,16 +160,24 @@ class CandidateOutcome:
                 raise ValueError('Operator outcomes require choice and base IDs')
             if self.k is None or self.m is None:
                 raise ValueError('Operator outcomes require k and m')
+            if self.candidate_index is None:
+                raise ValueError('Operator outcomes require candidate_index')
             require_integer(self.k, name='k', minimum=1)
             require_integer(self.m, name='m', minimum=1)
             if self.m > self.k:
                 raise ValueError('m cannot exceed k')
-            if self.choice_id.kind.value == 'operator':
-                if self.component_position is not None:
-                    raise ValueError('standalone outcomes have no component position')
-            elif self.component_position is not CompositionPosition.SECOND:
+            require_integer(self.candidate_index, name='candidate_index', minimum=1)
+            if self.choice_id.kind.value == 'composition':
+                if self.component_position is not CompositionPosition.SECOND:
+                    raise ValueError(
+                        'dynamic composition outcomes use component_position=second'
+                    )
+            elif self.component_position not in (
+                None,
+                CompositionPosition.SECOND,
+            ):
                 raise ValueError(
-                    'composition candidates have component_position=second'
+                    'standalone outcomes use no position or second for a composite'
                 )
 
         if self.processing_status is ProcessingStatus.COMPLETED:

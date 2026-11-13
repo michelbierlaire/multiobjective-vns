@@ -19,6 +19,7 @@ from multiobjective_vns.multiday_vrp.operators.common import (
     randomized_order,
 )
 from multiobjective_vns.multiday_vrp.operators.path_search import (
+    PathSearchIndex,
     route_node_sequence,
     sample_loopless_paths,
     stop_node_id,
@@ -141,6 +142,7 @@ def _rebuild_paths(
     *,
     max_paths: int,
     max_expansions: int,
+    path_search_index: PathSearchIndex | None = None,
 ) -> VrpSolution | None:
     existing_paths: dict[tuple[str, str], list[tuple[str, ...]]] = defaultdict(list)
     for route in base.routes:
@@ -168,6 +170,7 @@ def _rebuild_paths(
                     random_source=context.random_source,
                     max_paths=max_paths,
                     max_arc_expansion_steps=max_expansions,
+                    path_search_index=path_search_index,
                 )
                 if not paths:
                     return None

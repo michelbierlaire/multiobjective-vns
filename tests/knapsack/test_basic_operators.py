@@ -78,12 +78,14 @@ def call_operator(
 def assert_result(
     result: OperatorResult, *, m: int, solution: tuple[int, ...] | None
 ) -> None:
-    assert result.m == m
     if solution is None:
-        assert result.candidate is None
+        assert result.candidates == ()
     else:
-        assert isinstance(result.candidate, Candidate)
-        assert result.candidate.solution == solution
+        assert len(result.candidates) == 1
+        proposal = result.candidates[0]
+        assert proposal.m == m
+        assert isinstance(proposal.candidate, Candidate)
+        assert proposal.candidate.solution == solution
 
 
 def test_flip_skips_infeasible_change_and_counts_retained_changes() -> None:

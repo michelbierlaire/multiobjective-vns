@@ -85,26 +85,24 @@ def _package_instance(
         package_time_windows=windows,
         vehicle_package_compatibility=compatibility_records,
     )
-    objective = instance.objective_data.objectives[0]._replace(
-        penalty_scales={
-            **instance.objective_data.objectives[0].penalty_scales,
-            'early_window': 1.0,
-            'late_window': 1.0,
-        }
+    window_objective = instance.objective_data.objectives[0]._replace(
+        objective_id='time-window-violation',
+        base_measure_id='zero',
+        penalty_scales={'early_window': 1.0, 'late_window': 1.0},
     )
     objective_data = instance.objective_data._replace(
-        objectives=(objective,),
+        objectives=(*instance.objective_data.objectives, window_objective),
         penalty_functions=(
             *instance.objective_data.penalty_functions,
             PenaltyFunctionSpec(
-                'vehicles-used',
+                'time-window-violation',
                 'early_window',
                 '',
                 'linear',
                 FrozenTomlTable({'rate': 1.0}),
             ),
             PenaltyFunctionSpec(
-                'vehicles-used',
+                'time-window-violation',
                 'late_window',
                 '',
                 'linear',
@@ -115,6 +113,7 @@ def _package_instance(
     return instance._replace(
         package_data=package_data,
         objective_data=objective_data,
+        time_window_violation_objective_id='time-window-violation',
         fleet_data=instance.fleet_data._replace(
             vehicles=(
                 instance.fleet_data.vehicles[0]._replace(
@@ -193,7 +192,7 @@ def test_package_resource_violation_returns_hard_infeasibility(
     )
 
     assert result.feasible is False
-    assert result.objective_values == (inf,)
+    assert result.objective_values == (inf, inf)
     assert isinstance(result.analysis, VrpOperatorAnalysis)
     assert result.analysis.hard_failure is not None
     assert result.analysis.hard_failure.kind == 'static_constraint'
@@ -292,7 +291,7 @@ def test_intervention_tools_consume_capacity_for_their_depot_segment(
     )
 
     assert result.feasible is False
-    assert result.objective_values == (inf,)
+    assert result.objective_values == (inf, inf)
 
 
 def test_initial_transfer_facility_inventory_obeys_storage_capacity(
@@ -318,11 +317,33 @@ def test_initial_transfer_facility_inventory_obeys_storage_capacity(
     )
 
     assert result.feasible is False
-    assert result.objective_values == (inf,)
+    assert result.objective_values == (inf, inf)
+    analysis = cast(VrpOperatorAnalysis, result.analysis)
+    storage_findings = tuple(
+        finding
+        for finding in analysis.resource_findings
+        if finding.kind == 'transfer_storage'
+    )
+    assert tuple(
+        (
+            finding.resource_id,
+            finding.scenario_id,
+            finding.measure,
+            finding.transfer_step_ref,
+        )
+        for finding in storage_findings
+    ) == (('node-a', 'scenario-000001', 1.0, None),)
 
 
-def test_simultaneous_transfer_operations_are_processed_in_custody_order(
+@pytest.mark.parametrize(
+    ('storage_capacity', 'receiver_start_time', 'expected_feasible'),
+    ((2.0, 5.0, True), (0.0, 20.0, False)),
+)
+def test_transfer_custody_order_and_storage_findings(
     tmp_path: Path,
+    storage_capacity: float,
+    receiver_start_time: float,
+    expected_feasible: bool,
 ) -> None:
     instance = _package_instance(tmp_path, package_loads=(1.0,), vehicle_capacity=5.0)
     package = instance.package_data.packages[0]._replace(
@@ -337,7 +358,7 @@ def test_simultaneous_transfer_operations_are_processed_in_custody_order(
     instance = instance._replace(
         network_data=instance.network_data._replace(
             depots=(*instance.network_data.depots, depot_2),
-            transfer_facilities=(TransferFacilityRecord('node-b', 2.0),),
+            transfer_facilities=(TransferFacilityRecord('node-b', storage_capacity),),
         ),
         fleet_data=instance.fleet_data._replace(
             vehicles=(*instance.fleet_data.vehicles, vehicle_2),
@@ -392,7 +413,7 @@ def test_simultaneous_transfer_operations_are_processed_in_custody_order(
                 'vehicle-2',
                 1,
                 'depot-2',
-                5.0,
+                receiver_start_time,
                 'driver-2',
                 (
                     transfer_in,
@@ -415,4 +436,17 @@ def test_simultaneous_transfer_operations_are_processed_in_custody_order(
         solution, build_vrp_objective_declaration(instance)
     )
 
-    assert result.feasible is True
+    assert result.feasible is expected_feasible
+    analysis = cast(VrpOperatorAnalysis, result.analysis)
+    storage_findings = tuple(
+        finding
+        for finding in analysis.resource_findings
+        if finding.kind == 'transfer_storage'
+    )
+    if expected_feasible:
+        assert storage_findings == ()
+    else:
+        assert tuple(
+            (finding.resource_id, finding.measure, finding.transfer_step_ref)
+            for finding in storage_findings
+        ) == (('node-b', 1.0, transfer_ref),)

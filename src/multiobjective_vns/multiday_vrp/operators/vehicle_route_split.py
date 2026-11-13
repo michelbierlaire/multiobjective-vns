@@ -6,7 +6,6 @@ Author: Michel Bierlaire, EPFL
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -136,21 +135,13 @@ class VehicleRouteSplitOperator:
         )
 
     def _eligible_route_targets(self, solution: VrpSolution) -> tuple[int, ...]:
-        route_vehicles_by_day: dict[int, set[str]] = defaultdict(set)
-        for route in solution.routes:
-            route_vehicles_by_day[route.day_index].add(route.vehicle_id)
-        vehicle_ids = tuple(
-            item.vehicle_id for item in self._instance.fleet_data.vehicles
-        )
         eligible: list[int] = []
         for route_index, route in enumerate(solution.routes):
             units = _split_service_units(solution, route_index)
-            unused = tuple(
-                vehicle_id
-                for vehicle_id in vehicle_ids
-                if vehicle_id not in route_vehicles_by_day[route.day_index]
+            receiving_vehicles = _eligible_receiving_vehicle_ids(
+                self._instance, solution, route.day_index
             )
-            if len(units) >= 2 and unused:
+            if len(units) >= 2 and receiving_vehicles:
                 eligible.append(route_index)
         return tuple(eligible)
 
@@ -164,15 +155,8 @@ class VehicleRouteSplitOperator:
         units = _split_service_units(base, route_index)
         if len(units) < 2:
             return ()
-        existing_by_day = {
-            route.vehicle_id
-            for route in base.routes
-            if route.day_index == source_route.day_index
-        }
-        free_vehicles = tuple(
-            vehicle.vehicle_id
-            for vehicle in self._instance.fleet_data.vehicles
-            if vehicle.vehicle_id not in existing_by_day
+        free_vehicles = _eligible_receiving_vehicle_ids(
+            self._instance, base, source_route.day_index
         )
         driver_by_vehicle = _qualified_drivers(self._instance)
         vehicle_depots = _overnight_depots(self._instance)
@@ -309,3 +293,19 @@ class VehicleRouteSplitOperator:
             self._objective_position,
             context,
         )
+
+
+def _eligible_receiving_vehicle_ids(
+    instance: LoadedVrpInstance, solution: VrpSolution, day_index: int
+) -> tuple[str, ...]:
+    active_on_day = {
+        route.vehicle_id for route in solution.routes if route.day_index == day_index
+    }
+    active_over_horizon = {route.vehicle_id for route in solution.routes}
+    exact_count = instance.settings.exact_active_vehicle_count
+    return tuple(
+        vehicle.vehicle_id
+        for vehicle in instance.fleet_data.vehicles
+        if vehicle.vehicle_id not in active_on_day
+        and (exact_count is None or vehicle.vehicle_id in active_over_horizon)
+    )

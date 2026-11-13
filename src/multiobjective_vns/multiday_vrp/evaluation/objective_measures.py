@@ -55,7 +55,9 @@ class _ObjectiveMeasureMethods(_EvaluatorRuntime):
         measure_id = objective.base_measure_id
 
         if measure_id in {
+            'zero',
             'total_travel_time',
+            'total_waiting_time',
             'event_count',
             'maximum_event_exposure',
             'total_route_duration',
@@ -115,6 +117,9 @@ class _ObjectiveMeasureMethods(_EvaluatorRuntime):
         objective_id: str,
     ) -> float:
 
+        if measure_id == 'zero':
+            return 0.0
+
         if measure_id == 'total_travel_time':
             return validate_finite_result(
                 fsum(
@@ -124,6 +129,16 @@ class _ObjectiveMeasureMethods(_EvaluatorRuntime):
                     for traversal in leg.arc_traversals
                 ),
                 'total travel time',
+            )
+
+        if measure_id == 'total_waiting_time':
+            return validate_finite_result(
+                fsum(
+                    stop.pre_service_wait + stop.wait
+                    for route in solution.routes
+                    for stop in route.stops
+                ),
+                'total waiting time',
             )
 
         if measure_id in {'event_count', 'maximum_event_exposure'}:

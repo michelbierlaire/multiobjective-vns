@@ -52,6 +52,8 @@ def test_log_and_initialization_errors_expose_partial_results() -> None:
         failure=failure,
         event_log_path=Path('events.jsonl'),
         summary_path=None,
+        registry_view_path=Path('registry-view.json'),
+        pareto_view_path=None,
         executive_summary=None,
         report_diagnostics=(),
     )
@@ -59,9 +61,12 @@ def test_log_and_initialization_errors_expose_partial_results() -> None:
         invocation_id=InvocationId(UUID(int=1)),
         candidate_outcomes=(),
         diagnostics=(failure,),
+        registry_view_path=Path('registry-view.json'),
     )
 
     assert log_error.event_log_path == Path('events.jsonl')
+    assert log_error.registry_view_path == Path('registry-view.json')
     assert initial_error.diagnostics == (failure,)
+    assert initial_error.registry_view_path == Path('registry-view.json')
     with pytest.raises(InitialSolutionsError):
         raise initial_error

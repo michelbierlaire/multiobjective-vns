@@ -8,12 +8,14 @@ from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
     CandidateOutcome,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.records.evaluation import (
     ApplicationAnalysis,
     ApplicationEvaluation,
     EvaluationRecord,
+    ObjectiveBoundFinding,
     SolutionRecord,
 )
 from multiobjective_vns.records.extensions import (
@@ -62,6 +64,9 @@ from multiobjective_vns.records.results import (
     LogFinalizationResult,
     MaintenanceResult,
     ModificationCountFrequency,
+    ObjectiveBoundCount,
+    ObjectiveBoundEventFinding,
+    ObjectiveBoundReport,
     OperatorCatalogEntry,
     ParetoSolutionReport,
     PromotedCompositionReport,
@@ -70,6 +75,7 @@ from multiobjective_vns.records.results import (
     RunLog,
     RunProvenance,
     RunResult,
+    ViewerExportScope,
 )
 from multiobjective_vns.records.state import (
     Checkpoint,
@@ -103,6 +109,7 @@ __all__ = [
     'Candidate',
     'CandidateContext',
     'CandidateOutcome',
+    'CandidateProposal',
     'ChoiceDescriptor',
     'ChoiceSelectionRequest',
     'ComponentFailure',
@@ -128,6 +135,10 @@ __all__ = [
     'OperatorChoiceCategory',
     'MaintenanceResult',
     'ModificationCountFrequency',
+    'ObjectiveBoundCount',
+    'ObjectiveBoundEventFinding',
+    'ObjectiveBoundFinding',
+    'ObjectiveBoundReport',
     'OperatorCatalogEntry',
     'OperatorResult',
     'ParetoSolutionReport',
@@ -152,4 +163,5 @@ __all__ = [
     'LogFinalizationResult',
     'SubmissionSource',
     'TerminationReason',
+    'ViewerExportScope',
 ]

@@ -31,6 +31,7 @@ from multiobjective_vns.multiday_vrp.identity import VrpSolutionIdentity
 from multiobjective_vns.multiday_vrp.input_loader import load_vrp_instance
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.catalog import (
+    VrpOperatorCatalog,
     VrpOperatorCatalogSettings,
     build_default_vrp_operator_catalog,
 )
@@ -44,7 +45,11 @@ from multiobjective_vns.multiday_vrp.scenario_generation.records import (
 from multiobjective_vns.multiday_vrp.solution import VrpSolution
 from multiobjective_vns.objectives import ObjectiveDeclaration
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
-from multiobjective_vns.registrations import OperatorGroup, OperatorRegistration
+from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
+    OperatorGroup,
+    OperatorRegistration,
+)
 
 __all__ = [
     'VrpApplication',
@@ -63,10 +68,13 @@ class VrpApplication:
     :param instance: Normalized input data and its feature profile.
     :param problem_instance_id: Stable identity for the bound problem data.
     :param solution_codec: Immutable VRP plan checkpoint codec.
-    :param solution_identity: Structural VRP plan identity callback.
+    :param solution_identity: Canonical VRP plan identity callback bound to the
+        loaded pickup symmetry declarations.
     :param objective_declaration: Ordered objective comparison contract.
     :param application_evaluator: Evaluator bound to the instance and extensions.
     :param operators: Feature-selected default Operator registrations.
+    :param pre_registered_compositions: Default composite Operators enabled by
+        active features and selected objective targets.
     :param operator_groups: Validated soft composition hints.
     """
 
@@ -77,6 +85,7 @@ class VrpApplication:
     objective_declaration: ObjectiveDeclaration
     application_evaluator: VrpApplicationEvaluator
     operators: tuple[OperatorRegistration, ...]
+    pre_registered_compositions: tuple[OperatorCompositionRegistration, ...]
     operator_groups: tuple[OperatorGroup, ...]
 
 
@@ -206,7 +215,7 @@ def build_vrp_application(
         return assessment_evaluator.evaluate(solution, objective_declaration)
 
     assessor = cast(VrpPlanAssessor, assess_plan)
-    operators = build_default_vrp_operator_catalog(
+    catalog = build_default_vrp_operator_catalog(
         instance,
         problem_instance_id=problem_instance_id,
         objective_declaration=objectives,
@@ -214,26 +223,30 @@ def build_vrp_application(
         additive_path_costs=additive_path_costs,
         settings=settings,
     )
-    _validate_operator_groups(operator_groups, operators)
+    _validate_operator_groups(operator_groups, catalog)
 
     return VrpApplication(
         instance=instance,
         problem_instance_id=problem_instance_id,
         solution_codec=VrpSolutionCodec(),
-        solution_identity=VrpSolutionIdentity(),
+        solution_identity=VrpSolutionIdentity(instance),
         objective_declaration=objectives,
         application_evaluator=evaluator,
-        operators=operators,
+        operators=catalog.operators,
+        pre_registered_compositions=catalog.pre_registered_compositions,
         operator_groups=operator_groups,
     )
 
 
 def _validate_operator_groups(
-    groups: tuple[OperatorGroup, ...], operators: tuple[OperatorRegistration, ...]
+    groups: tuple[OperatorGroup, ...], catalog: VrpOperatorCatalog
 ) -> None:
     group_ids: set[object] = set()
     group_texts: set[str] = set()
-    operator_ids = {registration.operator_id for registration in operators}
+    operator_ids = {registration.operator_id for registration in catalog.operators}
+    operator_ids.update(
+        registration.operator_id for registration in catalog.pre_registered_compositions
+    )
     for group in groups:
         group_text = identifier_text(group.group_id)
         if group.group_id in group_ids or group_text in group_texts:

@@ -31,7 +31,11 @@ from multiobjective_vns.multiday_vrp.operators import (
 from multiobjective_vns.multiday_vrp.solution import VrpSolution
 from multiobjective_vns.objectives import ObjectiveDeclaration
 from multiobjective_vns.random_source import RandomSource
-from multiobjective_vns.records.candidates import Candidate, CandidateContext
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 
 from .input_fixtures import write_minimal_vrp_bundle
@@ -137,10 +141,10 @@ def test_operator_result_matches_candidate_and_modification_count() -> None:
         solution, modifications=2, requested_size=4, metadata={'source': 'test'}
     )
 
-    assert empty.m == 0
-    assert empty.candidate is None
-    assert result.m == 2
-    assert result.candidate == Candidate(solution, {'source': 'test'})
+    assert empty.candidates == ()
+    assert result.candidates == (
+        CandidateProposal(Candidate(solution, {'source': 'test'}), 2),
+    )
 
 
 @pytest.mark.parametrize(

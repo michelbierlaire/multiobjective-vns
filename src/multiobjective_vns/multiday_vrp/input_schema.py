@@ -19,10 +19,20 @@ MANIFEST_REQUIRED = frozenset(
         'files',
     }
 )
-MANIFEST_OPTIONAL = frozenset({'application_data_file', 'hos_configuration_file'})
+MANIFEST_OPTIONAL = frozenset(
+    {
+        'application_data_file',
+        'exact_active_vehicle_count',
+        'hos_configuration_file',
+        'pickup_symmetry_groups',
+        'node_coordinate_system_id',
+        'node_coordinate_unit',
+    }
+)
 
 FILE_COLUMNS: dict[str, tuple[str, ...]] = {
     'nodes': ('node_id',),
+    'node_coordinates': ('node_id', 'x', 'y'),
     'arcs': ('arc_id', 'tail_node_id', 'head_node_id'),
     'depots': ('depot_id', 'node_id'),
     'transfer_facilities': ('node_id', 'storage_capacity'),
@@ -109,6 +119,7 @@ FILE_COLUMNS: dict[str, tuple[str, ...]] = {
     'continuous_driving_limits': ('driver_id', 'max_continuous_driving_time'),
 }
 FILE_NAMES = {
+    'node_coordinates': 'node-coordinates.csv',
     'transfer_facilities': 'transfer-facilities.csv',
     'vehicle_overnight_depots': 'vehicle-overnight-depots.csv',
     'vehicle_driving_skills': 'vehicle-driving-skills.csv',
@@ -147,7 +158,9 @@ SIMPLE_RULES = frozenset(
 )
 BUILTIN_BASE_MEASURES = frozenset(
     {
+        'zero',
         'total_travel_time',
+        'total_waiting_time',
         'event_count',
         'maximum_event_exposure',
         'total_route_duration',

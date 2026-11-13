@@ -79,9 +79,9 @@ def call(
 
 
 def candidate_solution(result: OperatorResult) -> tuple[int, ...] | None:
-    if result.candidate is None:
+    if not result.candidates:
         return None
-    solution = result.candidate.solution
+    solution = result.candidates[0].candidate.solution
     assert isinstance(solution, tuple)
     return solution
 
@@ -92,7 +92,7 @@ def test_profile_remove_uses_low_selected_and_high_excluded_boundary_items() -> 
 
     result = call(operator, (1, 1, 0, 0))
 
-    assert result.m == 1
+    assert result.candidates[0].m == 1
     assert candidate_solution(result) == (1, 0, 0, 0)
 
 
@@ -118,7 +118,7 @@ def test_profile_exchange_restricts_both_sides_to_boundary() -> None:
 
     result = call(operator, (0, 0, 0, 1), ensure_feasible=False)
 
-    assert result.m == 1
+    assert result.candidates[0].m == 1
     assert candidate_solution(result) == (0, 1, 0, 0)
 
 
@@ -127,7 +127,7 @@ def test_profile_capacity_repair_removes_lowest_scoring_boundary_item() -> None:
 
     result = call(operator, (1, 1, 1, 0))
 
-    assert result.m == 1
+    assert result.candidates[0].m == 1
     assert candidate_solution(result) == (1, 0, 1, 0)
 
 

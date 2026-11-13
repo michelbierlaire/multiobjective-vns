@@ -7,6 +7,7 @@ Author: Michel Bierlaire, EPFL
 from dataclasses import dataclass
 
 from multiobjective_vns.callbacks import Operator
+from multiobjective_vns.candidate_batch import CandidateBatchAdapter
 from multiobjective_vns.knapsack.instance import KnapsackInstance
 from multiobjective_vns.knapsack.operators.basic import (
     AddItemsOperator,
@@ -60,8 +61,8 @@ def _registration(
 ) -> OperatorRegistration:
     return OperatorRegistration(
         operator_id=operator_id,
-        configuration_id=configuration_id,
-        operator=operator,
+        configuration_id=f'knapsack-candidate-batch-v2:{configuration_id}',
+        operator=CandidateBatchAdapter(operator),
         initial_state=None,
         max_neighborhood_size=max_size,
         feasibility_restoration=feasibility_restoration,

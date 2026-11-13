@@ -72,6 +72,30 @@ class OperatorRegistration:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorCompositionRegistration:
+    """Stable identity and ordered components for a pre-registered composite.
+
+    The composite is executed by the search engine as ``second(first(x))``.
+    Its neighborhood limit, feasibility-restoration guarantee, and
+    modification count are derived from its component registrations.
+    """
+
+    operator_id: OperatorId
+    configuration_id: ComponentConfigurationId
+    first_operator_id: OperatorId
+    second_operator_id: OperatorId
+
+    def __post_init__(self) -> None:
+        try:
+            identifier_text(self.operator_id)
+            identifier_text(self.configuration_id)
+            identifier_text(self.first_operator_id)
+            identifier_text(self.second_operator_id)
+        except Exception as error:
+            raise ComponentRegistrationError(str(error)) from error
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorGroup:
     """User hint grouping Operators that may be promising to combine."""
 

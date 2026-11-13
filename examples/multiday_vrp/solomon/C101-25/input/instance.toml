@@ -1,7 +1,7 @@
 # Solomon C101 with the first 25 customers.
 # The single ScenarioBank day is 2025-01-02 in the Geneva time zone.
 format_version = 1
-instance_id = 'solomon-c101-25-package-input-v1'
+instance_id = 'solomon-c101-25-package-input-v2'
 scenario_bank_file = 'scenario-bank/scenario-bank.toml'
 load_unit = 'solomon-demand-units'
 
@@ -19,6 +19,18 @@ rule_treatment = 'penalty'
 active_simple_rules = []
 hos_regime_id = 'none'
 hos_regime_version = 'none'
+
+# All Solomon pickups occur at the depot with identical zero-duration service
+# and pickup windows. Their order is interchangeable for this model.
+[[pickup_symmetry_groups]]
+group_id = 'solomon-depot-pickups'
+package_ids = [
+    'package-01', 'package-02', 'package-03', 'package-04', 'package-05',
+    'package-06', 'package-07', 'package-08', 'package-09', 'package-10',
+    'package-11', 'package-12', 'package-13', 'package-14', 'package-15',
+    'package-16', 'package-17', 'package-18', 'package-19', 'package-20',
+    'package-21', 'package-22', 'package-23', 'package-24', 'package-25',
+]
 
 [files]
 nodes = 'nodes.csv'

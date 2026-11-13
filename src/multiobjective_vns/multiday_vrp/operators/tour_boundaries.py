@@ -7,13 +7,13 @@ Author: Michel Bierlaire, EPFL
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cmp_to_key
 from itertools import product
 
 from multiobjective_vns.identifiers import ObjectiveId
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
-    choose_uniformly,
     operator_result,
     randomized_order,
     randomized_sample,
@@ -39,7 +39,12 @@ from multiobjective_vns.objectives import (
     ObjectiveComparison,
     ObjectiveDeclaration,
 )
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.values import require_integer
 
 __all__ = ['MergeToursOperator', 'SplitTourOperator']
@@ -62,7 +67,14 @@ class _InsertedVisitTarget:
     inbound_paths: tuple[tuple[str, ...], ...]
 
 
-type _SplitTarget = _ExistingVisitTarget | _InsertedVisitTarget
+@dataclass(frozen=True, slots=True)
+class _InsertedVisitLocation:
+    route_index: int
+    leg_index: int
+    depot_node_id: str
+
+
+type _SplitLocation = _ExistingVisitTarget | _InsertedVisitLocation
 
 
 class SplitTourOperator:
@@ -125,53 +137,71 @@ class SplitTourOperator:
 
         :param context: Immutable base, requested size, feasibility requirement,
             and shared random source.
-        :returns: The changed plan and number of boundaries added, or ``m=0``.
+        :returns: Up to ``context.max_candidates`` ordered proposals from the
+            last completed split step, each with the number of added boundaries.
         """
         size = validate_neighborhood_size(context.k, self._maximum_size)
         base = require_vrp_base(context)
         working = base
         modifications = 0
+        last_candidates: tuple[_ScoredCandidate, ...] = ()
         for _ in range(size):
             candidates = self._assessed_candidates(
                 working, self._candidate_plans(working, context), context
             )
             if not candidates:
                 break
-            working = self._choose(candidates, context)
+            last_candidates = _order_candidates(
+                candidates,
+                self._objectives,
+                self._objective_position,
+                context,
+            )
+            working = last_candidates[0][0]
             modifications += 1
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
+        if not modifications:
+            return operator_result(None, modifications=0, requested_size=size)
+        proposals = tuple(
+            CandidateProposal(Candidate(solution), modifications)
+            for solution, _values in last_candidates[: context.max_candidates]
         )
+        return OperatorResult(candidates=proposals)
 
     def _candidate_plans(
         self, solution: VrpSolution, context: CandidateContext
     ) -> tuple[VrpSolution, ...]:
-        targets = randomized_order(
-            _split_targets(
-                self._instance,
-                solution,
-                context,
-                path_limit=self._path_limit,
-                expansion_limit=self._expansion_limit,
-            ),
-            context.random_source,
+        locations = randomized_order(
+            _split_locations(self._instance, solution), context.random_source
         )
+        path_cache: dict[tuple[str, str], tuple[tuple[str, ...], ...]] = {}
         candidates: list[VrpSolution] = []
-        for target in targets:
-            if isinstance(target, _ExistingVisitTarget):
-                stops = list(solution.routes[target.route_index].stops)
-                stop = stops[target.stop_index]
-                stops[target.stop_index] = replace(stop, tour_end=True)
+        for location in locations:
+            if isinstance(location, _ExistingVisitTarget):
+                stops = list(solution.routes[location.route_index].stops)
+                stop = stops[location.stop_index]
+                stops[location.stop_index] = replace(stop, tour_end=True)
                 candidate = _replace_route_stops(
-                    solution, target.route_index, tuple(stops)
+                    solution, location.route_index, tuple(stops)
                 )
                 _append_distinct(candidates, candidate)
             else:
+                target = _materialize_inserted_target(
+                    self._instance,
+                    solution,
+                    location,
+                    context,
+                    path_cache,
+                    path_limit=self._path_limit,
+                    expansion_limit=self._expansion_limit,
+                )
+                if target is None:
+                    continue
                 path_pairs = tuple(product(target.outbound_paths, target.inbound_paths))
-                for outbound_path, inbound_path in randomized_order(
-                    path_pairs, context.random_source
+                remaining = self._candidate_limit - len(candidates)
+                for outbound_path, inbound_path in randomized_sample(
+                    path_pairs,
+                    min(remaining, len(path_pairs)),
+                    context.random_source,
                 ):
                     candidate = _insert_tour_boundary(
                         solution,
@@ -206,16 +236,6 @@ class SplitTourOperator:
             if candidate != base:
                 assessed.append((candidate, evaluation.objective_values))
         return tuple(assessed)
-
-    def _choose(
-        self, candidates: tuple[_ScoredCandidate, ...], context: CandidateContext
-    ) -> VrpSolution:
-        return _choose_candidate(
-            candidates,
-            self._objectives,
-            self._objective_position,
-            context,
-        )[0]
 
 
 class MergeToursOperator:
@@ -268,12 +288,14 @@ class MergeToursOperator:
 
         :param context: Immutable base, requested size, feasibility requirement,
             and shared random source.
-        :returns: The changed plan and number of boundaries removed, or ``m=0``.
+        :returns: Up to ``context.max_candidates`` ordered proposals from the
+            last completed merge step, each with the number of removed boundaries.
         """
         size = validate_neighborhood_size(context.k, self._maximum_size)
         base = require_vrp_base(context)
         working = base
         modifications = 0
+        last_candidates: tuple[_ScoredCandidate, ...] = ()
         for _ in range(size):
             targets = _merge_targets(self._instance, working)
             selected = randomized_sample(
@@ -286,13 +308,21 @@ class MergeToursOperator:
             assessed = self._assessed_candidates(working, candidates, context)
             if not assessed:
                 break
-            working = self._choose(assessed, context)
+            last_candidates = _order_candidates(
+                assessed,
+                self._objectives,
+                self._objective_position,
+                context,
+            )
+            working = last_candidates[0][0]
             modifications += 1
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
+        if not modifications:
+            return operator_result(None, modifications=0, requested_size=size)
+        proposals = tuple(
+            CandidateProposal(Candidate(solution), modifications)
+            for solution, _values in last_candidates[: context.max_candidates]
         )
+        return OperatorResult(candidates=proposals)
 
     def _assessed_candidates(
         self,
@@ -315,127 +345,128 @@ class MergeToursOperator:
                 assessed.append((candidate, evaluation.objective_values))
         return tuple(assessed)
 
-    def _choose(
-        self, candidates: tuple[_ScoredCandidate, ...], context: CandidateContext
-    ) -> VrpSolution:
-        return _choose_candidate(
-            candidates,
-            self._objectives,
-            self._objective_position,
-            context,
-        )[0]
 
-
-def _split_targets(
-    instance: LoadedVrpInstance,
-    solution: VrpSolution,
-    context: CandidateContext,
-    *,
-    path_limit: int,
-    expansion_limit: int,
-) -> tuple[_SplitTarget, ...]:
+def _split_locations(
+    instance: LoadedVrpInstance, solution: VrpSolution
+) -> tuple[_SplitLocation, ...]:
     max_tours = {
         item.vehicle_id: item.max_tours_per_day for item in instance.fleet_data.vehicles
     }
     depot_nodes = tuple(sorted({item.node_id for item in instance.network_data.depots}))
-    targets: list[_SplitTarget] = []
+    locations: list[_SplitLocation] = []
     for route_index, route in enumerate(solution.routes):
         if 1 + sum(stop.tour_end for stop in route.stops) >= max_tours.get(
             route.vehicle_id, 1
         ):
             continue
+        route_nodes = route_node_sequence(instance, solution, route)
+        stop_nodes = tuple(
+            stop_node_id(instance, solution, stop) for stop in route.stops
+        )
         for stop_index, stop in enumerate(route.stops):
+            depot_node_id = stop_nodes[stop_index]
             if (
-                stop_node_id(instance, solution, stop) in depot_nodes
+                depot_node_id in depot_nodes
                 and not stop.tour_end
-                and _is_final_depot_stop_in_visit(
+                and (
+                    stop_index + 1 == len(stop_nodes)
+                    or stop_nodes[stop_index + 1] != depot_node_id
+                )
+                and _is_intermediate_depot_visit(
                     instance,
                     solution,
                     route_index,
                     stop_index,
-                    stop_node_id(instance, solution, stop),
-                )
-                and _is_intermediate_depot_visit(
-                    instance, solution, route_index, stop_index
+                    route_nodes=route_nodes,
+                    stop_nodes=stop_nodes,
                 )
             ):
-                targets.append(_ExistingVisitTarget(route_index, stop_index))
+                locations.append(_ExistingVisitTarget(route_index, stop_index))
 
-        route_nodes = route_node_sequence(instance, solution, route)
         for leg_index, (origin, destination) in enumerate(
             zip(route_nodes[:-1], route_nodes[1:], strict=True)
         ):
             for depot_node_id in depot_nodes:
                 if depot_node_id in {origin, destination}:
                     continue
-                outbound = sample_loopless_paths(
-                    instance,
-                    origin,
-                    depot_node_id,
-                    random_source=context.random_source,
-                    max_paths=path_limit,
-                    max_arc_expansion_steps=expansion_limit,
+                locations.append(
+                    _InsertedVisitLocation(route_index, leg_index, depot_node_id)
                 )
-                if not outbound:
-                    continue
-                inbound = sample_loopless_paths(
-                    instance,
-                    depot_node_id,
-                    destination,
-                    random_source=context.random_source,
-                    max_paths=path_limit,
-                    max_arc_expansion_steps=expansion_limit,
-                )
-                if inbound:
-                    targets.append(
-                        _InsertedVisitTarget(
-                            route_index,
-                            leg_index,
-                            depot_node_id,
-                            outbound,
-                            inbound,
-                        )
-                    )
-    return tuple(targets)
+    return tuple(locations)
+
+
+def _materialize_inserted_target(
+    instance: LoadedVrpInstance,
+    solution: VrpSolution,
+    location: _InsertedVisitLocation,
+    context: CandidateContext,
+    path_cache: dict[tuple[str, str], tuple[tuple[str, ...], ...]],
+    *,
+    path_limit: int,
+    expansion_limit: int,
+) -> _InsertedVisitTarget | None:
+    route = solution.routes[location.route_index]
+    nodes = route_node_sequence(instance, solution, route)
+    origin, destination = nodes[location.leg_index : location.leg_index + 2]
+
+    def paths_between(start: str, end: str) -> tuple[tuple[str, ...], ...]:
+        key = (start, end)
+        if key not in path_cache:
+            path_cache[key] = sample_loopless_paths(
+                instance,
+                start,
+                end,
+                random_source=context.random_source,
+                max_paths=path_limit,
+                max_arc_expansion_steps=expansion_limit,
+            )
+        return path_cache[key]
+
+    outbound = paths_between(origin, location.depot_node_id)
+    if not outbound:
+        return None
+    inbound = paths_between(location.depot_node_id, destination)
+    if not inbound:
+        return None
+    return _InsertedVisitTarget(
+        location.route_index,
+        location.leg_index,
+        location.depot_node_id,
+        outbound,
+        inbound,
+    )
 
 
 def _merge_targets(
     instance: LoadedVrpInstance, solution: VrpSolution
 ) -> tuple[tuple[int, int], ...]:
     depot_nodes = {item.node_id for item in instance.network_data.depots}
-    return tuple(
-        (route_index, stop_index)
-        for route_index, route in enumerate(solution.routes)
-        for stop_index, stop in enumerate(route.stops)
-        if (
-            stop_node_id(instance, solution, stop) in depot_nodes
-            and stop.tour_end
-            and _is_final_depot_stop_in_visit(
-                instance,
-                solution,
-                route_index,
-                stop_index,
-                stop_node_id(instance, solution, stop),
-            )
-            and _is_intermediate_depot_visit(
-                instance, solution, route_index, stop_index
-            )
+    targets: list[tuple[int, int]] = []
+    for route_index, route in enumerate(solution.routes):
+        route_nodes = route_node_sequence(instance, solution, route)
+        stop_nodes = tuple(
+            stop_node_id(instance, solution, stop) for stop in route.stops
         )
-    )
-
-
-def _is_final_depot_stop_in_visit(
-    instance: LoadedVrpInstance,
-    solution: VrpSolution,
-    route_index: int,
-    stop_index: int,
-    node_id: str,
-) -> bool:
-    stops = solution.routes[route_index].stops
-    return (
-        stop_index + 1 == len(stops)
-        or stop_node_id(instance, solution, stops[stop_index + 1]) != node_id
-    )
+        for stop_index, stop in enumerate(route.stops):
+            depot_node_id = stop_nodes[stop_index]
+            if (
+                depot_node_id in depot_nodes
+                and stop.tour_end
+                and (
+                    stop_index + 1 == len(stop_nodes)
+                    or stop_nodes[stop_index + 1] != depot_node_id
+                )
+                and _is_intermediate_depot_visit(
+                    instance,
+                    solution,
+                    route_index,
+                    stop_index,
+                    route_nodes=route_nodes,
+                    stop_nodes=stop_nodes,
+                )
+            ):
+                targets.append((route_index, stop_index))
+    return tuple(targets)
 
 
 def _is_intermediate_depot_visit(
@@ -443,29 +474,35 @@ def _is_intermediate_depot_visit(
     solution: VrpSolution,
     route_index: int,
     stop_index: int,
+    *,
+    route_nodes: tuple[str, ...] | None = None,
+    stop_nodes: tuple[str, ...] | None = None,
 ) -> bool:
     route = solution.routes[route_index]
-    stop = route.stops[stop_index]
-    nodes = route_node_sequence(instance, solution, route)
+    nodes = (
+        route_node_sequence(instance, solution, route)
+        if route_nodes is None
+        else route_nodes
+    )
+    stop_node_ids = (
+        tuple(stop_node_id(instance, solution, stop) for stop in route.stops)
+        if stop_nodes is None
+        else stop_nodes
+    )
     start_node, end_node = nodes[0], nodes[-1]
-    stop_node = stop_node_id(instance, solution, stop)
+    stop_node = stop_node_ids[stop_index]
     if stop_node == start_node:
         start_block_end = 0
         while (
             start_block_end + 1 < len(route.stops)
-            and stop_node_id(instance, solution, route.stops[start_block_end + 1])
-            == start_node
+            and stop_node_ids[start_block_end + 1] == start_node
         ):
             start_block_end += 1
         if stop_index <= start_block_end:
             return False
     if stop_node == end_node:
         end_block_start = len(route.stops) - 1
-        while (
-            end_block_start > 0
-            and stop_node_id(instance, solution, route.stops[end_block_start - 1])
-            == end_node
-        ):
+        while end_block_start > 0 and stop_node_ids[end_block_start - 1] == end_node:
             end_block_start -= 1
         if stop_index >= end_block_start:
             return False
@@ -521,27 +558,41 @@ def _append_distinct(candidates: list[VrpSolution], candidate: VrpSolution) -> N
         candidates.append(candidate)
 
 
-def _choose_candidate(
+def _order_candidates(
     candidates: tuple[_ScoredCandidate, ...],
     objectives: ObjectiveDeclaration,
     objective_index: int | None,
     context: CandidateContext,
-) -> _ScoredCandidate:
+) -> tuple[_ScoredCandidate, ...]:
     if objective_index is None:
-        return choose_uniformly(candidates, context.random_source)
+        return randomized_order(candidates, context.random_source)
     objective = objectives.objectives[objective_index]
-    best = candidates[0]
-    tied = [best]
-    for candidate in candidates[1:]:
+
+    def compare(left: _ScoredCandidate, right: _ScoredCandidate) -> int:
         comparison = objective.compare(
-            candidate[1][objective_index], best[1][objective_index]
+            left[1][objective_index], right[1][objective_index]
         )
         if comparison is ObjectiveComparison.LESS:
-            best = candidate
-            tied = [candidate]
-        elif comparison is ObjectiveComparison.EQUAL:
-            tied.append(candidate)
-    return choose_uniformly(tied, context.random_source)
+            return -1
+        if comparison is ObjectiveComparison.GREATER:
+            return 1
+        return 0
+
+    ranked = sorted(candidates, key=cmp_to_key(compare))
+    ordered: list[_ScoredCandidate] = []
+    group_start = 0
+    while group_start < len(ranked):
+        group_end = group_start + 1
+        while (
+            group_end < len(ranked)
+            and compare(ranked[group_start], ranked[group_end]) == 0
+        ):
+            group_end += 1
+        ordered.extend(
+            randomized_order(ranked[group_start:group_end], context.random_source)
+        )
+        group_start = group_end
+    return tuple(ordered)
 
 
 def _bounded_limit(value: int, name: str, maximum: int) -> int:

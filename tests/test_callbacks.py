@@ -4,6 +4,8 @@ Created: 2026-10-29T13:19:17+00:00
 Author: Michel Bierlaire, EPFL
 """
 
+import json
+
 from multiobjective_vns.callbacks import (
     ApplicationEvaluator,
     CodecPayload,
@@ -30,14 +32,14 @@ class CallbackBundle:
     def equivalent(self, left: object, right: object) -> bool:
         return left == right
 
-    def capture(self, solution: object) -> object:
-        return solution
+    def capture(self, solution: object) -> bytes:
+        return json.dumps(solution).encode('utf-8')
 
-    def restore(self, payload: object) -> object:
-        return payload
+    def restore(self, payload: bytes) -> object:
+        return tuple(json.loads(payload))
 
     def call(self, context: CandidateContext) -> OperatorResult:
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
 
 
 def test_application_callbacks_are_structural_protocols() -> None:
@@ -50,8 +52,8 @@ def test_application_callbacks_are_structural_protocols() -> None:
     assert evaluator.evaluate((0,), None) == ApplicationEvaluation(True, True, (0, 0))  # type: ignore[arg-type]
     assert identity.equivalent((0,), (0,))
     assert codec.restore(codec.capture((0,))) == (0,)
-    assert operator.call(None).m == 0  # type: ignore[arg-type]
+    assert operator.call(None).candidates == ()  # type: ignore[arg-type]
     solution: Solution = (1, 0)
     payload: CodecPayload = codec.capture(solution)
     state_payload: StatePayload = payload
-    assert state_payload == solution
+    assert state_payload == b'[1, 0]'

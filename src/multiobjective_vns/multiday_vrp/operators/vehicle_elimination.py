@@ -25,6 +25,14 @@ from multiobjective_vns.multiday_vrp.operators.feature_common import (
     assess_complete_candidate,
     objective_position,
 )
+from multiobjective_vns.multiday_vrp.operators.path_search import (
+    route_node_sequence,
+    stop_node_id,
+)
+from multiobjective_vns.multiday_vrp.operators.vehicle_insertion_search import (
+    InsertionStrategy,
+    build_insertion_beam,
+)
 from multiobjective_vns.multiday_vrp.operators.vehicle_route_assignment_helpers import (
     _bounded_limit,
     _choose_scored,
@@ -65,7 +73,8 @@ class VehicleEliminationDestroyRepairOperator:
     :param assess_plan: Shared complete-plan assessment callback.
     :param max_neighborhood_size: Largest supported value of ``k``.
     :param objective_id: Optional objective used to rank alternatives.
-    :param max_candidate_alternatives: Maximum repair trials per elimination.
+    :param insertion_strategy: Best insertion or regret insertion.
+    :param max_candidate_alternatives: Per-unit proposal limit and beam width.
     :param max_paths_per_leg: Maximum sampled paths for a route leg.
     :param max_arc_expansion_steps: Search bound for each sampled path.
     """
@@ -75,6 +84,7 @@ class VehicleEliminationDestroyRepairOperator:
         '_objectives',
         '_assess_plan',
         '_objective_position',
+        '_insertion_strategy',
         '_maximum_size',
         '_candidate_limit',
         '_path_limit',
@@ -89,6 +99,7 @@ class VehicleEliminationDestroyRepairOperator:
         *,
         max_neighborhood_size: int,
         objective_id: ObjectiveId | None = None,
+        insertion_strategy: InsertionStrategy = 'best',
         max_candidate_alternatives: int = 32,
         max_paths_per_leg: int = 32,
         max_arc_expansion_steps: int = 10000,
@@ -101,6 +112,9 @@ class VehicleEliminationDestroyRepairOperator:
             if objective_id is None
             else objective_position(objective_declaration, objective_id)
         )
+        if insertion_strategy not in {'best', 'regret'}:
+            raise ValueError("insertion_strategy must be 'best' or 'regret'")
+        self._insertion_strategy = insertion_strategy
         self._maximum_size = require_integer(
             max_neighborhood_size, name='max_neighborhood_size', minimum=1
         )
@@ -151,13 +165,12 @@ class VehicleEliminationDestroyRepairOperator:
                     for route_index, _stop_index, _stop in unit.occurrences
                 )
             )
-            candidates = self._repair_candidates(
+            assessed = self._repair_candidates(
                 working,
                 source_vehicle_id,
                 selected_groups,
                 context,
             )
-            assessed = self._assess_candidates(candidates, context)
             if not assessed:
                 break
             working = _choose_scored(
@@ -180,106 +193,232 @@ class VehicleEliminationDestroyRepairOperator:
         source_vehicle_id: str,
         groups: tuple[tuple[_ServiceUnit, ...], ...],
         context: CandidateContext,
-    ) -> tuple[VrpSolution, ...]:
-        selected_keys = {unit.key for group in groups for unit in group}
-        partial_routes = []
-        for route in base.routes:
-            if route.vehicle_id == source_vehicle_id:
-                continue
-            kept_stops = tuple(
-                stop
-                for stop in route.stops
-                if _stop_unit_key(stop) not in selected_keys
-            )
-            partial_routes.append(replace(route, stops=kept_stops))
-        partial = _sort_routes(
-            replace(base, routes=tuple(partial_routes)), self._instance
-        )
-        if not partial.routes or not groups:
+    ) -> tuple[_ScoredPlan, ...]:
+        if not groups:
             return ()
 
-        completed: list[VrpSolution] = []
-        for _ in range(self._candidate_limit):
-            trial = partial
-            complete = True
-            for group in randomized_order(groups, context.random_source):
-                for unit in randomized_order(group, context.random_source):
-                    updated = self._insert_repair_unit(trial, unit, context)
-                    if updated is None:
-                        complete = False
-                        break
-                    trial = updated
-                if not complete:
-                    break
-            if not complete:
-                continue
+        def propose(
+            plan: VrpSolution,
+            group: tuple[_ServiceUnit, ...],
+            proposal_context: CandidateContext,
+        ) -> tuple[VrpSolution, ...]:
+            return self._relationship_group_placements(
+                plan,
+                source_vehicle_id,
+                group,
+                proposal_context,
+            )
+
+        def assess(plan: VrpSolution) -> tuple[object, ...] | None:
+            evaluation = assess_complete_candidate(
+                self._instance,
+                self._objectives,
+                plan,
+                self._assess_plan,
+                ensure_feasible=context.ensure_feasible,
+            )
+            return None if evaluation is None else evaluation.objective_values
+
+        return build_insertion_beam(
+            base,
+            groups,
+            propose,
+            assess,
+            self._objectives,
+            objective_position=self._objective_position,
+            strategy=self._insertion_strategy,
+            context=context,
+            candidate_limit=self._candidate_limit,
+        )
+
+    def _relationship_group_placements(
+        self,
+        base: VrpSolution,
+        source_vehicle_id: str,
+        group: tuple[_ServiceUnit, ...],
+        context: CandidateContext,
+    ) -> tuple[VrpSolution, ...]:
+        keys = {unit.key for unit in group}
+        moved_stops = tuple(
+            stop
+            for route in base.routes
+            for stop in route.stops
+            if _stop_unit_key(stop) in keys
+        )
+        if not moved_stops:
+            return ()
+
+        remaining_routes = tuple(
+            replace(
+                route,
+                stops=tuple(
+                    stop for stop in route.stops if _stop_unit_key(stop) not in keys
+                ),
+            )
+            for route in base.routes
+        )
+        receiving_plan = replace(base, routes=remaining_routes)
+        receiving_plan = _sort_routes(
+            replace(
+                receiving_plan,
+                routes=tuple(
+                    route
+                    for route in receiving_plan.routes
+                    if any(_stop_unit_key(stop) is not None for stop in route.stops)
+                ),
+            ),
+            self._instance,
+        )
+        if not receiving_plan.routes:
+            return ()
+
+        partial_plans: tuple[VrpSolution, ...] = (receiving_plan,)
+        for unit in randomized_order(group, context.random_source):
+            expanded: list[VrpSolution] = []
+            for partial in partial_plans:
+                expanded.extend(
+                    self._service_unit_placements(
+                        partial,
+                        source_vehicle_id,
+                        unit,
+                        context,
+                    )
+                )
+            unique = _unique_plans(expanded)
+            if not unique:
+                return ()
+            ordered = randomized_order(unique, context.random_source)
+            partial_plans = ordered[: self._candidate_limit]
+
+        complete: list[VrpSolution] = []
+        for plan in partial_plans:
+            ordered_plan = _sort_routes(plan, self._instance)
             with_paths = _rebuild_paths(
                 self._instance,
                 base,
-                trial,
+                ordered_plan,
                 context,
                 max_paths=self._path_limit,
                 max_expansions=self._expansion_limit,
             )
-            if with_paths is None or with_paths == base:
-                continue
-            if with_paths not in completed:
-                completed.append(with_paths)
-        return tuple(completed)
+            if with_paths is not None and with_paths != base:
+                _append_unique_plan(complete, with_paths)
+        return tuple(complete)
 
-    def _insert_repair_unit(
+    def _service_unit_placements(
         self,
-        partial: VrpSolution,
+        plan: VrpSolution,
+        source_vehicle_id: str,
         unit: _ServiceUnit,
         context: CandidateContext,
-    ) -> VrpSolution | None:
+    ) -> tuple[VrpSolution, ...]:
         if unit.key[0] == 'package':
-            return _insert_package_chain(
-                self._instance,
-                partial,
-                unit,
-                context,
+            package_stops = tuple(
+                sorted(
+                    (replace(item[2], tour_end=False) for item in unit.occurrences),
+                    key=_package_operation_order,
+                )
             )
-        stops = tuple(
-            _without_tour_boundary(occurrence[2]) for occurrence in unit.occurrences
-        )
-        if not stops or not partial.routes:
-            return None
-        route_index = choose_uniformly(
-            tuple(range(len(partial.routes))), context.random_source
-        )
-        route = partial.routes[route_index]
-        insertion_index = choose_uniformly(
-            tuple(range(len(route.stops) + 1)), context.random_source
-        )
-        updated_routes = list(partial.routes)
-        updated_routes[route_index] = replace(
-            route,
-            stops=(
-                *route.stops[:insertion_index],
-                *stops,
-                *route.stops[insertion_index:],
-            ),
-        )
-        return replace(partial, routes=tuple(updated_routes))
+            package_states: tuple[tuple[VrpSolution, str | None], ...] = ((plan, None),)
+            for stop in package_stops:
+                expanded: list[tuple[VrpSolution, str | None]] = []
+                for current, carrier in package_states:
+                    expanded.extend(
+                        self._package_stop_placements(
+                            current,
+                            source_vehicle_id,
+                            unit.key[1],
+                            stop,
+                            carrier,
+                            context,
+                        )
+                    )
+                package_states = randomized_order(
+                    _unique_carrier_plans(expanded), context.random_source
+                )[: self._candidate_limit]
+                if not package_states:
+                    return ()
+            return tuple(current for current, _carrier in package_states)
 
-    def _assess_candidates(
+        activity_states: tuple[VrpSolution, ...] = (plan,)
+        stops = tuple(replace(item[2], tour_end=False) for item in unit.occurrences)
+        for stop in stops:
+            expanded_plans: list[VrpSolution] = []
+            for current in activity_states:
+                expanded_plans.extend(
+                    self._activity_stop_placements(
+                        current,
+                        source_vehicle_id,
+                        stop,
+                        context,
+                    )
+                )
+            activity_states = randomized_order(
+                _unique_plans(expanded_plans), context.random_source
+            )[: self._candidate_limit]
+            if not activity_states:
+                return ()
+        return activity_states
+
+    def _activity_stop_placements(
         self,
-        candidates: Sequence[VrpSolution],
+        plan: VrpSolution,
+        source_vehicle_id: str,
+        stop: RouteStop,
         context: CandidateContext,
-    ) -> tuple[_ScoredPlan, ...]:
-        assessed: list[_ScoredPlan] = []
-        for candidate in candidates:
-            evaluation = assess_complete_candidate(
-                self._instance,
-                self._objectives,
-                candidate,
-                self._assess_plan,
-                ensure_feasible=context.ensure_feasible,
+    ) -> tuple[VrpSolution, ...]:
+        choices = tuple(
+            (route_index, position)
+            for route_index, route in enumerate(plan.routes)
+            if route.vehicle_id != source_vehicle_id
+            for position in range(len(route.stops) + 1)
+        )
+        candidates = _unique_plans(
+            tuple(
+                _insert_stop(plan, route_index, position, stop)
+                for route_index, position in choices
             )
-            if evaluation is not None and evaluation.objective_values is not None:
-                assessed.append((candidate, evaluation.objective_values))
-        return tuple(assessed)
+        )
+        return randomized_order(candidates, context.random_source)[
+            : self._candidate_limit
+        ]
+
+    def _package_stop_placements(
+        self,
+        plan: VrpSolution,
+        source_vehicle_id: str,
+        package_id: str,
+        stop: RouteStop,
+        current_carrier: str | None,
+        context: CandidateContext,
+    ) -> tuple[tuple[VrpSolution, str | None], ...]:
+        compatibility = {
+            (record.vehicle_id, record.package_id): record.compatible
+            for record in self._instance.package_data.vehicle_package_compatibility
+        }
+        choices: list[tuple[VrpSolution, str | None]] = []
+        for route_index, route in enumerate(plan.routes):
+            if route.vehicle_id == source_vehicle_id:
+                continue
+            if not compatibility.get((route.vehicle_id, package_id), True):
+                continue
+            if not _package_route_allowed(stop, route.vehicle_id, current_carrier):
+                continue
+            positions = _package_insertion_positions(
+                self._instance,
+                plan,
+                route_index,
+                package_id,
+                stop,
+            )
+            for position in positions:
+                updated = _insert_stop(plan, route_index, position, stop)
+                carrier = _next_carrier(stop, route.vehicle_id, current_carrier)
+                choices.append((updated, carrier))
+        ordered = randomized_order(
+            _unique_carrier_plans(choices), context.random_source
+        )
+        return ordered[: self._candidate_limit]
 
 
 def _service_units(solution: VrpSolution) -> tuple[_ServiceUnit, ...]:
@@ -382,80 +521,88 @@ def _eligible_source_vehicles(
     )
 
 
-def _without_tour_boundary(stop: RouteStop) -> RouteStop:
-    if isinstance(stop, (ActivityStop, TransferOperationStop, DepotOnlyStop)):
-        return replace(stop, tour_end=False)
-    raise TypeError('route stop must be a supported RouteStop variant')
-
-
-def _insert_package_chain(
-    instance: LoadedVrpInstance,
-    partial: VrpSolution,
-    unit: _ServiceUnit,
-    context: CandidateContext,
-) -> VrpSolution | None:
-    package_id = unit.key[1]
-    package_stops = tuple(
-        sorted(
-            (_without_tour_boundary(occurrence[2]) for occurrence in unit.occurrences),
-            key=_package_operation_order,
-        )
+def _insert_stop(
+    plan: VrpSolution,
+    route_index: int,
+    insertion_index: int,
+    stop: RouteStop,
+) -> VrpSolution:
+    route = plan.routes[route_index]
+    updated_routes = list(plan.routes)
+    updated_routes[route_index] = replace(
+        route,
+        stops=(
+            *route.stops[:insertion_index],
+            stop,
+            *route.stops[insertion_index:],
+        ),
     )
-    if not package_stops or not partial.routes:
-        return None
+    return replace(plan, routes=tuple(updated_routes))
 
-    compatibility = {
-        (record.vehicle_id, record.package_id): record.compatible
-        for record in instance.package_data.vehicle_package_compatibility
-    }
-    current_carrier: str | None = None
-    working = partial
 
-    for stop in package_stops:
-        eligible_routes = tuple(
-            route_index
-            for route_index, route in enumerate(working.routes)
-            if compatibility.get((route.vehicle_id, package_id), True)
-            and _package_route_allowed(stop, route.vehicle_id, current_carrier)
-        )
-        if not eligible_routes:
-            return None
-        route_index = choose_uniformly(eligible_routes, context.random_source)
-        route = working.routes[route_index]
-        previous_package_positions = tuple(
-            index
-            for index, existing in enumerate(route.stops)
-            if _stop_unit_key(existing) == unit.key
-        )
-        first_position = (
-            max(previous_package_positions) + 1 if previous_package_positions else 0
-        )
-        insertion_index = choose_uniformly(
-            tuple(range(first_position, len(route.stops) + 1)),
-            context.random_source,
-        )
-        updated_routes = list(working.routes)
-        updated_routes[route_index] = replace(
-            route,
-            stops=(
-                *route.stops[:insertion_index],
-                stop,
-                *route.stops[insertion_index:],
-            ),
-        )
-        working = replace(working, routes=tuple(updated_routes))
+def _package_insertion_positions(
+    instance: LoadedVrpInstance,
+    plan: VrpSolution,
+    route_index: int,
+    package_id: str,
+    stop: RouteStop,
+) -> tuple[int, ...]:
+    route = plan.routes[route_index]
+    package_positions = tuple(
+        index
+        for index, existing in enumerate(route.stops)
+        if _stop_unit_key(existing) == ('package', package_id)
+    )
+    first_position = max(package_positions) + 1 if package_positions else 0
+    if (
+        isinstance(stop, ActivityStop)
+        and stop.activity_ref.kind == 'pickup'
+        and stop_node_id(instance, plan, stop)
+        == route_node_sequence(instance, plan, route)[0]
+    ):
+        return (0,)
+    return tuple(range(first_position, len(route.stops) + 1))
 
-        if isinstance(stop, ActivityStop) and stop.activity_ref.kind == 'pickup':
-            current_carrier = route.vehicle_id
-        elif isinstance(stop, TransferOperationStop) and stop.role == 'in':
-            current_carrier = route.vehicle_id
-        elif isinstance(stop, TransferOperationStop) and stop.role == 'out':
-            current_carrier = route.vehicle_id
-        elif isinstance(stop, ActivityStop) and stop.activity_ref.kind == 'delivery':
-            if current_carrier is not None and route.vehicle_id != current_carrier:
-                return None
 
-    return working
+def _next_carrier(
+    stop: RouteStop,
+    vehicle_id: str,
+    current_carrier: str | None,
+) -> str | None:
+    if isinstance(stop, ActivityStop) and stop.activity_ref.kind == 'pickup':
+        return vehicle_id
+    if isinstance(stop, TransferOperationStop) and stop.role == 'in':
+        return vehicle_id
+    if isinstance(stop, TransferOperationStop) and stop.role == 'out':
+        return vehicle_id
+    if isinstance(stop, ActivityStop) and stop.activity_ref.kind == 'delivery':
+        return current_carrier
+    return current_carrier
+
+
+def _unique_plans(plans: Sequence[VrpSolution]) -> tuple[VrpSolution, ...]:
+    unique: list[VrpSolution] = []
+    for plan in plans:
+        _append_unique_plan(unique, plan)
+    return tuple(unique)
+
+
+def _append_unique_plan(plans: list[VrpSolution], candidate: VrpSolution) -> None:
+    if not any(existing == candidate for existing in plans):
+        plans.append(candidate)
+
+
+def _unique_carrier_plans(
+    plans: Sequence[tuple[VrpSolution, str | None]],
+) -> tuple[tuple[VrpSolution, str | None], ...]:
+    unique: list[tuple[VrpSolution, str | None]] = []
+    for candidate, carrier in plans:
+        if not any(
+            existing == candidate and existing_carrier == carrier
+            for existing, existing_carrier in unique
+        ):
+            unique.append((candidate, carrier))
+    return tuple(unique)
 
 
 def _package_route_allowed(

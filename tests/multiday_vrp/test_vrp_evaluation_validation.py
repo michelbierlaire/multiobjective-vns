@@ -37,6 +37,30 @@ def test_empty_plan_is_representation_valid_when_instance_has_no_required_tasks(
     assert representation_error(instance, VrpSolution((), ())) is None
 
 
+def test_exact_active_vehicle_count_is_a_hard_plan_constraint(
+    tmp_path: Path,
+) -> None:
+    instance = load_vrp_instance(write_minimal_vrp_bundle(tmp_path))
+    solution = VrpSolution((), ())
+    objectives = build_vrp_objective_declaration(instance)
+
+    zero_vehicle_instance = instance._replace(
+        settings=instance.settings._replace(exact_active_vehicle_count=0)
+    )
+    one_vehicle_instance = instance._replace(
+        settings=instance.settings._replace(exact_active_vehicle_count=1)
+    )
+    zero_vehicle_result = VrpApplicationEvaluator(zero_vehicle_instance).evaluate(
+        solution, build_vrp_objective_declaration(zero_vehicle_instance)
+    )
+    one_vehicle_result = VrpApplicationEvaluator(one_vehicle_instance).evaluate(
+        solution, objectives
+    )
+
+    assert zero_vehicle_result.feasible is True
+    assert one_vehicle_result.feasible is False
+
+
 def test_unknown_vehicle_reference_is_representation_invalid(tmp_path: Path) -> None:
     instance = load_vrp_instance(write_minimal_vrp_bundle(tmp_path))
     route = VehicleDayRoute(

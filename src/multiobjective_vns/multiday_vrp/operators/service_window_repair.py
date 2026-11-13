@@ -6,7 +6,9 @@ Author: Michel Bierlaire, EPFL
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cmp_to_key
 
 from multiobjective_vns.identifiers import ObjectiveId, identifier_text
 from multiobjective_vns.multiday_vrp.evaluation.records import VrpOperatorAnalysis
@@ -21,6 +23,8 @@ from multiobjective_vns.multiday_vrp.operators.common import (
 )
 from multiobjective_vns.multiday_vrp.operators.feature_common import objective_position
 from multiobjective_vns.multiday_vrp.operators.path_search import (
+    PathSearchIndex,
+    build_path_search_index,
     rebuild_changed_routes,
 )
 from multiobjective_vns.multiday_vrp.solution import (
@@ -30,7 +34,12 @@ from multiobjective_vns.multiday_vrp.solution import (
     VrpSolution,
 )
 from multiobjective_vns.objectives import ObjectiveComparison, ObjectiveDeclaration
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.values import require_integer
 
@@ -67,6 +76,9 @@ class TimeWindowFocusedDestroyRepairOperator:
         '_candidate_limit',
         '_path_limit',
         '_expansion_limit',
+        '_windowed_activity_keys',
+        '_package_compatibility',
+        '_intervention_window_days',
     )
 
     def __init__(
@@ -98,17 +110,33 @@ class TimeWindowFocusedDestroyRepairOperator:
         self._expansion_limit = _bounded_limit(
             max_arc_expansion_steps, 'max_arc_expansion_steps', 10000
         )
+        self._windowed_activity_keys = _windowed_activity_keys(instance)
+        self._package_compatibility = {
+            (item.vehicle_id, item.package_id): item.compatible
+            for item in instance.package_data.vehicle_package_compatibility
+        }
+        intervention_window_days: dict[str, set[int]] = {}
+        for item in instance.intervention_data.intervention_time_windows:
+            intervention_window_days.setdefault(item.intervention_id, set()).add(
+                item.day_index
+            )
+        self._intervention_window_days = {
+            intervention_id: frozenset(days)
+            for intervention_id, days in intervention_window_days.items()
+        }
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Apply one bounded removal-and-reinsertion move of up to ``k`` stops."""
         size = validate_neighborhood_size(context.k, self._maximum_size)
         base = require_vrp_base(context)
-        analysis = self._base_analysis(context, base)
+        analysis = self._base_analysis(context)
+        guidance_by_position = _maximum_guidance_by_position(
+            base, analysis, identifier_text(self._objective_id)
+        )
         targets = _select_targets(
-            self._instance,
             base,
-            analysis,
-            self._objective_id,
+            self._windowed_activity_keys,
+            guidance_by_position,
             size,
             context,
         )
@@ -127,12 +155,19 @@ class TimeWindowFocusedDestroyRepairOperator:
 
         candidates: list[tuple[VrpSolution, tuple[object, ...], int]] = []
         seen: set[VrpSolution] = set()
+        path_search_index: PathSearchIndex | None = None
         for _ in range(self._candidate_limit):
             trial_stops = [list(stops) for stops in base_stops]
             complete = True
             for target in targets:
                 positions = _insertion_positions(
-                    self._instance, base, trial_stops, target.stop
+                    base,
+                    trial_stops,
+                    target.stop,
+                    self._package_compatibility,
+                    self._intervention_window_days.get(
+                        target.reference.activity_id, frozenset()
+                    ),
                 )
                 if not positions:
                     complete = False
@@ -149,6 +184,10 @@ class TimeWindowFocusedDestroyRepairOperator:
                 for route_index, stops in enumerate(trial_stops)
                 if tuple(stops) != base.routes[route_index].stops
             }
+            if not changed_stops:
+                continue
+            if path_search_index is None:
+                path_search_index = build_path_search_index(self._instance)
             rebuilt = rebuild_changed_routes(
                 self._instance,
                 base,
@@ -157,6 +196,7 @@ class TimeWindowFocusedDestroyRepairOperator:
                 max_paths_per_leg=self._path_limit,
                 max_arc_expansion_steps=self._expansion_limit,
                 max_candidate_alternatives=1,
+                path_search_index=path_search_index,
             )
             for candidate in rebuilt:
                 if candidate in seen:
@@ -179,73 +219,87 @@ class TimeWindowFocusedDestroyRepairOperator:
 
         if not candidates:
             return operator_result(None, modifications=0, requested_size=size)
-        selected = self._select_candidate(candidates, context)
-        return operator_result(
-            selected[0], modifications=selected[2], requested_size=size
+        ranked = self._rank_candidates(candidates, context)
+        return OperatorResult(
+            candidates=tuple(
+                CandidateProposal(Candidate(solution), modifications)
+                for solution, _values, modifications in ranked[: context.max_candidates]
+            )
         )
 
-    def _base_analysis(
-        self, context: CandidateContext, base: VrpSolution
-    ) -> VrpOperatorAnalysis | None:
+    def _base_analysis(self, context: CandidateContext) -> VrpOperatorAnalysis | None:
         record = context.base_evaluation
         evaluation = None if record is None else record.application_evaluation
-        if evaluation is None:
-            evaluation = _assessment(
-                self._assess_plan, self._instance, self._objectives, base
-            )
-        return (
-            evaluation.analysis
-            if isinstance(evaluation.analysis, VrpOperatorAnalysis)
-            else None
-        )
+        if (
+            not isinstance(evaluation, ApplicationEvaluation)
+            or not evaluation.representation_valid
+            or not isinstance(evaluation.analysis, VrpOperatorAnalysis)
+            or not evaluation.analysis.is_complete
+        ):
+            return None
+        return evaluation.analysis
 
-    def _select_candidate(
+    def _rank_candidates(
         self,
         candidates: list[tuple[VrpSolution, tuple[object, ...], int]],
         context: CandidateContext,
-    ) -> tuple[VrpSolution, tuple[object, ...], int]:
+    ) -> tuple[tuple[VrpSolution, tuple[object, ...], int], ...]:
         objective = self._objectives.objectives[self._objective_position]
-        best = candidates[0]
-        tied = [best]
-        for candidate in candidates[1:]:
+
+        def compare(
+            left: tuple[VrpSolution, tuple[object, ...], int],
+            right: tuple[VrpSolution, tuple[object, ...], int],
+        ) -> int:
             comparison = objective.compare(
-                candidate[1][self._objective_position],
-                best[1][self._objective_position],
+                left[1][self._objective_position],
+                right[1][self._objective_position],
             )
             if comparison is ObjectiveComparison.LESS:
-                best = candidate
-                tied = [candidate]
-            elif comparison is ObjectiveComparison.EQUAL:
-                tied.append(candidate)
-        return choose_uniformly(tied, context.random_source)
+                return -1
+            if comparison is ObjectiveComparison.GREATER:
+                return 1
+            return 0
+
+        ordered = sorted(candidates, key=cmp_to_key(compare))
+        ranked: list[tuple[VrpSolution, tuple[object, ...], int]] = []
+        group_start = 0
+        while group_start < len(ordered):
+            group_end = group_start + 1
+            while (
+                group_end < len(ordered)
+                and compare(ordered[group_start], ordered[group_end]) == 0
+            ):
+                group_end += 1
+            ranked.extend(
+                randomized_order(ordered[group_start:group_end], context.random_source)
+            )
+            group_start = group_end
+        return tuple(ranked)
 
 
 def _select_targets(
-    instance: LoadedVrpInstance,
     solution: VrpSolution,
-    analysis: VrpOperatorAnalysis | None,
-    objective_id: ObjectiveId,
+    windowed_activity_keys: frozenset[tuple[str, str, int | None]],
+    guidance_by_position: Mapping[_Position, float],
     maximum_count: int,
     context: CandidateContext,
 ) -> tuple[_Target, ...]:
-    objective_text = identifier_text(objective_id)
     targets: list[_Target] = []
     for route_index, route in enumerate(solution.routes):
         for stop_index, stop in enumerate(route.stops):
-            if type(stop) is not ActivityStop or not _has_window(
-                instance, stop.activity_ref, route.day_index
-            ):
+            if type(stop) is not ActivityStop:
                 continue
-            guidance = _maximum_guidance(
-                solution,
-                analysis,
-                route_index,
-                stop_index,
-                stop.activity_ref,
-                objective_text,
+            reference = stop.activity_ref
+            window_key = (
+                (reference.kind, reference.activity_id, None)
+                if reference.kind in {'pickup', 'delivery'}
+                else (reference.kind, reference.activity_id, route.day_index)
             )
+            if window_key not in windowed_activity_keys:
+                continue
+            guidance = guidance_by_position.get((route_index, stop_index))
             targets.append(
-                _Target(stop.activity_ref, stop, (route_index, stop_index), guidance)
+                _Target(reference, stop, (route_index, stop_index), guidance)
             )
     if not targets:
         return ()
@@ -280,83 +334,69 @@ def _select_targets(
     return tuple(selected)
 
 
-def _maximum_guidance(
-    solution: VrpSolution,
-    analysis: VrpOperatorAnalysis | None,
-    route_index: int,
-    stop_index: int,
-    reference: ActivityRef,
-    objective_id: str,
-) -> float | None:
-    if analysis is None:
-        return None
-    route = solution.routes[route_index]
-    values: list[float] = []
-    for scenario in analysis.scenario_evaluations:
-        vehicle_day = next(
-            (
-                item
-                for item in scenario.vehicle_days
-                if item.vehicle_id == route.vehicle_id
-                and item.day_index == route.day_index
-            ),
-            None,
-        )
-        if vehicle_day is None:
-            continue
-        stop_trace = next(
-            (
-                item
-                for item in vehicle_day.stops
-                if item.stop_index == stop_index and item.activity_ref == reference
-            ),
-            None,
-        )
-        if stop_trace is None:
-            continue
-        assessment = next(
-            (
-                item
-                for item in stop_trace.window_assessments_by_objective
-                if item.objective_id == objective_id
-            ),
-            None,
-        )
-        if assessment is not None:
-            values.append(assessment.guidance_value)
-    return max(values) if values else None
-
-
-def _has_window(
-    instance: LoadedVrpInstance, reference: ActivityRef, day_index: int
-) -> bool:
-    if reference.kind in {'pickup', 'delivery'}:
-        return any(
-            item.package_id == reference.activity_id and item.activity == reference.kind
-            for item in instance.package_data.package_time_windows
-        )
-    return any(
-        item.intervention_id == reference.activity_id and item.day_index == day_index
+def _windowed_activity_keys(
+    instance: LoadedVrpInstance,
+) -> frozenset[tuple[str, str, int | None]]:
+    return frozenset(
+        (item.activity, item.package_id, None)
+        for item in instance.package_data.package_time_windows
+    ) | frozenset(
+        ('intervention', item.intervention_id, item.day_index)
         for item in instance.intervention_data.intervention_time_windows
     )
 
 
+def _maximum_guidance_by_position(
+    solution: VrpSolution,
+    analysis: VrpOperatorAnalysis | None,
+    objective_id: str,
+) -> dict[_Position, float]:
+    if analysis is None or not analysis.scenario_evaluations:
+        return {}
+    guidance_by_position: dict[_Position, float] = {}
+    for scenario in analysis.scenario_evaluations:
+        traces_by_route = {
+            (item.vehicle_id, item.day_index): item for item in scenario.vehicle_days
+        }
+        for route_index, route in enumerate(solution.routes):
+            vehicle_day = traces_by_route.get((route.vehicle_id, route.day_index))
+            if vehicle_day is None:
+                continue
+            for stop_trace in vehicle_day.stops:
+                stop_index = stop_trace.stop_index
+                if stop_index >= len(route.stops):
+                    continue
+                route_stop = route.stops[stop_index]
+                if (
+                    type(route_stop) is not ActivityStop
+                    or stop_trace.activity_ref != route_stop.activity_ref
+                ):
+                    continue
+                assessment = next(
+                    (
+                        item
+                        for item in stop_trace.window_assessments_by_objective
+                        if item.objective_id == objective_id
+                    ),
+                    None,
+                )
+                if assessment is None:
+                    continue
+                key = (route_index, stop_index)
+                guidance_by_position[key] = max(
+                    guidance_by_position.get(key, 0.0), assessment.guidance_value
+                )
+    return guidance_by_position
+
+
 def _insertion_positions(
-    instance: LoadedVrpInstance,
     solution: VrpSolution,
     stops_by_route: list[list[RouteStop]],
     stop: ActivityStop,
+    package_compatibility: Mapping[tuple[str, str], bool],
+    intervention_days: frozenset[int],
 ) -> tuple[_Position, ...]:
     reference = stop.activity_ref
-    package_compatibility = {
-        (item.vehicle_id, item.package_id): item.compatible
-        for item in instance.package_data.vehicle_package_compatibility
-    }
-    intervention_days = {
-        item.day_index
-        for item in instance.intervention_data.intervention_time_windows
-        if item.intervention_id == reference.activity_id
-    }
     return tuple(
         (route_index, stop_index)
         for route_index, route in enumerate(solution.routes)

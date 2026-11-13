@@ -19,6 +19,7 @@ from multiobjective_vns.multiday_vrp.input_records import (
     VrpObjectiveData,
     VrpPackageData,
     VrpPersonnelData,
+    VrpSpatialData,
 )
 from multiobjective_vns.multiday_vrp.input_validation import (
     _has_restrictive_windows,
@@ -38,11 +39,14 @@ def _derive_features(
     events: VrpEventData,
     objectives: VrpObjectiveData,
     settings: VrpInstanceSettings,
+    spatial_data: VrpSpatialData | None = None,
 ) -> VrpFeatureProfile:
     features: set[VrpFeatureId] = {
         'directed_route_paths',
         'objective_declaration',
     }
+    if spatial_data is not None and spatial_data.coordinate_system_id is not None:
+        features.add('planar_node_coordinates')
     travel = scenario_bank.travel_times
     for scenario in scenario_bank.scenarios:
         for arc_id in scenario_bank.arc_ids:
@@ -79,6 +83,8 @@ def _derive_features(
         features.add('network_event_exposure')
     if len(scenario_bank.planning_dates) > 1:
         features.add('multi_day_planning')
+    if settings.exact_active_vehicle_count is None:
+        features.add('variable_active_vehicle_count')
     overnight: dict[str, set[str]] = {}
     for item in fleet.vehicle_overnight_depots:
         overnight.setdefault(item.vehicle_id, set()).add(item.depot_id)
@@ -233,9 +239,7 @@ def _person_assignment_profile(
     include_skills: bool,
     include_qualifications: bool,
 ) -> tuple[object, ...]:
-    person = next(
-        item for item in personnel.personnel if item.person_id == person_id
-    )
+    person = next(item for item in personnel.personnel if item.person_id == person_id)
     driving_skills = (
         tuple(
             sorted(
@@ -276,27 +280,28 @@ def _personnel_availability_differs(
     interventions: VrpInterventionData,
 ) -> bool:
     relevant_person_ids = {
-        person.person_id
-        for person in personnel.personnel
-        if person.authorized_driver
+        person.person_id for person in personnel.personnel if person.authorized_driver
     }
     person_qualifications: dict[str, set[str]] = {}
-    for item in personnel.personnel_intervention_qualifications:
-        person_qualifications.setdefault(item.person_id, set()).add(
-            item.qualification_id
+    for qualification_record in personnel.personnel_intervention_qualifications:
+        person_qualifications.setdefault(qualification_record.person_id, set()).add(
+            qualification_record.qualification_id
         )
-    requirements_by_intervention: dict[str, set[str]] = {}
-    for item in interventions.intervention_qualifications_required:
-        requirements_by_intervention.setdefault(item.intervention_id, set()).add(
-            item.qualification_id
-        )
+    requirements_by_intervention: dict[str, set[str]] = {
+        intervention.intervention_id: set()
+        for intervention in interventions.interventions
+    }
+    for required_qualification in interventions.intervention_qualifications_required:
+        requirements_by_intervention.setdefault(
+            required_qualification.intervention_id, set()
+        ).add(required_qualification.qualification_id)
     if interventions.interventions:
         for person in personnel.personnel:
             qualifications = person_qualifications.get(person.person_id, set())
             if any(
                 requirements.issubset(qualifications)
                 for requirements in requirements_by_intervention.values()
-            ) or not requirements_by_intervention:
+            ):
                 relevant_person_ids.add(person.person_id)
     profiles = tuple(
         _effective_availability(person.person_id, personnel)
@@ -313,20 +318,22 @@ def _driver_assignment_differs(
     settings: VrpInstanceSettings,
 ) -> bool:
     skill_by_person: dict[str, set[str]] = {}
-    for item in personnel.personnel_driving_skills:
-        skill_by_person.setdefault(item.person_id, set()).add(item.skill_id)
+    for personnel_skill in personnel.personnel_driving_skills:
+        skill_by_person.setdefault(personnel_skill.person_id, set()).add(
+            personnel_skill.skill_id
+        )
     required_by_vehicle: dict[str, set[str]] = {}
-    for item in fleet.vehicle_driving_skills:
-        required_by_vehicle.setdefault(item.vehicle_id, set()).add(item.skill_id)
+    for vehicle_skill in fleet.vehicle_driving_skills:
+        required_by_vehicle.setdefault(vehicle_skill.vehicle_id, set()).add(
+            vehicle_skill.skill_id
+        )
     assignment_rules_active = (
         settings.staff_depot_mode == 'depot_continuity'
         or bool(settings.active_simple_rules)
         or settings.hos_regime_id != 'none'
     )
     include_skills = bool(fleet.vehicle_driving_skills)
-    include_qualifications = bool(
-        interventions.intervention_qualifications_required
-    )
+    include_qualifications = bool(interventions.intervention_qualifications_required)
     for vehicle in fleet.vehicles:
         required = required_by_vehicle.get(vehicle.vehicle_id, set())
         eligible = tuple(
@@ -360,7 +367,9 @@ def _has_different_profiles(profiles: tuple[object, ...]) -> bool:
 
 
 def _values_differ(first: object, second: object) -> bool:
-    if type(first) in (int, float) and type(second) in (int, float):
+    if isinstance(first, bool) or isinstance(second, bool):
+        return first != second
+    if isinstance(first, (int, float)) and isinstance(second, (int, float)):
         left = float(first)
         right = float(second)
         return abs(left - right) > _numeric_tolerance(left, right)

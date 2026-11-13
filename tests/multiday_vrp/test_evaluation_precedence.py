@@ -126,7 +126,7 @@ def test_precedence_is_checked_across_routes_in_each_scenario(tmp_path: Path) ->
     )
 
     assert result.feasible is False
-    assert result.objective_values == (inf,)
+    assert result.objective_values == (inf, inf)
     analysis = result.analysis
     assert isinstance(analysis, VrpOperatorAnalysis)
     assert analysis.hard_failure is not None

@@ -67,8 +67,6 @@ def _make_rule_instance(root: Path, treatment: str) -> LoadedVrpInstance:
     )
     objective = instance.objective_data.objectives[0]._replace(
         penalty_scales={
-            'early_window': 1.0,
-            'late_window': 1.0,
             'vehicle_availability': 1.0,
             'personnel_availability': 1.0,
             'duty_overlap': 1.0,
@@ -79,6 +77,13 @@ def _make_rule_instance(root: Path, treatment: str) -> LoadedVrpInstance:
         objectives=(objective,),
         penalty_functions=(
             *instance.objective_data.penalty_functions,
+            PenaltyFunctionSpec(
+                'vehicles-used',
+                'simple_rule',
+                '',
+                'linear',
+                FrozenTomlTable({'rate': 1.0}),
+            ),
             PenaltyFunctionSpec(
                 'vehicles-used',
                 'simple_rule',
@@ -177,6 +182,13 @@ def test_hos_callback_measures_are_penalized_once_per_scenario(tmp_path: Path) -
         objectives=(objective,),
         penalty_functions=(
             *instance.objective_data.penalty_functions,
+            PenaltyFunctionSpec(
+                'vehicles-used',
+                'hos_rule',
+                '',
+                'linear',
+                FrozenTomlTable({'rate': 2.0}),
+            ),
             PenaltyFunctionSpec(
                 'vehicles-used',
                 'hos_rule',

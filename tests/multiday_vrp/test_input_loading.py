@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from multiobjective_vns.multiday_vrp import VrpInputError, load_vrp_instance
+from multiobjective_vns.multiday_vrp import (
+    PickupSymmetryGroup,
+    VrpInputError,
+    load_vrp_instance,
+)
 from multiobjective_vns.multiday_vrp.extensions import (
     BaseMeasureRegistration,
     ExtensionParametersRequest,
@@ -16,7 +20,10 @@ from multiobjective_vns.multiday_vrp.extensions import (
     VrpExtensionRegistry,
 )
 
-from .input_fixtures import write_minimal_vrp_bundle
+from .input_fixtures import (
+    write_minimal_vrp_bundle,
+    write_pickup_symmetry_bundle,
+)
 
 
 def test_loader_builds_normalized_instance_and_loads_scenario_bank(
@@ -45,6 +52,142 @@ def test_loader_builds_normalized_instance_and_loads_scenario_bank(
         'within_day_time_dependent_travel'
         not in instance.feature_profile.active_features
     )
+    assert instance.settings.exact_active_vehicle_count is None
+    assert 'variable_active_vehicle_count' in instance.feature_profile.active_features
+    assert instance.pickup_symmetry_groups == ()
+
+
+def test_loader_accepts_total_waiting_time_as_a_builtin_objective(
+    tmp_path: Path,
+) -> None:
+    manifest = write_minimal_vrp_bundle(tmp_path)
+    objectives = manifest.parent / 'objectives.toml'
+    source = objectives.read_text(encoding='utf-8').replace(
+        "base_measure_id = 'vehicles_used'",
+        "base_measure_id = 'total_waiting_time'",
+    )
+    objectives.write_text(source, encoding='utf-8')
+
+    instance = load_vrp_instance(manifest)
+
+    assert instance.objective_data.objectives[0].base_measure_id == 'total_waiting_time'
+
+
+def test_loader_reads_pickup_symmetry_group_declarations(tmp_path: Path) -> None:
+    instance = load_vrp_instance(write_pickup_symmetry_bundle(tmp_path))
+
+    assert instance.pickup_symmetry_groups == (
+        PickupSymmetryGroup('same-pickup', ('package-a', 'package-b')),
+    )
+
+
+def test_loader_rejects_pickup_group_with_unknown_package(tmp_path: Path) -> None:
+    manifest = write_pickup_symmetry_bundle(tmp_path)
+    source = manifest.read_text(encoding='utf-8').replace(
+        "package_ids = ['package-a', 'package-b']",
+        "package_ids = ['package-a', 'unknown-package']",
+    )
+    manifest.write_text(source, encoding='utf-8')
+
+    with pytest.raises(VrpInputError, match='pickup symmetry.*unknown package'):
+        load_vrp_instance(manifest)
+
+
+def test_loader_rejects_overlapping_pickup_symmetry_groups(tmp_path: Path) -> None:
+    manifest = write_pickup_symmetry_bundle(tmp_path)
+    source = manifest.read_text(encoding='utf-8').replace(
+        '[files]\n',
+        """[[pickup_symmetry_groups]]
+group_id = 'overlapping-pickup'
+package_ids = ['package-a', 'package-b']
+
+[files]
+""",
+    )
+    manifest.write_text(source, encoding='utf-8')
+
+    with pytest.raises(
+        VrpInputError, match='belongs to multiple pickup symmetry groups'
+    ):
+        load_vrp_instance(manifest)
+
+
+def test_loader_rejects_pickup_group_with_different_pickup_nodes(
+    tmp_path: Path,
+) -> None:
+    manifest = write_pickup_symmetry_bundle(tmp_path)
+    packages = manifest.parent / 'packages.csv'
+    source = packages.read_text(encoding='utf-8').replace(
+        'package-b,node-a,node-b,', 'package-b,node-b,node-b,'
+    )
+    packages.write_text(source, encoding='utf-8')
+
+    with pytest.raises(VrpInputError, match='same pickup node'):
+        load_vrp_instance(manifest)
+
+
+def test_loader_rejects_pickup_group_with_different_service_durations(
+    tmp_path: Path,
+) -> None:
+    manifest = write_pickup_symmetry_bundle(tmp_path)
+    packages = manifest.parent / 'packages.csv'
+    source = packages.read_text(encoding='utf-8').replace(
+        'package-b,node-a,node-b,1.0,0.0,0.0,',
+        'package-b,node-a,node-b,1.0,1.0,0.0,',
+    )
+    packages.write_text(source, encoding='utf-8')
+
+    with pytest.raises(VrpInputError, match='same pickup service duration'):
+        load_vrp_instance(manifest)
+
+
+def test_loader_rejects_pickup_group_with_different_window_alternatives(
+    tmp_path: Path,
+) -> None:
+    manifest = write_pickup_symmetry_bundle(tmp_path)
+    windows = manifest.parent / 'package-time-windows.csv'
+    source = windows.read_text(encoding='utf-8').replace(
+        'package-b,pickup,1,2025-01-02T00:00:00+01:00,2025-01-02T00:00:00+01:00',
+        'package-b,pickup,1,2025-01-02T00:05:00+01:00,2025-01-02T00:05:00+01:00',
+    )
+    windows.write_text(source, encoding='utf-8')
+
+    with pytest.raises(VrpInputError, match='same pickup-window alternatives'):
+        load_vrp_instance(manifest)
+
+
+def test_loader_reads_an_exact_active_vehicle_count(tmp_path: Path) -> None:
+    manifest = write_minimal_vrp_bundle(tmp_path)
+    source = manifest.read_text(encoding='utf-8').replace(
+        "hos_regime_version = 'none'\n",
+        "hos_regime_version = 'none'\nexact_active_vehicle_count = 1\n",
+    )
+    manifest.write_text(source, encoding='utf-8')
+
+    instance = load_vrp_instance(manifest)
+
+    assert instance.settings.exact_active_vehicle_count == 1
+    assert (
+        'variable_active_vehicle_count' not in instance.feature_profile.active_features
+    )
+
+
+@pytest.mark.parametrize(
+    ('value', 'reason'),
+    [('true', 'integer'), ('-1', 'nonnegative'), ('2', 'number of vehicles')],
+)
+def test_loader_validates_exact_active_vehicle_count(
+    tmp_path: Path, value: str, reason: str
+) -> None:
+    manifest = write_minimal_vrp_bundle(tmp_path)
+    source = manifest.read_text(encoding='utf-8').replace(
+        "hos_regime_version = 'none'\n",
+        f"hos_regime_version = 'none'\nexact_active_vehicle_count = {value}\n",
+    )
+    manifest.write_text(source, encoding='utf-8')
+
+    with pytest.raises(VrpInputError, match=reason):
+        load_vrp_instance(manifest)
 
 
 def test_omitted_availability_files_expand_to_full_horizon(tmp_path: Path) -> None:
@@ -382,21 +525,26 @@ def test_loader_normalizes_package_and_intervention_tables(tmp_path: Path) -> No
     )
     objectives = instance_dir / 'objectives.toml'
     objectives.write_text(
-        objectives.read_text(encoding='utf-8').replace(
-            'duty_overlap = 1.0 }',
-            'duty_overlap = 1.0, early_window = 1.0, late_window = 1.0 }',
-        )
+        objectives.read_text(encoding='utf-8')
         + """
 
+[[objectives]]
+objective_id = 'time-window-violation'
+base_measure_id = 'zero'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0 }
+
 [[penalty_functions]]
-objective_id = 'vehicles-used'
+objective_id = 'time-window-violation'
 violation_category = 'early_window'
 rule_id = ''
 function_id = 'linear'
 parameters = { rate = 1.0 }
 
 [[penalty_functions]]
-objective_id = 'vehicles-used'
+objective_id = 'time-window-violation'
 violation_category = 'late_window'
 rule_id = ''
 function_id = 'linear'
@@ -412,6 +560,7 @@ parameters = { rate = 1.0 }
     assert instance.package_data.vehicle_package_compatibility[0].compatible
     assert instance.intervention_data.interventions[0].intervention_id == 'repair-1'
     assert instance.intervention_data.interventions[0].service_duration == 12.0
+    assert instance.time_window_violation_objective_id == 'time-window-violation'
 
 
 def test_loader_links_activity_relations_and_event_objectives(tmp_path: Path) -> None:
@@ -468,21 +617,26 @@ def test_loader_links_activity_relations_and_event_objectives(tmp_path: Path) ->
         encoding='utf-8',
     )
     objectives.write_text(
-        objectives.read_text(encoding='utf-8').replace(
-            'duty_overlap = 1.0 }',
-            'duty_overlap = 1.0, early_window = 1.0, late_window = 1.0 }',
-        )
+        objectives.read_text(encoding='utf-8')
         + """
 
+[[objectives]]
+objective_id = 'time-window-violation'
+base_measure_id = 'zero'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0 }
+
 [[penalty_functions]]
-objective_id = 'vehicles-used'
+objective_id = 'time-window-violation'
 violation_category = 'early_window'
 rule_id = ''
 function_id = 'linear'
 parameters = { rate = 1.0 }
 
 [[penalty_functions]]
-objective_id = 'vehicles-used'
+objective_id = 'time-window-violation'
 violation_category = 'late_window'
 rule_id = ''
 function_id = 'linear'
@@ -497,6 +651,7 @@ parameters = { rate = 1.0 }
     assert instance.event_data.events[0].location_id == 'node-b'
     assert instance.event_data.objective_event_types[0].event_type_id == 'traffic-light'
     assert 'network_event_exposure' in instance.feature_profile.active_features
+    assert instance.time_window_violation_objective_id == 'time-window-violation'
 
 
 def test_loader_normalizes_active_work_rule_tables(tmp_path: Path) -> None:

@@ -10,12 +10,13 @@ import json
 import math
 import threading
 import time
+import warnings
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 
 from multiobjective_vns.callbacks import (
     ApplicationEvaluator,
@@ -64,6 +65,12 @@ from multiobjective_vns.identifiers import (
 from multiobjective_vns.objectives import (
     ObjectiveComparison,
     ObjectiveDeclaration,
+    ObjectiveValue,
+)
+from multiobjective_vns.pareto_snapshots import (
+    ParetoSnapshotData,
+    read_pareto_snapshot,
+    write_pareto_snapshot,
 )
 from multiobjective_vns.policies import (
     ArchivePolicy,
@@ -72,15 +79,22 @@ from multiobjective_vns.policies import (
     ExplorationPolicy,
     FeedbackPolicy,
 )
+from multiobjective_vns.promoted_catalog import (
+    PromotedCatalogEntry,
+    PromotedCompositionCatalog,
+    PromotedCompositionCatalogError,
+)
 from multiobjective_vns.random_source import RandomSource
 from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
     CandidateOutcome,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.records.evaluation import (
     EvaluationRecord,
+    ObjectiveBoundFinding,
     SolutionRecord,
 )
 from multiobjective_vns.records.failures import ComponentFailure, FailureKind
@@ -105,6 +119,8 @@ from multiobjective_vns.records.policies import (
 from multiobjective_vns.records.reporting import (
     ComponentConfigurationEntry,
     ComponentRole,
+    ObjectiveBoundEventFinding,
+    ObjectiveBoundReport,
     OperatorCatalogEntry,
     PromotedCompositionReport,
     RunProvenance,
@@ -130,6 +146,7 @@ from multiobjective_vns.records.status import (
     TerminationReason,
 )
 from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
     OperatorGroup,
     OperatorRegistration,
     SearchExtensionRegistration,
@@ -181,7 +198,7 @@ class _SearchSnapshot:
     active_ids: frozenset[SolutionId]
     attempt_counts: Mapping[SolutionId, int]
     tracked_choice_ids: frozenset[ChoiceId]
-    choice_size_cursors: Mapping[ChoiceId, int]
+    choice_size_cursors: Mapping[tuple[SolutionId, ChoiceId], int]
     operator_payloads: Mapping[OperatorId, object]
     extension_payloads: Mapping[ComponentId, object]
     feedback_payload: object
@@ -190,6 +207,7 @@ class _SearchSnapshot:
     configuration_signature: tuple[object, ...]
     problem_instance_text: str
     objective_texts: tuple[str, ...]
+    objective_bounds: tuple[ObjectiveValue | None, ...]
     commit_sequence: int = 0
     base_selection_context: tuple[SolutionId, bool] | None = None
     excursion: _InfeasibleExcursion | None = None
@@ -234,6 +252,10 @@ class _RandomFailure(Exception):
     def __init__(self, failure: ComponentFailure) -> None:
         super().__init__(failure.reason)
         self.failure = failure
+
+
+class _NoEligibleBase(Exception):
+    """No current Pareto base has an enabled, unexhausted choice."""
 
 
 class _OperatorCallFailure(Exception):
@@ -302,6 +324,9 @@ class _OperatorSpec:
     feasibility_restoration: bool
     modification_count_definition: str
     group_ids: frozenset[OperatorGroupId]
+    configuration_id: ComponentConfigurationId
+    catalog_kind: Literal['ordinary', 'pre_registered_composite', 'promoted_composite']
+    component_operator_ids: tuple[OperatorId, OperatorId] | None = None
     registration: OperatorRegistration | None = None
     first: _OperatorSpec | None = None
     second: _OperatorSpec | None = None
@@ -348,6 +373,15 @@ class _CheckpointProgress:
     interval: int | None
 
 
+@dataclass(slots=True)
+class _ParetoSnapshotProgress:
+    """Invocation-local destination and latest successful snapshot path."""
+
+    destination: Path
+    latest_successful_path: Path | None = None
+    failed: bool = False
+
+
 class MultiobjectiveVNS:
     """Run sequential multiobjective variable-neighborhood search.
 
@@ -359,10 +393,14 @@ class MultiobjectiveVNS:
     :param solution_identity: Application equivalence rule.
     :param objective_declaration: Ordered minimized objectives.
     :param operators: Registered neighborhood Operators.
+    :param pre_registered_compositions: Ordered Operator pairs registered as
+        standalone composite choices before search.
     :param application_evaluator: Joint representation, feasibility, and
         objective evaluator.
     :param problem_instance_id: Stable identity for the fixed problem data.
     :param config: Immutable search configuration.
+    :param promoted_composition_catalog_path: File that carries promoted
+        composition definitions across fresh searches, or ``None`` to disable.
     :raises ComponentRegistrationError: If registrations conflict or are
         incomplete.
     :raises ComponentSetupError: If component baselines cannot be captured.
@@ -375,9 +413,10 @@ class MultiobjectiveVNS:
         solution_identity: SolutionIdentity,
         objective_declaration: ObjectiveDeclaration,
         operators: tuple[OperatorRegistration, ...],
+        pre_registered_compositions: tuple[OperatorCompositionRegistration, ...] = (),
         application_evaluator: ApplicationEvaluator,
         problem_instance_id: ProblemInstanceId,
-        config: MultiobjectiveVNSConfig = MultiobjectiveVNSConfig(),
+        config: MultiobjectiveVNSConfig,
         operator_groups: tuple[OperatorGroup, ...] = (),
         extensions: tuple[SearchExtensionRegistration, ...] = (),
         archive_policy: ArchivePolicy | None = None,
@@ -390,11 +429,21 @@ class MultiobjectiveVNS:
         event_observers: tuple[EventObserver, ...] = (),
         checkpoint_store: CheckpointStore | None = None,
         solution_formatter: SolutionFormatter | None = None,
+        promoted_composition_catalog_path: Path | None = Path(
+            './multiobjective-vns-promoted-compositions.json'
+        ),
     ) -> None:
         if not isinstance(operators, tuple) or not operators:
             raise ComponentRegistrationError('operators must be a nonempty tuple')
         if any(not isinstance(item, OperatorRegistration) for item in operators):
             raise ComponentRegistrationError('operators must be registrations')
+        if not isinstance(pre_registered_compositions, tuple) or any(
+            not isinstance(item, OperatorCompositionRegistration)
+            for item in pre_registered_compositions
+        ):
+            raise ComponentRegistrationError(
+                'pre_registered_compositions must be composition registrations'
+            )
         if not isinstance(operator_groups, tuple) or any(
             not isinstance(group, OperatorGroup) for group in operator_groups
         ):
@@ -407,6 +456,12 @@ class MultiobjectiveVNS:
             raise ComponentRegistrationError('objective_declaration is required')
         if not isinstance(config, MultiobjectiveVNSConfig):
             raise ComponentRegistrationError('config must be a MultiobjectiveVNSConfig')
+        if promoted_composition_catalog_path is not None and not isinstance(
+            promoted_composition_catalog_path, Path
+        ):
+            raise ComponentRegistrationError(
+                'promoted_composition_catalog_path must be a Path or None'
+            )
 
         self._solution_codec = solution_codec
         self._solution_identity = solution_identity
@@ -415,9 +470,26 @@ class MultiobjectiveVNS:
         self._operator_by_id = {
             registration.operator_id: registration for registration in operators
         }
+        self._pre_registered_compositions = pre_registered_compositions
+        self._pre_registered_by_id = {
+            registration.operator_id: registration
+            for registration in pre_registered_compositions
+        }
+        self._pre_registered_pairs = frozenset(
+            (item.first_operator_id, item.second_operator_id)
+            for item in pre_registered_compositions
+        )
         self._application_evaluator = application_evaluator
         self._problem_instance_id = problem_instance_id
         self._config = config
+        self._promoted_composition_catalog_path = (
+            promoted_composition_catalog_path.resolve()
+            if promoted_composition_catalog_path is not None
+            else None
+        )
+        self._promoted_composition_catalog = PromotedCompositionCatalog(
+            self._promoted_composition_catalog_path
+        )
         self._operator_groups = operator_groups
         self._extensions = extensions
         self._archive_policy = archive_policy or ParetoArchivePolicy()
@@ -482,6 +554,76 @@ class MultiobjectiveVNS:
             )
         finally:
             self._active_run_lock.release()
+
+    def load_pareto_snapshot(self, path: Path) -> tuple[object, ...]:
+        """Restore a compatible Pareto snapshot as fresh initial solutions.
+
+        :param path: Snapshot path returned by an earlier ``RunResult``.
+        :returns: Restored solutions in the snapshot's archive order.
+        :raises ResumeCompatibilityError: If problem, objective, or codec
+            identities differ from the snapshot.
+        :raises ComponentSetupError: If the file or a solution payload cannot
+            be read or restored.
+        """
+        if not isinstance(path, Path):
+            raise TypeError('path must be a Path')
+        try:
+            snapshot = read_pareto_snapshot(path)
+        except Exception as error:
+            kind = (
+                FailureKind.INFRASTRUCTURE_FAILURE
+                if isinstance(error, OSError)
+                else FailureKind.CONTRACT_VIOLATION
+            )
+            raise ComponentSetupError(
+                self._failure(
+                    'multiobjective-vns:pareto-snapshot-store',
+                    'pareto_snapshot_restore',
+                    f'Pareto snapshot could not be read: {error}',
+                    kind,
+                )
+            ) from error
+
+        expected_objective_ids = tuple(
+            identifier_text(objective.objective_id)
+            for objective in self._objective_declaration.objectives
+        )
+        expected_objective_configurations = tuple(
+            identifier_text(objective.configuration_id)
+            for objective in self._objective_declaration.objectives
+        )
+        if (
+            snapshot.problem_instance_id != identifier_text(self._problem_instance_id)
+            or snapshot.objective_ids != expected_objective_ids
+            or snapshot.objective_configuration_ids != expected_objective_configurations
+            or snapshot.solution_codec_component_id
+            != identifier_text(self._solution_codec.component_id)
+            or snapshot.solution_codec_configuration_id
+            != identifier_text(self._solution_codec.configuration_id)
+        ):
+            raise ResumeCompatibilityError(
+                'Pareto snapshot compatibility manifest differs'
+            )
+
+        solutions: list[object] = []
+        for payload in snapshot.solution_payloads:
+            try:
+                solutions.append(self._solution_codec.restore(payload))
+            except Exception as error:
+                kind = (
+                    FailureKind.CONTRACT_VIOLATION
+                    if isinstance(error, (TypeError, ValueError))
+                    else FailureKind.CALLBACK_EXCEPTION
+                )
+                raise ComponentSetupError(
+                    self._failure(
+                        self._solution_codec,
+                        'pareto_snapshot_restore',
+                        f'SolutionCodec.restore failed: {error}',
+                        kind,
+                    )
+                ) from error
+        return tuple(solutions)
 
     def maintain(
         self,
@@ -601,7 +743,7 @@ class MultiobjectiveVNS:
                     for objective in self._objective_declaration.objectives
                 ),
                 'config': self._config,
-                'provenance': self._provenance(),
+                'provenance': self._provenance(state),
                 'log_directory': str(resolved_directory),
                 'checkpoint_commit_sequence': state.commit_sequence,
                 'wall_time_limit_seconds': None,
@@ -706,6 +848,9 @@ class MultiobjectiveVNS:
                     termination = TerminationReason.COMPONENT_FAILURE
                     break
 
+        termination = self._publish_final_views(
+            coordinator, state, termination, diagnostics
+        )
         try:
             self._append_invocation(
                 coordinator,
@@ -760,6 +905,12 @@ class MultiobjectiveVNS:
                 finalized.event_log_path if finalized is not None else None
             ),
             summary_path=(finalized.summary_path if finalized is not None else None),
+            registry_view_path=(
+                finalized.registry_view_path if finalized is not None else None
+            ),
+            pareto_view_path=(
+                finalized.pareto_view_path if finalized is not None else None
+            ),
         )
 
     def _prepare_pool_cleanup(
@@ -892,6 +1043,10 @@ class MultiobjectiveVNS:
             for registration in self._operators
         }
         choices.update(
+            ChoiceId.for_operator(registration.operator_id)
+            for registration in self._pre_registered_compositions
+        )
+        choices.update(
             ChoiceId.for_operator(promoted.report.operator_id)
             for promoted in state.promoted_operators
         )
@@ -956,6 +1111,9 @@ class MultiobjectiveVNS:
         )
         invocation_id = InvocationId.new()
         resolved_directory = log_directory.resolve()
+        snapshot_progress = _ParetoSnapshotProgress(
+            resolved_directory / f'{invocation_id.to_log_text()}.pareto.json'
+        )
         try:
             self._logger.begin(invocation_id, resolved_directory)
         except Exception as error:
@@ -992,7 +1150,7 @@ class MultiobjectiveVNS:
                     for objective in self._objective_declaration.objectives
                 ),
                 'config': self._config,
-                'provenance': self._provenance(),
+                'provenance': self._provenance(state),
                 'log_directory': str(resolved_directory),
                 'checkpoint_commit_sequence': resume_sequence,
                 'wall_time_limit_seconds': wall_limit,
@@ -1021,7 +1179,7 @@ class MultiobjectiveVNS:
 
         termination = TerminationReason.BUDGET_EXHAUSTED
         ready_for_checkpoint = initial_solutions is None
-        valid_initial_count = 0
+        eligible_initial_count = 0
         assessment_counts: Counter[ApplicationAssessment] = Counter()
         initial_submission_count = 0
         if initial_solutions is not None:
@@ -1039,6 +1197,7 @@ class MultiobjectiveVNS:
                         k=None,
                         m=None,
                         component_position=None,
+                        candidate_index=None,
                         ensure_feasible=None,
                     )
                 except _TransitionFailure as transition_failure:
@@ -1052,8 +1211,11 @@ class MultiobjectiveVNS:
                     )
                     termination = TerminationReason.COMPONENT_FAILURE
                     break
-                if submission.outcome.assessment is ApplicationAssessment.VALID:
-                    valid_initial_count += 1
+                if (
+                    submission.outcome.assessment is ApplicationAssessment.VALID
+                    and not submission.outcome.objective_bound_findings
+                ):
+                    eligible_initial_count += 1
                 if submission.outcome.assessment is not None:
                     assessment_counts[submission.outcome.assessment] += 1
                 if submission.failures and submission.outcome.solution_id is None:
@@ -1070,6 +1232,35 @@ class MultiobjectiveVNS:
                     termination = TerminationReason.COMPONENT_FAILURE
                     break
                 state = cast(_SearchSnapshot, coordinator.search_state)
+                if submission.admitted:
+                    view_failure = self._publish_view(
+                        invocation_id=invocation_id,
+                        state=state,
+                        scope='pareto',
+                        is_final=False,
+                    )
+                    if view_failure is not None:
+                        diagnostics.append(view_failure)
+                        logging_failure = self._try_append_failure_event(
+                            coordinator, view_failure
+                        )
+                        if logging_failure is not None:
+                            diagnostics.append(logging_failure)
+                        termination = TerminationReason.COMPONENT_FAILURE
+                        break
+                    snapshot_failure = self._save_pareto_snapshot(
+                        state, snapshot_progress
+                    )
+                    if snapshot_failure is not None:
+                        diagnostics.append(snapshot_failure)
+                        logging_failure = self._try_append_failure_event(
+                            coordinator, snapshot_failure
+                        )
+                        if logging_failure is not None:
+                            diagnostics.append(logging_failure)
+                        snapshot_progress.failed = True
+                        termination = TerminationReason.COMPONENT_FAILURE
+                        break
                 if self._progress_due(started, last_progress, progress_interval):
                     last_progress = self._emit_progress(
                         coordinator, started, wall_limit
@@ -1077,7 +1268,7 @@ class MultiobjectiveVNS:
 
             if termination is TerminationReason.COMPONENT_FAILURE:
                 ready_for_checkpoint = False
-            elif valid_initial_count == 0:
+            elif eligible_initial_count == 0:
                 termination = TerminationReason.INITIALIZATION_FAILED
                 self._append_invocation(
                     coordinator,
@@ -1086,12 +1277,17 @@ class MultiobjectiveVNS:
                         EventPhase.INITIALIZATION,
                         {
                             'submission_count': initial_submission_count,
-                            'valid_count': 0,
-                            'reason': 'no_valid_feasible_solution',
+                            'application_feasible_count': assessment_counts[
+                                ApplicationAssessment.VALID
+                            ],
+                            'eligible_count': 0,
+                            'reason': (
+                                'no_application_feasible_solution_within_objective_bounds'
+                            ),
                         },
                     ),
                 )
-                self._stop_and_finalize(
+                termination = self._stop_and_finalize(
                     coordinator,
                     state,
                     initial_archive_ids,
@@ -1133,6 +1329,16 @@ class MultiobjectiveVNS:
                         if finalization is not None
                         else ()
                     ),
+                    registry_view_path=(
+                        finalization.registry_view_path
+                        if finalization is not None
+                        else None
+                    ),
+                    pareto_view_path=(
+                        finalization.pareto_view_path
+                        if finalization is not None
+                        else None
+                    ),
                 )
             else:
                 state = cast(_SearchSnapshot, coordinator.search_state)
@@ -1148,6 +1354,7 @@ class MultiobjectiveVNS:
                             'valid_count': assessment_counts[
                                 ApplicationAssessment.VALID
                             ],
+                            'eligible_count': eligible_initial_count,
                             'invalid_count': assessment_counts[
                                 ApplicationAssessment.INVALID
                             ],
@@ -1199,8 +1406,26 @@ class MultiobjectiveVNS:
                     progress_interval,
                     stop_token,
                     checkpoint_progress,
+                    snapshot_progress,
                 )
                 state = cast(_SearchSnapshot, coordinator.search_state)
+
+        state = cast(_SearchSnapshot, coordinator.search_state)
+        if (
+            state.archive_ids
+            and snapshot_progress.latest_successful_path is None
+            and not snapshot_progress.failed
+        ):
+            snapshot_failure = self._save_pareto_snapshot(state, snapshot_progress)
+            if snapshot_failure is not None:
+                diagnostics.append(snapshot_failure)
+                logging_failure = self._try_append_failure_event(
+                    coordinator, snapshot_failure
+                )
+                if logging_failure is not None:
+                    diagnostics.append(logging_failure)
+                snapshot_progress.failed = True
+                termination = TerminationReason.COMPONENT_FAILURE
 
         if ready_for_checkpoint and self._checkpoint_store is not None:
             if termination is not TerminationReason.COMPONENT_FAILURE:
@@ -1221,7 +1446,7 @@ class MultiobjectiveVNS:
             checkpoint_reference = checkpoint_progress.reference
 
         state = cast(_SearchSnapshot, coordinator.search_state)
-        self._stop_and_finalize(
+        termination = self._stop_and_finalize(
             coordinator,
             state,
             initial_archive_ids,
@@ -1254,6 +1479,9 @@ class MultiobjectiveVNS:
                 checkpoint_reference,
                 finalized.event_log_path,
                 finalized.summary_path,
+                snapshot_progress.latest_successful_path,
+                finalized.registry_view_path,
+                finalized.pareto_view_path,
             )
         return RunResult(
             state,
@@ -1263,6 +1491,7 @@ class MultiobjectiveVNS:
             counters,
             coordinator.run_log,
             checkpoint_reference=checkpoint_reference,
+            pareto_snapshot_path=snapshot_progress.latest_successful_path,
         )
 
     def _search(
@@ -1276,10 +1505,12 @@ class MultiobjectiveVNS:
         progress_interval: float,
         stop_token: StopToken | None,
         checkpoint_progress: _CheckpointProgress,
+        snapshot_progress: _ParetoSnapshotProgress,
     ) -> tuple[TerminationReason, InvocationCounters]:
         committed = coordinator
         disabled_choices: set[ChoiceId] = set()
         disabled_operators: set[OperatorId] = set()
+        reported_choice_ids: set[ChoiceId] = set()
         last_progress = started
         while True:
             if self._stop_requested(stop_token):
@@ -1318,8 +1549,15 @@ class MultiobjectiveVNS:
 
             try:
                 base_record, base_source, eligible_base_count = self._select_base(
-                    state, state.base_selection_context, committed, counters
+                    state,
+                    state.base_selection_context,
+                    committed,
+                    counters,
+                    disabled_choices,
+                    disabled_operators,
                 )
+            except _NoEligibleBase:
+                return TerminationReason.NO_AVAILABLE_OPERATOR, counters
             except _RandomFailure as error:
                 diagnostics.append(error.failure)
                 self._append_failure_event(
@@ -1363,6 +1601,7 @@ class MultiobjectiveVNS:
 
             choices = self._choices(
                 state,
+                base_record.solution_id,
                 restoration_required,
                 disabled_choices,
                 disabled_operators,
@@ -1374,20 +1613,6 @@ class MultiobjectiveVNS:
                     else TerminationReason.NO_AVAILABLE_OPERATOR,
                     counters,
                 )
-            self._append_invocation(
-                committed,
-                self._event(
-                    'choice_set_available',
-                    EventPhase.CHOICE_SELECTION,
-                    {
-                        'iteration': iteration,
-                        'restoration_required': restoration_required,
-                        'choices': tuple(choice.descriptor for choice in choices),
-                    },
-                    solution_id=base_record.solution_id,
-                ),
-            )
-
             standalone_choices = tuple(
                 choice
                 for choice in choices
@@ -1397,6 +1622,31 @@ class MultiobjectiveVNS:
                 choice
                 for choice in choices
                 if choice.descriptor.choice_id.kind is ChoiceKind.COMPOSITION
+            )
+            choice_descriptors = tuple(choice.descriptor for choice in choices)
+            newly_eligible_choices = tuple(
+                descriptor
+                for descriptor in choice_descriptors
+                if descriptor.choice_id not in reported_choice_ids
+            )
+            reported_choice_ids.update(
+                descriptor.choice_id for descriptor in newly_eligible_choices
+            )
+            self._append_invocation(
+                committed,
+                self._event(
+                    'choice_set_available',
+                    EventPhase.CHOICE_SELECTION,
+                    {
+                        'iteration': iteration,
+                        'restoration_required': restoration_required,
+                        'eligible_choice_count': len(choices),
+                        'eligible_standalone_count': len(standalone_choices),
+                        'eligible_composition_count': len(composition_choices),
+                        'newly_eligible_choices': newly_eligible_choices,
+                    },
+                    solution_id=base_record.solution_id,
+                ),
             )
             configured_probability = float(
                 self._config.composition_selection_probability
@@ -1487,6 +1737,16 @@ class MultiobjectiveVNS:
                 return TerminationReason.COMPONENT_FAILURE, counters
 
             k = selected_choice.descriptor.current_k
+            remaining_requests = (
+                self._config.budget_limits.max_evaluation_requests
+                - counters.evaluation_requests
+            )
+            call_candidate_limit = min(
+                self._config.max_candidates_per_attempt,
+                remaining_requests,
+            )
+            if call_candidate_limit <= 0:
+                return TerminationReason.BUDGET_EXHAUSTED, counters
             if self._hard_limit(counters, started, wall_limit):
                 return TerminationReason.BUDGET_EXHAUSTED, counters
             self._append_invocation(
@@ -1501,6 +1761,7 @@ class MultiobjectiveVNS:
                         'max_neighborhood_size': (
                             selected_choice.descriptor.max_neighborhood_size
                         ),
+                        'max_candidates': call_candidate_limit,
                         'restoration_required': restoration_required,
                     },
                     choice_id=selected_choice.descriptor.choice_id,
@@ -1511,12 +1772,14 @@ class MultiobjectiveVNS:
             counters = replace(
                 counters, candidate_attempts=counters.candidate_attempts + 1
             )
+            previous_promotion_count = len(state.promoted_operators)
             attempt = self._attempt(
                 state,
                 base_record,
                 selected_choice,
                 k,
                 restoration_required,
+                call_candidate_limit,
                 counters,
                 committed,
                 diagnostics,
@@ -1528,6 +1791,46 @@ class MultiobjectiveVNS:
                     counters,
                     evaluation_requests=(counters.evaluation_requests + attempt[1]),
                 )
+
+            if attempt[0] is not None and attempt[4]:
+                view_failure = self._publish_view(
+                    invocation_id=committed.run_log.invocation_id,
+                    state=state,
+                    scope='pareto',
+                    is_final=False,
+                )
+                if view_failure is not None:
+                    diagnostics.append(view_failure)
+                    logging_failure = self._try_append_failure_event(
+                        committed, view_failure
+                    )
+                    if logging_failure is not None:
+                        diagnostics.append(logging_failure)
+                    return TerminationReason.COMPONENT_FAILURE, counters
+                snapshot_failure = self._save_pareto_snapshot(state, snapshot_progress)
+                if snapshot_failure is not None:
+                    diagnostics.append(snapshot_failure)
+                    logging_failure = self._try_append_failure_event(
+                        committed, snapshot_failure
+                    )
+                    if logging_failure is not None:
+                        diagnostics.append(logging_failure)
+                    snapshot_progress.failed = True
+                    return TerminationReason.COMPONENT_FAILURE, counters
+
+            if (
+                attempt[0] is not None
+                and len(state.promoted_operators) > previous_promotion_count
+            ):
+                catalog_failure = self._save_promoted_catalog(state)
+                if catalog_failure is not None:
+                    diagnostics.append(catalog_failure)
+                    logging_failure = self._try_append_failure_event(
+                        committed, catalog_failure
+                    )
+                    if logging_failure is not None:
+                        diagnostics.append(logging_failure)
+                    return TerminationReason.COMPONENT_FAILURE, counters
 
             if attempt[0] is not None and checkpoint_progress.interval is not None:
                 checkpoint_failure = self._save_checkpoint_if_needed(
@@ -1549,8 +1852,12 @@ class MultiobjectiveVNS:
             if failure_status == 'component_failure':
                 return TerminationReason.COMPONENT_FAILURE, counters
             if failure_status == 'operator_failure':
-                if selected_choice.second is None:
-                    disabled_operators.add(selected_choice.first.operator_id)
+                if selected_choice.descriptor.choice_id.kind is ChoiceKind.OPERATOR:
+                    disabled_operators.add(
+                        cast(
+                            OperatorId, selected_choice.descriptor.choice_id.operator_id
+                        )
+                    )
                 else:
                     disabled_choices.add(selected_choice.descriptor.choice_id)
 
@@ -1568,6 +1875,7 @@ class MultiobjectiveVNS:
         choice: _Choice,
         k: int,
         restoration_required: bool,
+        max_candidates: int,
         counters: InvocationCounters,
         coordinator: SearchCommitCoordinator,
         diagnostics: list[ComponentFailure],
@@ -1609,80 +1917,75 @@ class MultiobjectiveVNS:
         state_payloads = dict(state.operator_payloads)
         component_events: list[EventDraft] = []
         failures: list[ComponentFailure] = []
-        components_completed = 0
-        final_candidate: Candidate | None = None
-        m: int | None = None
-        component_position: CompositionPosition | None = None
+        component_call_index = [0]
+        composition_parts = self._composition_parts(choice)
+        composition_stats = {'first_candidate_count': 0, 'second_call_count': 0}
         active_operator = choice.first
-        preparation_failure = False
         random_failure = False
-        objective_comparison_failure = False
-        processing_failure_requests = 0
-        processing_failure_events: tuple[EventDraft, ...] = ()
+        operator_failure = False
+        result: OperatorResult | None = None
         try:
-            first_result = self._call_operator_spec(
-                choice.first,
-                base.solution,
-                k,
-                False
-                if choice.second is not None
-                else (
-                    self._config.feasibility_mode == 'strict' or restoration_required
-                ),
-                state_payloads,
-                base.evaluation_record,
-            )
-            components_completed = 1
-            component_events.append(
-                self._operator_result_event(
-                    choice_id,
-                    base.solution_id,
+            if composition_parts is None:
+                result = self._call_operator_spec(
                     choice.first,
-                    first_result,
-                    k,
-                    CompositionPosition.FIRST if choice.second is not None else None,
-                )
-            )
-            if choice.second is None:
-                m = first_result.m
-                final_candidate = first_result.candidate
-            elif first_result.m == 0:
-                m = 0
-            else:
-                second = choice.second
-                active_operator = second
-                second_result = self._call_operator_spec(
-                    second,
-                    cast(Candidate, first_result.candidate).solution,
+                    base.solution,
                     k,
                     self._config.feasibility_mode == 'strict' or restoration_required,
                     state_payloads,
-                    None,
+                    base.evaluation_record,
+                    max_candidates=max_candidates,
+                    choice_id=choice_id,
+                    base_id=base.solution_id,
+                    component_position=None,
+                    input_candidate_index=None,
+                    component_events=component_events,
+                    component_call_index=component_call_index,
                 )
-                components_completed = 2
-                component_events.append(
-                    self._operator_result_event(
-                        choice_id,
-                        base.solution_id,
-                        second,
-                        second_result,
-                        k,
-                        CompositionPosition.SECOND,
-                    )
+            else:
+                first_spec, second_spec, _ = composition_parts
+                active_operator = first_spec
+                result, composition_stats = self._call_operator_pair(
+                    first_spec,
+                    second_spec,
+                    base.solution,
+                    k,
+                    self._config.feasibility_mode == 'strict' or restoration_required,
+                    state_payloads,
+                    base.evaluation_record,
+                    max_candidates=max_candidates,
+                    choice_id=choice_id,
+                    base_id=base.solution_id,
+                    component_events=component_events,
+                    component_call_index=component_call_index,
                 )
-                m = min(first_result.m, second_result.m)
-                final_candidate = (
-                    None if m == 0 else cast(Candidate, second_result.candidate)
-                )
-                component_position = CompositionPosition.SECOND
         except _OperatorCallFailure as error:
             if error.state_captured:
                 state_payloads[error.operator_id] = error.state_payload
             failures.append(replace(error.failure, choice_id=choice_id))
             random_failure = error.random_failure
+            operator_failure = True
         except _TransitionFailure as error:
-            failures.append(replace(error.failure, choice_id=choice_id))
-            preparation_failure = True
+            diagnostics.append(replace(error.failure, choice_id=choice_id))
+            self._append_failure_event(
+                coordinator,
+                replace(error.failure, choice_id=choice_id),
+                base_id=base.solution_id,
+                k=k,
+                component_position=None,
+                choice_id=choice_id,
+            )
+            self._restore_feedback(pre_feedback)
+            self._restore_random(pre_random)
+            self._restore_operator_payloads(state_payloads, state.operator_payloads)
+            return (
+                None,
+                int(error.evaluation_requested),
+                None,
+                False,
+                (),
+                False,
+                ('component_failure'),
+            )
         except Exception as error:
             failures.append(
                 ComponentFailure(
@@ -1693,171 +1996,111 @@ class MultiobjectiveVNS:
                     choice_id=choice_id,
                 )
             )
+            operator_failure = True
 
-        if choice.second is not None:
+        if composition_parts is not None:
+            first_spec, second_spec, execution_source = composition_parts
             component_events.append(
                 self._event(
                     'composition_result',
                     EventPhase.COMPOSITION,
                     {
                         'k': k,
-                        'm': m,
-                        'call_status': 'failed' if failures else 'completed',
-                        'components_completed': components_completed,
-                        'final_candidate_returned': final_candidate is not None,
+                        'call_status': 'failed' if operator_failure else 'completed',
+                        'final_candidate_count': (
+                            0 if result is None else len(result.candidates)
+                        ),
+                        'final_modification_counts': (
+                            None
+                            if result is None
+                            else tuple(item.m for item in result.candidates)
+                        ),
+                        'first_candidate_count': composition_stats[
+                            'first_candidate_count'
+                        ],
+                        'second_call_count': composition_stats['second_call_count'],
+                        'execution_source': execution_source,
+                        'component_operator_ids': (
+                            first_spec.operator_id,
+                            second_spec.operator_id,
+                        ),
                     },
                     choice_id=choice_id,
                     solution_id=base.solution_id,
                 )
             )
 
-        if failures:
-            if preparation_failure:
-                diagnostics.extend(failures)
-                self._append_failure_event(
-                    coordinator,
-                    failures[-1],
-                    base_id=base.solution_id,
-                    k=k,
-                    component_position=None,
-                    choice_id=choice_id,
-                )
-                self._restore_feedback(pre_feedback)
-                self._restore_random(pre_random)
-                self._restore_operator_payloads(state_payloads, state.operator_payloads)
-                return None, 0, None, False, (), False, 'component_failure'
+        if operator_failure:
             if not random_failure:
                 self._restore_random(pre_random)
                 self._restore_operator_payloads(state_payloads, state.operator_payloads)
-            stagnation_attempts = state.attempts_since_archive_admission
-            try:
-                observation = FeedbackObservation(
-                    choice_id=choice_id,
-                    k=k,
-                    m=None,
-                    outcomes=(),
-                    failures=tuple(failures),
-                    stagnation_attempts=stagnation_attempts,
-                    archive_reward=0.0,
-                )
-                self._feedback_policy.observe(observation)
-                feedback_payload = self._capture_feedback()
-            except Exception as error:
-                self._restore_feedback(pre_feedback)
-                failure = self._failure(
-                    self._feedback_policy,
-                    'policy_decision',
-                    f'FeedbackPolicy.observe failed: {error}',
-                    FailureKind.CALLBACK_EXCEPTION,
-                )
+            for failure in failures:
                 diagnostics.append(failure)
-                self._append_failure_event(
-                    coordinator,
-                    failure,
-                    base_id=base.solution_id,
-                    k=k,
-                    component_position=None,
+                component_events.append(
+                    self._component_failure_event(
+                        failure,
+                        base_id=base.solution_id,
+                        k=k,
+                        component_position=None,
+                        choice_id=choice_id,
+                    )
                 )
-                return None, 0, None, False, (), False, 'component_failure'
-            failure_drafts = [
-                self._component_failure_event(
-                    failure,
-                    base_id=base.solution_id,
-                    k=k,
-                    component_position=None,
-                )
-                for failure in failures
-            ]
-            base_seq = len(coordinator.run_log.events)
-            failure_sequences = tuple(
-                base_seq + len(component_events) + index
-                for index in range(len(failure_drafts))
-            )
-            feedback_event = self._event(
-                'feedback_observed',
-                EventPhase.FEEDBACK,
-                {
-                    'k': k,
-                    'm': None,
-                    'candidate_event_sequences': (),
-                    'failure_event_sequences': failure_sequences,
-                    'pareto_admission_count': 0,
-                    'stagnation_attempts': stagnation_attempts,
-                    'archive_reward': 0.0,
-                },
-                choice_id=choice_id,
-            )
-            try:
-                random_payload = self._capture_random()
-            except _TransitionFailure as error:
-                self._restore_feedback(pre_feedback)
-                self._restore_random(pre_random)
-                self._restore_operator_payloads(state_payloads, state.operator_payloads)
-                diagnostics.append(error.failure)
-                self._append_failure_event(
-                    coordinator,
-                    error.failure,
-                    base_id=base.solution_id,
-                    k=k,
-                    component_position=None,
-                    choice_id=choice_id,
-                )
-                return None, 0, None, False, (), False, 'component_failure'
-            next_state = replace(
+            failed_result = self._commit_attempt_result(
                 state,
-                attempt_counts=self._increment_count(
-                    state.attempt_counts, base.solution_id
-                ),
-                tracked_choice_ids=state.tracked_choice_ids | {choice_id},
-                choice_size_cursors=self._updated_choice_cursors(
-                    state, choice_id, k, admitted=False
-                ),
-                operator_payloads=MappingProxyType(state_payloads),
-                feedback_payload=feedback_payload,
-                random_payload=random_payload,
-                base_selection_context=(base.solution_id, False),
-                attempts_since_archive_admission=stagnation_attempts + 1,
-                commit_sequence=state.commit_sequence + 1,
+                base,
+                choice,
+                k,
+                max_candidates,
+                modification_counts=None,
+                outcomes=(),
+                failures=tuple(failures),
+                candidate_events=(),
+                component_events=tuple(component_events),
+                state_payloads=state_payloads,
+                pre_random=pre_random,
+                pre_feedback=pre_feedback,
+                counters=counters,
+                coordinator=coordinator,
+                diagnostics=diagnostics,
+                terminal_failure=None,
+                evaluation_requests=0,
+                excursion_events=(),
             )
-            drafts = (*component_events, *failure_drafts, feedback_event)
-            try:
-                coordinator.commit(next_state, drafts)
-            except Exception as error:
-                self._restore_feedback(pre_feedback)
-                self._restore_random(pre_random)
-                failure = self._failure(
-                    self._logger,
-                    'run_logging',
-                    f'failed-attempt event commit failed: {error}',
-                    FailureKind.INFRASTRUCTURE_FAILURE,
-                )
-                diagnostics.append(failure)
-                return None, 0, None, False, (), False, 'component_failure'
+            if failed_result[0] is None:
+                return failed_result
             return (
-                next_state,
-                0,
-                None,
-                False,
-                (),
-                False,
+                *failed_result[:6],
                 'component_failure' if random_failure else 'operator_failure',
             )
 
-        if m is None:
-            return None, 0, None, False, (), False, 'component_failure'
-        submission: _Submission | None = None
-        if final_candidate is not None:
+        assert result is not None
+        modification_counts = tuple(proposal.m for proposal in result.candidates)
+        working_state = state
+        outcomes: list[CandidateOutcome] = []
+        candidate_events: list[EventDraft] = []
+        excursion_events: list[EventDraft] = []
+        admissions: list[SolutionId] = []
+        evaluation_requests = 0
+        guarantee_failure = False
+        terminal_failure: ComponentFailure | None = None
+        final_component_position = (
+            CompositionPosition.SECOND if composition_parts is not None else None
+        )
+        # Advance the staged state after each proposal. Archive admissions
+        # record attempt success while the loop processes the remaining list.
+        for candidate_index, proposal in enumerate(result.candidates, start=1):
             try:
                 submission = self._prepare_submission(
-                    state,
-                    final_candidate,
+                    working_state,
+                    proposal.candidate,
                     source=SubmissionSource.OPERATOR,
                     counters=counters,
                     choice_id=choice_id,
                     base_id=base.solution_id,
                     k=k,
-                    m=m,
-                    component_position=component_position,
+                    m=proposal.m,
+                    component_position=final_component_position,
+                    candidate_index=candidate_index,
                     ensure_feasible=(
                         self._config.feasibility_mode == 'strict'
                         or restoration_required
@@ -1865,108 +2108,187 @@ class MultiobjectiveVNS:
                 )
             except _TransitionFailure as error:
                 failure = replace(error.failure, choice_id=choice_id)
-                if failure.phase == 'objective_comparison':
+                evaluation_requests += int(error.evaluation_requested)
+                if failure.phase in (
+                    'objective_comparison',
+                    'objective_bound_comparison',
+                ):
                     diagnostics.append(failure)
                     failures.append(failure)
-                    objective_comparison_failure = True
-                    processing_failure_requests = int(error.evaluation_requested)
-                    processing_failure_events = (
+                    terminal_failure = failure
+                    candidate_events.append(
                         self._component_failure_event(
                             failure,
                             base_id=base.solution_id,
                             k=k,
-                            component_position=component_position,
+                            component_position=final_component_position,
                             choice_id=choice_id,
-                        ),
+                        )
                     )
-                else:
-                    diagnostics.append(failure)
-                    self._append_failure_event(
-                        coordinator,
-                        failure,
-                        base_id=base.solution_id,
-                        k=k,
-                        component_position=component_position,
-                        choice_id=choice_id,
-                    )
-                    self._restore_feedback(pre_feedback)
-                    self._restore_random(pre_random)
-                    self._restore_operator_payloads(
-                        state_payloads, state.operator_payloads
-                    )
-                    return (
-                        None,
-                        int(error.evaluation_requested),
-                        m,
-                        False,
-                        (),
-                        False,
-                        'component_failure',
-                    )
+                    break
+                diagnostics.append(failure)
+                self._append_failure_event(
+                    coordinator,
+                    failure,
+                    base_id=base.solution_id,
+                    k=k,
+                    component_position=final_component_position,
+                    choice_id=choice_id,
+                )
+                self._restore_feedback(pre_feedback)
+                self._restore_random(pre_random)
+                self._restore_operator_payloads(state_payloads, state.operator_payloads)
+                return (
+                    None,
+                    evaluation_requests,
+                    proposal.m,
+                    False,
+                    (),
+                    False,
+                    ('component_failure'),
+                )
 
-        outcome_tuple = () if submission is None else (submission.outcome,)
-        admission = bool(submission is not None and submission.admitted)
-        stagnation_attempts = state.attempts_since_archive_admission
-        archive_reward = (
-            float(self._config.feedback_admission_reward_floor)
-            + (1.0 - float(self._config.feedback_admission_reward_floor))
-            * stagnation_attempts
-            / (stagnation_attempts + self._config.feedback_stagnation_scale)
-            if admission
-            else 0.0
-        )
-        excursion = state.excursion if submission is None else submission.excursion
-        excursion_event = None if submission is None else submission.excursion_event
-        submission_events = () if submission is None else submission.events
-        guarantee_failure = False
-        if submission is not None:
-            state = submission.state
+            working_state = submission.state
+            evaluation_requests += int(submission.evaluation_requested)
+            outcomes.append(submission.outcome)
             failures.extend(submission.failures)
-            guarantee_failure = any(
+            guarantee_failure = guarantee_failure or any(
                 failure.phase == 'operator_guarantee' for failure in submission.failures
             )
-            state, promotion_event = self._promote_composition(
-                state, choice, submission.outcome
+            candidate_events.extend(submission.events)
+            if submission.excursion_event is not None:
+                excursion_events.append(submission.excursion_event)
+            if submission.admitted and submission.outcome.solution_id is not None:
+                admissions.append(submission.outcome.solution_id)
+            working_state, promotion_event = self._promote_composition(
+                working_state, choice, submission.outcome
             )
             if promotion_event is not None:
                 insertion_point = next(
                     (
                         index
-                        for index, draft in enumerate(submission_events)
+                        for index, draft in enumerate(candidate_events)
                         if draft.event_type == 'archive_changed'
                     ),
                     next(
                         (
                             index
-                            for index, draft in enumerate(submission_events)
+                            for index, draft in enumerate(candidate_events)
                             if draft.event_type == 'candidate_processed'
                         ),
                     ),
                 )
-                submission_events = (
-                    *submission_events[: insertion_point + 1],
-                    promotion_event,
-                    *submission_events[insertion_point + 1 :],
-                )
+                candidate_events.insert(insertion_point + 1, promotion_event)
+            working_state = self._ensure_choice_cursors(working_state)
 
-        try:
+        outcome_tuple = tuple(outcomes)
+        admission_count = len(admissions)
+        application_success = admission_count > 0
+        observation = FeedbackObservation(
+            choice_id=choice_id,
+            k=k,
+            modification_counts=modification_counts,
+            outcomes=outcome_tuple,
+            failures=tuple(failures),
+            archive_admission_count=admission_count,
+        )
+        committed = self._commit_attempt_result(
+            working_state,
+            base,
+            choice,
+            k,
+            max_candidates,
+            modification_counts=modification_counts,
+            outcomes=outcome_tuple,
+            failures=tuple(failures),
+            candidate_events=tuple(candidate_events),
+            component_events=tuple(component_events),
+            state_payloads=state_payloads,
+            pre_random=pre_random,
+            pre_feedback=pre_feedback,
+            counters=counters,
+            coordinator=coordinator,
+            diagnostics=diagnostics,
+            terminal_failure=terminal_failure,
+            evaluation_requests=evaluation_requests,
+            excursion_events=tuple(excursion_events),
+            observation=observation,
+        )
+        if committed[0] is None:
+            return committed
+        return (
+            committed[0],
+            committed[1],
+            modification_counts[0] if modification_counts else 0,
+            application_success,
+            tuple(admissions),
+            bool(excursion_events),
+            'component_failure'
+            if terminal_failure is not None
+            else 'operator_failure'
+            if guarantee_failure
+            else None,
+        )
+
+    def _commit_attempt_result(
+        self,
+        state: _SearchSnapshot,
+        base: SolutionRecord,
+        choice: _Choice,
+        k: int,
+        max_candidates: int,
+        *,
+        modification_counts: tuple[int, ...] | None,
+        outcomes: tuple[CandidateOutcome, ...],
+        failures: tuple[ComponentFailure, ...],
+        candidate_events: tuple[EventDraft, ...],
+        component_events: tuple[EventDraft, ...],
+        state_payloads: dict[OperatorId, object],
+        pre_random: object | None,
+        pre_feedback: object | None,
+        counters: InvocationCounters,
+        coordinator: SearchCommitCoordinator,
+        diagnostics: list[ComponentFailure],
+        terminal_failure: ComponentFailure | None,
+        evaluation_requests: int,
+        excursion_events: tuple[EventDraft, ...],
+        observation: FeedbackObservation | None = None,
+    ) -> tuple[
+        _SearchSnapshot | None,
+        int,
+        int | None,
+        bool,
+        tuple[SolutionId, ...],
+        bool,
+        str | None,
+    ]:
+        """Commit one completed or failed ordered candidate attempt."""
+        del max_candidates, counters
+        choice_id = choice.descriptor.choice_id
+        archived_count = sum(
+            outcome.disposition is SearchDisposition.ARCHIVED for outcome in outcomes
+        )
+        if observation is None:
             observation = FeedbackObservation(
                 choice_id=choice_id,
                 k=k,
-                m=m,
-                outcomes=outcome_tuple,
-                failures=tuple(failures),
-                stagnation_attempts=stagnation_attempts,
-                archive_reward=archive_reward,
+                modification_counts=modification_counts,
+                outcomes=outcomes,
+                failures=failures,
+                archive_admission_count=archived_count,
             )
+        try:
             self._feedback_policy.observe(observation)
             feedback_payload = self._capture_feedback()
+            random_payload = self._capture_random()
         except Exception as error:
             self._restore_feedback(pre_feedback)
+            self._restore_random(pre_random)
+            self._restore_operator_payloads(state_payloads, state.operator_payloads)
             failure = self._failure(
                 self._feedback_policy,
                 'policy_decision',
-                f'FeedbackPolicy.observe failed: {error}',
+                f'FeedbackPolicy.observe or state capture failed: {error}',
                 FailureKind.CALLBACK_EXCEPTION,
                 choice_id=choice_id,
             )
@@ -1976,87 +2298,95 @@ class MultiobjectiveVNS:
                 failure,
                 base_id=base.solution_id,
                 k=k,
-                component_position=component_position,
+                component_position=None,
                 choice_id=choice_id,
             )
-            return None, 0, m, False, (), False, 'component_failure'
+            return (
+                None,
+                evaluation_requests,
+                None,
+                False,
+                (),
+                False,
+                'component_failure',
+            )
 
-        candidate_drafts = (
-            *processing_failure_events,
-            *submission_events,
+        committed_admission = archived_count > 0
+        cursor_base = base.solution_id
+        next_state = replace(
+            state,
+            attempt_counts=self._increment_count(
+                state.attempt_counts, base.solution_id
+            ),
+            tracked_choice_ids=state.tracked_choice_ids | {choice_id},
+            operator_payloads=MappingProxyType(state_payloads),
+            feedback_payload=feedback_payload,
+            random_payload=random_payload,
+            base_selection_context=(base.solution_id, committed_admission),
+            attempts_since_archive_admission=(
+                0 if committed_admission else state.attempts_since_archive_admission + 1
+            ),
+            commit_sequence=state.commit_sequence + 1,
         )
-        candidate_event_sequences = tuple(
-            len(coordinator.run_log.events) + len(component_events) + index
-            for index, draft in enumerate(candidate_drafts)
+        next_state = self._ensure_choice_cursors(next_state)
+        if cursor_base in next_state.archive_ids or (
+            next_state.excursion is not None
+            and next_state.excursion.current_id == cursor_base
+        ):
+            next_state = replace(
+                next_state,
+                choice_size_cursors=self._updated_choice_cursors(
+                    next_state,
+                    cursor_base,
+                    choice_id,
+                    k,
+                    admitted=committed_admission,
+                ),
+            )
+
+        start_sequence = len(coordinator.run_log.events)
+        candidate_sequences = tuple(
+            start_sequence + len(component_events) + index
+            for index, draft in enumerate(candidate_events)
             if draft.event_type == 'candidate_processed'
         )
-        failure_event_sequences = tuple(
-            len(coordinator.run_log.events) + len(component_events) + index
-            for index, draft in enumerate(candidate_drafts)
+        component_failure_sequences = tuple(
+            start_sequence + index
+            for index, draft in enumerate(component_events)
             if draft.event_type == 'component_failure'
+        )
+        candidate_failure_sequences = tuple(
+            start_sequence + len(component_events) + index
+            for index, draft in enumerate(candidate_events)
+            if draft.event_type == 'component_failure'
+        )
+        failure_sequences = (
+            *component_failure_sequences,
+            *candidate_failure_sequences,
         )
         feedback_event = self._event(
             'feedback_observed',
             EventPhase.FEEDBACK,
             {
                 'k': k,
-                'm': m,
-                'candidate_event_sequences': candidate_event_sequences,
-                'failure_event_sequences': failure_event_sequences,
-                'pareto_admission_count': int(admission),
-                'stagnation_attempts': stagnation_attempts,
-                'archive_reward': archive_reward,
+                'modification_counts': modification_counts,
+                'candidate_event_sequences': candidate_sequences,
+                'failure_event_sequences': failure_sequences,
+                'archive_admission_count': archived_count,
+                'attempt_admitted': committed_admission,
             },
             choice_id=choice_id,
-        )
-        requests = (
-            1
-            if submission is not None and submission.evaluation_requested
-            else processing_failure_requests
-        )
-        try:
-            random_payload = self._capture_random()
-        except _TransitionFailure as error:
-            self._restore_feedback(pre_feedback)
-            self._restore_random(pre_random)
-            self._restore_operator_payloads(state_payloads, state.operator_payloads)
-            diagnostics.append(error.failure)
-            self._append_failure_event(
-                coordinator,
-                error.failure,
-                base_id=base.solution_id,
-                k=k,
-                component_position=component_position,
-                choice_id=choice_id,
-            )
-            return None, requests, m, False, (), False, 'component_failure'
-        new_state = replace(
-            state,
-            attempt_counts=self._increment_count(
-                state.attempt_counts, base.solution_id
-            ),
-            tracked_choice_ids=state.tracked_choice_ids | {choice_id},
-            choice_size_cursors=self._updated_choice_cursors(
-                state, choice_id, k, admitted=admission
-            ),
-            operator_payloads=MappingProxyType(state_payloads),
-            feedback_payload=feedback_payload,
-            random_payload=random_payload,
-            base_selection_context=(base.solution_id, admission),
-            excursion=excursion,
-            attempts_since_archive_admission=(
-                0 if admission else stagnation_attempts + 1
-            ),
-            commit_sequence=state.commit_sequence + 1,
+            solution_id=base.solution_id,
+            source_id=self._feedback_policy.component_id,
         )
         drafts = (
             *component_events,
-            *candidate_drafts,
-            *((excursion_event,) if excursion_event is not None else ()),
+            *candidate_events,
+            *excursion_events,
             feedback_event,
         )
         try:
-            coordinator.commit(new_state, drafts, outcome_tuple)
+            coordinator.commit(next_state, drafts, outcomes)
         except Exception as error:
             self._restore_feedback(pre_feedback)
             self._restore_random(pre_random)
@@ -2069,25 +2399,28 @@ class MultiobjectiveVNS:
                 choice_id=choice_id,
             )
             diagnostics.append(failure)
-            return None, requests, m, False, (), False, 'component_failure'
-        admitted_ids = (
-            (outcome_tuple[0].solution_id,)
-            if admission and outcome_tuple and outcome_tuple[0].solution_id is not None
-            else ()
-        )
-        excursion_transition = excursion_event is not None
+            return (
+                None,
+                evaluation_requests,
+                None,
+                False,
+                (),
+                False,
+                'component_failure',
+            )
         return (
-            new_state,
-            requests,
-            m,
-            admission,
-            admitted_ids,
-            excursion_transition,
-            'component_failure'
-            if objective_comparison_failure
-            else 'operator_failure'
-            if guarantee_failure
-            else None,
+            next_state,
+            evaluation_requests,
+            None,
+            committed_admission,
+            tuple(
+                outcome.solution_id
+                for outcome in outcomes
+                if outcome.disposition is SearchDisposition.ARCHIVED
+                and outcome.solution_id is not None
+            ),
+            bool(excursion_events),
+            'component_failure' if terminal_failure is not None else None,
         )
 
     def _promote_composition(
@@ -2159,6 +2492,10 @@ class MultiobjectiveVNS:
             for registration in self._operators
         }
         used_texts.update(
+            identifier_text(registration.operator_id)
+            for registration in self._pre_registered_compositions
+        )
+        used_texts.update(
             identifier_text(promoted.report.operator_id)
             for promoted in state.promoted_operators
         )
@@ -2181,6 +2518,7 @@ class MultiobjectiveVNS:
         k: int | None,
         m: int | None,
         component_position: CompositionPosition | None,
+        candidate_index: int | None,
         ensure_feasible: bool | None,
     ) -> _Submission:
         result = self._candidate_processor.process(
@@ -2192,6 +2530,7 @@ class MultiobjectiveVNS:
             k=k,
             m=m,
             component_position=component_position,
+            candidate_index=candidate_index,
         )
         new_state = replace(state, registry=result.registry)
         outcome = result.outcome
@@ -2203,13 +2542,48 @@ class MultiobjectiveVNS:
             outcome.solution_id is not None
             and outcome.disposition is not SearchDisposition.DUPLICATE
         )
+        if (
+            not new_record
+            and outcome.solution_id is not None
+            and outcome.disposition is SearchDisposition.DUPLICATE
+        ):
+            outcome = replace(
+                outcome,
+                objective_bound_findings=new_state.registry.get(
+                    outcome.solution_id
+                ).objective_bound_findings,
+            )
         if new_record and outcome.solution_id is not None:
             record = new_state.registry.get(outcome.solution_id)
             evaluation = record.evaluation_record.application_evaluation
             assessment = record.evaluation_record.assessment
-            if assessment is ApplicationAssessment.VALID and evaluation is not None:
+            try:
+                bound_findings = self._objective_bound_findings(record)
+            except _TransitionFailure as error:
+                raise _TransitionFailure(
+                    error.failure,
+                    evaluation_requested=result.evaluation_requested,
+                ) from error
+            if bound_findings:
+                record = replace(record, objective_bound_findings=bound_findings)
+                new_state = replace(
+                    new_state,
+                    registry=new_state.registry.with_updated_record(record),
+                )
+                outcome = replace(
+                    outcome,
+                    disposition=SearchDisposition.OBJECTIVE_BOUND_EXCEEDED,
+                    objective_bound_findings=bound_findings,
+                )
+            if (
+                assessment is ApplicationAssessment.VALID
+                and evaluation is not None
+                and not bound_findings
+            ):
                 try:
-                    decision = self._archive_decision(new_state, record)
+                    decision, objective_vector_duplicate = self._archive_decision(
+                        new_state, record
+                    )
                 except _TransitionFailure as error:
                     raise _TransitionFailure(
                         error.failure,
@@ -2256,21 +2630,37 @@ class MultiobjectiveVNS:
                         }
                     )
                 else:
-                    new_record_value = replace(
-                        record, archive_status=ArchiveStatus.DOMINATED
+                    if objective_vector_duplicate:
+                        warnings.warn(
+                            'Distinct visited plans share a Pareto objective vector. '
+                            'This may indicate search symmetry and can divert '
+                            'evaluations from discovering new objective trade-offs.',
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    archive_status = (
+                        ArchiveStatus.OBJECTIVE_VECTOR_DUPLICATE
+                        if objective_vector_duplicate
+                        else ArchiveStatus.DOMINATED
                     )
+                    disposition = (
+                        SearchDisposition.OBJECTIVE_VECTOR_DUPLICATE
+                        if objective_vector_duplicate
+                        else SearchDisposition.DOMINATED
+                    )
+                    new_record_value = replace(record, archive_status=archive_status)
                     new_state = replace(
                         new_state,
                         registry=new_state.registry.with_updated_record(
                             new_record_value
                         ),
                     )
-                    outcome = replace(outcome, disposition=SearchDisposition.DOMINATED)
+                    outcome = replace(outcome, disposition=disposition)
                     status_changes.append(
                         {
                             'solution_id': record.solution_id,
                             'previous_status': record.archive_status,
-                            'new_status': ArchiveStatus.DOMINATED,
+                            'new_status': archive_status,
                         }
                     )
                 if status_changes:
@@ -2455,6 +2845,7 @@ class MultiobjectiveVNS:
                     'source': source,
                     'processing_status': outcome.processing_status,
                     'base_solution_id': base_id,
+                    'candidate_index': candidate_index,
                     'k': k,
                     'm': m,
                     'component_position': component_position,
@@ -2467,12 +2858,16 @@ class MultiobjectiveVNS:
                     ),
                     'assessment': outcome.assessment,
                     'disposition': outcome.disposition,
+                    'objective_bound_findings': self._format_bound_event_findings(
+                        outcome.objective_bound_findings
+                    ),
                     'failure_event_sequences': (),
                 },
                 choice_id=choice_id,
                 solution_id=outcome.solution_id,
             )
         )
+
         if archive_event is not None:
             event_drafts.append(archive_event)
         if pool_event is not None:
@@ -2493,6 +2888,93 @@ class MultiobjectiveVNS:
             new_excursion,
             excursion_event,
         )
+
+    def _objective_bound_findings(
+        self, record: SolutionRecord
+    ) -> tuple[ObjectiveBoundFinding, ...]:
+        """Return exceeded bounds after completed application evaluation."""
+        evaluation_record = record.evaluation_record
+        if (
+            evaluation_record.processing_status is not ProcessingStatus.COMPLETED
+            or evaluation_record.assessment
+            not in (ApplicationAssessment.VALID, ApplicationAssessment.INFEASIBLE)
+        ):
+            return ()
+        evaluation = evaluation_record.application_evaluation
+        if evaluation is None or evaluation.objective_values is None:
+            return ()
+        bounds = cast(
+            tuple[ObjectiveValue | None, ...],
+            self._objective_declaration.upper_bounds,
+        )
+        findings: list[ObjectiveBoundFinding] = []
+        for objective, value, bound in zip(
+            self._objective_declaration.objectives,
+            evaluation.objective_values,
+            bounds,
+            strict=True,
+        ):
+            if bound is None:
+                continue
+            try:
+                comparison = objective.compare(value, bound)
+            except Exception as error:
+                raise _TransitionFailure(
+                    self._failure(
+                        objective.component_id,
+                        'objective_bound_comparison',
+                        f'ObjectiveFunction.compare raised while checking bound: {error}',
+                        FailureKind.CALLBACK_EXCEPTION,
+                        solution_id=record.solution_id,
+                    )
+                ) from error
+            if not isinstance(comparison, ObjectiveComparison):
+                raise _TransitionFailure(
+                    self._failure(
+                        objective.component_id,
+                        'objective_bound_comparison',
+                        'ObjectiveFunction.compare returned an invalid result while checking bound',
+                        FailureKind.CONTRACT_VIOLATION,
+                        solution_id=record.solution_id,
+                    )
+                )
+            if comparison is ObjectiveComparison.GREATER:
+                findings.append(
+                    ObjectiveBoundFinding(objective.objective_id, value, bound)
+                )
+        return tuple(findings)
+
+    def _format_bound_event_findings(
+        self, findings: tuple[ObjectiveBoundFinding, ...]
+    ) -> tuple[ObjectiveBoundEventFinding, ...]:
+        """Format findings for event JSON, retaining a reportable fallback."""
+        formatted: list[ObjectiveBoundEventFinding] = []
+        objective_by_id = {
+            objective.objective_id: objective
+            for objective in self._objective_declaration.objectives
+        }
+        for finding in findings:
+            objective = objective_by_id[finding.objective_id]
+            try:
+                value_text = objective.format(finding.objective_value)
+                if not isinstance(value_text, str) or not value_text:
+                    value_text = '[unformatted]'
+            except Exception:
+                value_text = '[unformatted]'
+            try:
+                bound_text = objective.format(finding.upper_bound)
+                if not isinstance(bound_text, str) or not bound_text:
+                    bound_text = '[unformatted]'
+            except Exception:
+                bound_text = '[unformatted]'
+            formatted.append(
+                ObjectiveBoundEventFinding(
+                    finding.objective_id,
+                    value_text,
+                    bound_text,
+                )
+            )
+        return tuple(formatted)
 
     def _commit_submission(
         self,
@@ -2543,7 +3025,7 @@ class MultiobjectiveVNS:
 
     def _archive_decision(
         self, state: _SearchSnapshot, candidate: SolutionRecord
-    ) -> ArchiveDecision:
+    ) -> tuple[ArchiveDecision, bool]:
         evaluation = candidate.evaluation_record.application_evaluation
         if evaluation is None or evaluation.objective_values is None:
             raise _TransitionFailure(
@@ -2566,7 +3048,7 @@ class MultiobjectiveVNS:
             is not None
         )
         request = ArchiveRequest(entry, archive_entries, self._objective_declaration)
-        expected = self._exact_archive_decision(request)
+        expected, objective_vector_duplicate = self._exact_archive_decision(request)
         try:
             decision = self._archive_policy.decide(request)
         except Exception as error:
@@ -2583,31 +3065,52 @@ class MultiobjectiveVNS:
                 self._failure(
                     self._archive_policy,
                     'policy_decision',
-                    'ArchivePolicy returned a decision inconsistent with Pareto dominance',
+                    'ArchivePolicy returned a decision inconsistent with the unique-vector Pareto rule',
                     FailureKind.CONTRACT_VIOLATION,
                 )
             )
-        return decision
+        return decision, objective_vector_duplicate
 
-    def _exact_archive_decision(self, request: ArchiveRequest) -> ArchiveDecision:
+    def _exact_archive_decision(
+        self, request: ArchiveRequest
+    ) -> tuple[ArchiveDecision, bool]:
         candidate_values = request.candidate.objective_values
-        dominated = any(
-            self._dominates(
-                entry.objective_values,
-                candidate_values,
+        comparisons_by_entry = tuple(
+            (
+                entry.solution_id,
+                self._compare_objective_vectors(
+                    entry.objective_values,
+                    candidate_values,
+                ),
             )
             for entry in request.current_archive
         )
-        if dominated:
-            return ArchiveDecision(False, ())
-        remove = tuple(
-            entry.solution_id
-            for entry in request.current_archive
-            if self._dominates(candidate_values, entry.objective_values)
+        dominated = any(
+            self._dominates_comparisons(comparisons)
+            for _, comparisons in comparisons_by_entry
         )
-        return ArchiveDecision(True, remove)
+        if dominated:
+            return ArchiveDecision(False, ()), False
+        objective_vector_duplicate = any(
+            all(comparison is ObjectiveComparison.EQUAL for comparison in comparisons)
+            for _, comparisons in comparisons_by_entry
+        )
+        if objective_vector_duplicate:
+            return ArchiveDecision(False, ()), True
+        remove = tuple(
+            solution_id
+            for solution_id, comparisons in comparisons_by_entry
+            if self._dominates_comparisons(
+                tuple(
+                    self._reverse_comparison(comparison) for comparison in comparisons
+                )
+            )
+        )
+        return ArchiveDecision(True, remove), False
 
-    def _dominates(self, left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+    def _compare_objective_vectors(
+        self, left: tuple[object, ...], right: tuple[object, ...]
+    ) -> tuple[ObjectiveComparison, ...]:
         comparisons: list[ObjectiveComparison] = []
         for objective, left_value, right_value in zip(
             self._objective_declaration.objectives,
@@ -2636,10 +3139,26 @@ class MultiobjectiveVNS:
                     )
                 )
             comparisons.append(comparison)
+        return tuple(comparisons)
+
+    @staticmethod
+    def _dominates_comparisons(
+        comparisons: tuple[ObjectiveComparison, ...],
+    ) -> bool:
         return all(
             value in (ObjectiveComparison.LESS, ObjectiveComparison.EQUAL)
             for value in comparisons
         ) and any(value is ObjectiveComparison.LESS for value in comparisons)
+
+    @staticmethod
+    def _reverse_comparison(
+        comparison: ObjectiveComparison,
+    ) -> ObjectiveComparison:
+        if comparison is ObjectiveComparison.LESS:
+            return ObjectiveComparison.GREATER
+        if comparison is ObjectiveComparison.GREATER:
+            return ObjectiveComparison.LESS
+        return ObjectiveComparison.EQUAL
 
     def _operator_guarantee_failure(
         self,
@@ -2744,6 +3263,8 @@ class MultiobjectiveVNS:
         previous_context: tuple[SolutionId, bool] | None,
         coordinator: SearchCommitCoordinator,
         counters: InvocationCounters,
+        disabled_choices: set[ChoiceId],
+        disabled_operators: set[OperatorId],
     ) -> tuple[SolutionRecord, str, int]:
         if state.excursion is not None:
             excursion = state.excursion
@@ -2752,30 +3273,21 @@ class MultiobjectiveVNS:
             return record, 'active_excursion', 1
         eligible = tuple(
             record
-            for record in state.active_solutions()
-            if record.evaluation_record.processing_status is ProcessingStatus.COMPLETED
-            and record.evaluation_record.assessment is ApplicationAssessment.VALID
+            for record in (
+                state.registry.get(solution_id)
+                for solution_id in sorted(state.archive_ids, key=identifier_text)
+            )
+            if self._choices(
+                state,
+                record.solution_id,
+                False,
+                disabled_choices,
+                disabled_operators,
+            )
         )
-        if self._uses_default_base_selection:
-            eligible = tuple(
-                record for record in eligible if record.solution_id in state.archive_ids
-            )
         if not eligible:
-            raise _TransitionFailure(
-                self._failure(
-                    self._base_policy,
-                    'policy_decision',
-                    'no feasible active base is available',
-                    FailureKind.CONTRACT_VIOLATION,
-                )
-            )
+            raise _NoEligibleBase
         previous_id = previous_context[0] if previous_context else None
-        if previous_context is not None and not previous_context[1]:
-            alternatives = tuple(
-                record for record in eligible if record.solution_id != previous_id
-            )
-            if alternatives:
-                eligible = alternatives
         request = BaseSelectionRequest(
             eligible,
             {
@@ -2818,6 +3330,7 @@ class MultiobjectiveVNS:
     def _choices(
         self,
         state: _SearchSnapshot,
+        base_id: SolutionId,
         restoration_required: bool,
         disabled_choices: set[ChoiceId],
         disabled_operators: set[OperatorId],
@@ -2835,7 +3348,7 @@ class MultiobjectiveVNS:
                 cap if cap is not None else spec.max_neighborhood_size,
             )
             choice_id = ChoiceId.for_operator(spec.operator_id)
-            current_k = state.choice_size_cursors.get(choice_id, 1)
+            current_k = state.choice_size_cursors.get((base_id, choice_id), 1)
             if current_k > max_size:
                 continue
             descriptor = ChoiceDescriptor(
@@ -2850,6 +3363,11 @@ class MultiobjectiveVNS:
             choices.append(_Choice(descriptor, spec))
         for first in available:
             for second in available:
+                if (
+                    first.operator_id,
+                    second.operator_id,
+                ) in self._pre_registered_pairs:
+                    continue
                 groups = first.group_ids & second.group_ids
                 choice_id = ChoiceId.for_composition(
                     CompositionId(first.operator_id, second.operator_id)
@@ -2860,7 +3378,7 @@ class MultiobjectiveVNS:
                 )
                 if cap is not None:
                     max_size = min(max_size, cap)
-                current_k = state.choice_size_cursors.get(choice_id, 1)
+                current_k = state.choice_size_cursors.get((base_id, choice_id), 1)
                 if current_k > max_size:
                     continue
                 descriptor = ChoiceDescriptor(
@@ -2889,16 +3407,33 @@ class MultiobjectiveVNS:
         return tuple(choices)
 
     @staticmethod
+    def _composition_parts(
+        choice: _Choice,
+    ) -> tuple[_OperatorSpec, _OperatorSpec, str] | None:
+        """Return immediate component specs and the selected composition kind."""
+        if choice.second is not None:
+            return choice.first, choice.second, 'dynamic'
+        if choice.first.first is None or choice.first.second is None:
+            return None
+        source = (
+            'pre_registered'
+            if choice.first.catalog_kind == 'pre_registered_composite'
+            else 'promoted'
+        )
+        return choice.first.first, choice.first.second, source
+
+    @staticmethod
     def _updated_choice_cursors(
         state: _SearchSnapshot,
+        base_id: SolutionId,
         choice_id: ChoiceId,
         k: int,
         *,
         admitted: bool,
-    ) -> Mapping[ChoiceId, int]:
+    ) -> Mapping[tuple[SolutionId, ChoiceId], int]:
         """Advance or reset one choice's cursor for a committed attempt."""
         cursors = dict(state.choice_size_cursors)
-        cursors[choice_id] = 1 if admitted else k + 1
+        cursors[(base_id, choice_id)] = 1 if admitted else k + 1
         return MappingProxyType(cursors)
 
     def _ensure_choice_cursors(self, state: _SearchSnapshot) -> _SearchSnapshot:
@@ -2911,10 +3446,19 @@ class MultiobjectiveVNS:
             )
             for first in specs
             for second in specs
+            if (first.operator_id, second.operator_id) not in self._pre_registered_pairs
         )
-        cursors = dict(state.choice_size_cursors)
-        for choice_id in choice_ids:
-            cursors.setdefault(choice_id, 1)
+        bases = set(state.archive_ids)
+        if state.excursion is not None:
+            bases.add(state.excursion.current_id)
+        cursors = {
+            (base_id, choice_id): current_k
+            for (base_id, choice_id), current_k in state.choice_size_cursors.items()
+            if base_id in bases
+        }
+        for base_id in bases:
+            for choice_id in choice_ids:
+                cursors.setdefault((base_id, choice_id), 1)
         if cursors == dict(state.choice_size_cursors):
             return state
         return replace(state, choice_size_cursors=MappingProxyType(cursors))
@@ -2922,19 +3466,47 @@ class MultiobjectiveVNS:
     def _operator_specs(self, state: _SearchSnapshot) -> tuple[_OperatorSpec, ...]:
         """Build executable Operator entries from registrations and promotions."""
         specs: dict[OperatorId, _OperatorSpec] = {}
-        for registration in self._operators:
+        for operator_registration in self._operators:
             group_ids = frozenset(
                 group.group_id
                 for group in self._operator_groups
-                if registration.operator_id in group.operator_ids
+                if operator_registration.operator_id in group.operator_ids
             )
-            specs[registration.operator_id] = _OperatorSpec(
-                registration.operator_id,
-                registration.max_neighborhood_size,
-                registration.feasibility_restoration,
-                registration.modification_count_definition,
+            specs[operator_registration.operator_id] = _OperatorSpec(
+                operator_registration.operator_id,
+                operator_registration.max_neighborhood_size,
+                operator_registration.feasibility_restoration,
+                operator_registration.modification_count_definition,
                 group_ids,
-                registration=registration,
+                operator_registration.configuration_id,
+                'ordinary',
+                registration=operator_registration,
+            )
+        for composition_registration in self._pre_registered_compositions:
+            first = specs.get(composition_registration.first_operator_id)
+            second = specs.get(composition_registration.second_operator_id)
+            if first is None or second is None:
+                raise ValueError('pre-registered composite refers to unknown Operators')
+            inherited_group_ids = first.group_ids & second.group_ids
+            declared_group_ids = frozenset(
+                group.group_id
+                for group in self._operator_groups
+                if composition_registration.operator_id in group.operator_ids
+            )
+            composite_group_ids = inherited_group_ids | declared_group_ids
+            specs[composition_registration.operator_id] = _OperatorSpec(
+                composition_registration.operator_id,
+                min(first.max_neighborhood_size, second.max_neighborhood_size),
+                second.feasibility_restoration,
+                'min(m_first, m_second); component scales: '
+                f'{first.modification_count_definition}; '
+                f'{second.modification_count_definition}',
+                composite_group_ids,
+                composition_registration.configuration_id,
+                'pre_registered_composite',
+                (first.operator_id, second.operator_id),
+                first=first,
+                second=second,
             )
         for promoted in state.promoted_operators:
             report = promoted.report
@@ -2942,12 +3514,27 @@ class MultiobjectiveVNS:
             second = specs.get(report.component_operator_ids[1])
             if first is None or second is None:
                 raise ValueError('promoted Operator refers to an unknown component')
+            configuration_id = 'multiobjective-vns:promoted-operator-config:' + (
+                json.dumps(
+                    [
+                        report.source_composition_id.to_log_text(),
+                        identifier_text(first.configuration_id),
+                        identifier_text(second.configuration_id),
+                        report.max_neighborhood_size,
+                    ],
+                    ensure_ascii=True,
+                    separators=(',', ':'),
+                )
+            )
             specs[report.operator_id] = _OperatorSpec(
                 report.operator_id,
                 report.max_neighborhood_size,
                 report.feasibility_restoration,
                 promoted.modification_count_definition,
                 report.inherited_group_ids,
+                configuration_id,
+                'promoted_composite',
+                report.component_operator_ids,
                 first=first,
                 second=second,
             )
@@ -2988,6 +3575,7 @@ class MultiobjectiveVNS:
         ensure_feasible: bool,
         previous_payload: object | None,
         base_evaluation: EvaluationRecord | None,
+        max_candidates: int,
     ) -> tuple[OperatorResult, object | None, bool]:
         state = registration.initial_state
         stateful = registration.initial_state is not None
@@ -3014,6 +3602,7 @@ class MultiobjectiveVNS:
                     operator_state=state,
                     random_source=cast(RandomSource, self._checked_random),
                     base_evaluation=base_evaluation,
+                    max_candidates=max_candidates,
                 )
             )
         except _RandomFailure as error:
@@ -3051,13 +3640,25 @@ class MultiobjectiveVNS:
                 payload,
                 stateful,
             )
-        if result.m > k:
+        if len(result.candidates) > max_candidates:
             raise _OperatorCallFailure(
                 ComponentFailure(
                     FailureKind.CONTRACT_VIOLATION,
                     registration.operator_id,
                     'operator_call',
-                    'OperatorResult.m cannot exceed requested k',
+                    'OperatorResult exceeds CandidateContext.max_candidates',
+                ),
+                registration.operator_id,
+                payload,
+                stateful,
+            )
+        if any(proposal.m > k for proposal in result.candidates):
+            raise _OperatorCallFailure(
+                ComponentFailure(
+                    FailureKind.CONTRACT_VIOLATION,
+                    registration.operator_id,
+                    'operator_call',
+                    'a CandidateProposal.m cannot exceed requested k',
                 ),
                 registration.operator_id,
                 payload,
@@ -3073,6 +3674,14 @@ class MultiobjectiveVNS:
         ensure_feasible: bool,
         state_payloads: dict[OperatorId, object],
         base_evaluation: EvaluationRecord | None,
+        *,
+        max_candidates: int,
+        choice_id: ChoiceId,
+        base_id: SolutionId,
+        component_position: CompositionPosition | None,
+        input_candidate_index: int | None,
+        component_events: list[EventDraft],
+        component_call_index: list[int],
     ) -> OperatorResult:
         """Run one registered Operator or a generated composition expression."""
         if spec.registration is not None:
@@ -3083,37 +3692,115 @@ class MultiobjectiveVNS:
                 ensure_feasible,
                 state_payloads.get(spec.operator_id),
                 base_evaluation,
+                max_candidates,
             )
             if stateful:
                 state_payloads[spec.operator_id] = payload
+            component_call_index[0] += 1
+            component_events.append(
+                self._operator_result_event(
+                    choice_id,
+                    base_id,
+                    spec,
+                    result,
+                    k,
+                    component_position,
+                    component_call_index[0],
+                    input_candidate_index,
+                )
+            )
             return result
         if spec.first is None or spec.second is None:
             raise ValueError('promoted Operator has an incomplete expression')
-        first_result = self._call_operator_spec(
+        result, _ = self._call_operator_pair(
             spec.first,
+            spec.second,
+            base,
+            k,
+            ensure_feasible,
+            state_payloads,
+            base_evaluation,
+            max_candidates=max_candidates,
+            choice_id=choice_id,
+            base_id=base_id,
+            component_events=component_events,
+            component_call_index=component_call_index,
+            inherited_position=component_position,
+            inherited_input_candidate_index=input_candidate_index,
+        )
+        return result
+
+    def _call_operator_pair(
+        self,
+        first: _OperatorSpec,
+        second: _OperatorSpec,
+        base: object,
+        k: int,
+        ensure_feasible: bool,
+        state_payloads: dict[OperatorId, object],
+        base_evaluation: EvaluationRecord | None,
+        *,
+        max_candidates: int,
+        choice_id: ChoiceId,
+        base_id: SolutionId,
+        component_events: list[EventDraft],
+        component_call_index: list[int],
+        inherited_position: CompositionPosition | None = None,
+        inherited_input_candidate_index: int | None = None,
+    ) -> tuple[OperatorResult, dict[str, int]]:
+        """Compose ordered candidate lists while respecting the final limit."""
+        first_position = inherited_position or CompositionPosition.FIRST
+        second_position = inherited_position or CompositionPosition.SECOND
+        first_result = self._call_operator_spec(
+            first,
             base,
             k,
             False,
             state_payloads,
             base_evaluation,
+            max_candidates=max_candidates,
+            choice_id=choice_id,
+            base_id=base_id,
+            component_position=first_position,
+            input_candidate_index=inherited_input_candidate_index,
+            component_events=component_events,
+            component_call_index=component_call_index,
         )
-        if first_result.m == 0:
-            return OperatorResult(0, None)
-        first_candidate = cast(Candidate, first_result.candidate)
-        second_result = self._call_operator_spec(
-            spec.second,
-            first_candidate.solution,
-            k,
-            ensure_feasible,
-            state_payloads,
-            None,
-        )
-        if second_result.m == 0:
-            return OperatorResult(0, None)
-        return OperatorResult(
-            min(first_result.m, second_result.m),
-            cast(Candidate, second_result.candidate),
-        )
+        statistics = {
+            'first_candidate_count': len(first_result.candidates),
+            'second_call_count': 0,
+        }
+        final_proposals: list[CandidateProposal] = []
+        for input_index, intermediate in enumerate(first_result.candidates, start=1):
+            remaining = max_candidates - len(final_proposals)
+            if remaining <= 0:
+                break
+            statistics['second_call_count'] += 1
+            second_result = self._call_operator_spec(
+                second,
+                intermediate.candidate.solution,
+                k,
+                ensure_feasible,
+                state_payloads,
+                None,
+                max_candidates=remaining,
+                choice_id=choice_id,
+                base_id=base_id,
+                component_position=second_position,
+                input_candidate_index=input_index,
+                component_events=component_events,
+                component_call_index=component_call_index,
+            )
+            for final in second_result.candidates:
+                if len(final_proposals) >= max_candidates:
+                    break
+                final_proposals.append(
+                    CandidateProposal(
+                        final.candidate,
+                        min(intermediate.m, final.m),
+                    )
+                )
+        return OperatorResult(candidates=tuple(final_proposals)), statistics
 
     def _capture_operator_call_state(
         self, registration: OperatorRegistration, state: object | None
@@ -3140,15 +3827,21 @@ class MultiobjectiveVNS:
         result: OperatorResult,
         k: int,
         position: CompositionPosition | None,
+        component_call_index: int,
+        input_candidate_index: int | None,
     ) -> EventDraft:
         return self._event(
             'operator_result',
             EventPhase.OPERATOR_CALL,
             {
                 'k': k,
-                'm': result.m,
-                'candidate_returned': result.candidate is not None,
+                'candidate_count': len(result.candidates),
+                'modification_counts': tuple(
+                    proposal.m for proposal in result.candidates
+                ),
                 'component_position': position,
+                'component_call_index': component_call_index,
+                'input_candidate_index': input_candidate_index,
             },
             source_id=registration.operator_id,
             choice_id=choice_id,
@@ -3192,41 +3885,32 @@ class MultiobjectiveVNS:
                 self._solution_identity,
                 exhaustive_identity_validation=self._config.exhaustive_identity_validation,
             )
-            choice_size_cursors: dict[ChoiceId, int] = {
-                ChoiceId.for_operator(registration.operator_id): 1
-                for registration in self._operators
-            }
-            choice_size_cursors.update(
-                {
-                    ChoiceId.for_composition(
-                        CompositionId(first.operator_id, second.operator_id)
-                    ): 1
-                    for first in self._operators
-                    for second in self._operators
-                }
-            )
-            return (
-                _SearchSnapshot(
-                    registry=registry,
-                    archive_ids=frozenset(),
-                    active_ids=frozenset(),
-                    attempt_counts=MappingProxyType({}),
-                    tracked_choice_ids=frozenset(),
-                    choice_size_cursors=MappingProxyType(choice_size_cursors),
-                    operator_payloads=MappingProxyType(dict(self._operator_baselines)),
-                    extension_payloads=MappingProxyType(
-                        dict(self._extension_baselines)
-                    ),
-                    feedback_payload=self._feedback_baseline,
-                    random_payload=self._random_baseline,
-                    manifest=self._manifest,
-                    configuration_signature=self._configuration_signature(),
-                    problem_instance_text=identifier_text(self._problem_instance_id),
-                    objective_texts=tuple(
-                        identifier_text(obj.objective_id)
-                        for obj in self._objective_declaration.objectives
-                    ),
+            initial_state = _SearchSnapshot(
+                registry=registry,
+                archive_ids=frozenset(),
+                active_ids=frozenset(),
+                attempt_counts=MappingProxyType({}),
+                tracked_choice_ids=frozenset(),
+                choice_size_cursors=MappingProxyType({}),
+                operator_payloads=MappingProxyType(dict(self._operator_baselines)),
+                extension_payloads=MappingProxyType(dict(self._extension_baselines)),
+                feedback_payload=self._feedback_baseline,
+                random_payload=self._random_baseline,
+                manifest=self._manifest,
+                configuration_signature=self._configuration_signature(),
+                problem_instance_text=identifier_text(self._problem_instance_id),
+                objective_texts=tuple(
+                    identifier_text(obj.objective_id)
+                    for obj in self._objective_declaration.objectives
                 ),
+                objective_bounds=cast(
+                    tuple[ObjectiveValue | None, ...],
+                    self._objective_declaration.upper_bounds,
+                ),
+            )
+            initial_state = self._load_promoted_catalog(initial_state)
+            return (
+                self._ensure_choice_cursors(initial_state),
                 None,
                 None,
             )
@@ -3266,22 +3950,39 @@ class MultiobjectiveVNS:
             )
         ):
             raise ResumeCompatibilityError('checkpoint compatibility manifest differs')
+        if not self._objective_bounds_match(saved.objective_bounds):
+            raise ResumeCompatibilityError('checkpoint objective bounds differ')
         records = saved.registry.records
         if saved.codec_payloads is not None:
             restored_records = []
             for record in records:
-                try:
-                    solution = self._solution_codec.restore(
-                        saved.codec_payloads[record.solution_id]
+                payload = saved.codec_payloads[record.solution_id]
+                if not isinstance(payload, bytes):
+                    raise CheckpointRestoreError(
+                        checkpoint,
+                        self._failure(
+                            self._solution_codec,
+                            'checkpoint_restore',
+                            'saved SolutionCodec payload must be bytes',
+                            FailureKind.CONTRACT_VIOLATION,
+                            solution_id=record.solution_id,
+                        ),
                     )
+                try:
+                    solution = self._solution_codec.restore(payload)
                 except Exception as error:
+                    kind = (
+                        FailureKind.CONTRACT_VIOLATION
+                        if isinstance(error, (TypeError, ValueError))
+                        else FailureKind.CALLBACK_EXCEPTION
+                    )
                     raise CheckpointRestoreError(
                         checkpoint,
                         self._failure(
                             self._solution_codec,
                             'checkpoint_restore',
                             f'SolutionCodec.restore failed: {error}',
-                            FailureKind.CALLBACK_EXCEPTION,
+                            kind,
                             solution_id=record.solution_id,
                         ),
                     ) from error
@@ -3380,6 +4081,67 @@ class MultiobjectiveVNS:
                 f'checkpoint_saved event append failed: {error}',
                 FailureKind.INFRASTRUCTURE_FAILURE,
             )
+        return None
+
+    def _save_pareto_snapshot(
+        self,
+        state: _SearchSnapshot,
+        progress: _ParetoSnapshotProgress,
+    ) -> ComponentFailure | None:
+        """Capture and atomically publish the current archive."""
+        records = state.pareto_solutions()
+        if not records:
+            return None
+        payloads: list[bytes] = []
+        for record in records:
+            try:
+                payload = self._solution_codec.capture(record.solution)
+            except Exception as error:
+                return self._failure(
+                    self._solution_codec,
+                    'pareto_snapshot_save',
+                    f'SolutionCodec.capture failed: {error}',
+                    FailureKind.CALLBACK_EXCEPTION,
+                    solution_id=record.solution_id,
+                )
+            if type(payload) is not bytes:
+                return self._failure(
+                    self._solution_codec,
+                    'pareto_snapshot_save',
+                    'SolutionCodec.capture must return bytes',
+                    FailureKind.CONTRACT_VIOLATION,
+                    solution_id=record.solution_id,
+                )
+            payloads.append(payload)
+
+        try:
+            snapshot = ParetoSnapshotData(
+                problem_instance_id=identifier_text(self._problem_instance_id),
+                objective_ids=tuple(
+                    identifier_text(objective.objective_id)
+                    for objective in self._objective_declaration.objectives
+                ),
+                objective_configuration_ids=tuple(
+                    identifier_text(objective.configuration_id)
+                    for objective in self._objective_declaration.objectives
+                ),
+                solution_codec_component_id=identifier_text(
+                    self._solution_codec.component_id
+                ),
+                solution_codec_configuration_id=identifier_text(
+                    self._solution_codec.configuration_id
+                ),
+                solution_payloads=tuple(payloads),
+            )
+            write_pareto_snapshot(progress.destination, snapshot)
+        except Exception as error:
+            return self._failure(
+                'multiobjective-vns:pareto-snapshot-store',
+                'pareto_snapshot_save',
+                f'Pareto snapshot publication failed: {error}',
+                FailureKind.INFRASTRUCTURE_FAILURE,
+            )
+        progress.latest_successful_path = progress.destination
         return None
 
     def _capture_operator_baselines(self) -> dict[OperatorId, object]:
@@ -3530,6 +4292,42 @@ class MultiobjectiveVNS:
     def _validate_registrations(self) -> None:
         if len(self._operator_by_id) != len(self._operators):
             raise ComponentRegistrationError('Operator IDs must be unique')
+        if len(self._pre_registered_by_id) != len(self._pre_registered_compositions):
+            raise ComponentRegistrationError(
+                'pre-registered composite Operator IDs must be unique'
+            )
+        all_operator_ids = set(self._operator_by_id)
+        operator_texts = {
+            identifier_text(operator_id) for operator_id in self._operator_by_id
+        }
+        composition_pairs: set[tuple[OperatorId, OperatorId]] = set()
+        for registration in self._pre_registered_compositions:
+            operator_id_text = identifier_text(registration.operator_id)
+            if (
+                registration.operator_id in all_operator_ids
+                or operator_id_text in operator_texts
+            ):
+                raise ComponentRegistrationError(
+                    'ordinary and pre-registered composite Operator IDs must be unique'
+                )
+            all_operator_ids.add(registration.operator_id)
+            operator_texts.add(operator_id_text)
+            if (
+                registration.first_operator_id not in self._operator_by_id
+                or registration.second_operator_id not in self._operator_by_id
+            ):
+                raise ComponentRegistrationError(
+                    'pre-registered composite references an unknown Operator'
+                )
+            pair = (
+                registration.first_operator_id,
+                registration.second_operator_id,
+            )
+            if pair in composition_pairs:
+                raise ComponentRegistrationError(
+                    'pre-registered composition pairs must be unique'
+                )
+            composition_pairs.add(pair)
         group_ids: set[object] = set()
         group_id_texts: set[str] = set()
         for group in self._operator_groups:
@@ -3538,13 +4336,19 @@ class MultiobjectiveVNS:
                 raise ComponentRegistrationError('OperatorGroup IDs must be unique')
             group_ids.add(group.group_id)
             group_id_texts.add(group_id_text)
-            if not group.operator_ids <= set(self._operator_by_id):
+            if not group.operator_ids <= all_operator_ids:
                 raise ComponentRegistrationError(
                     'OperatorGroup references unknown Operators'
                 )
-        if self._config.feasibility_mode == 'relaxed' and not any(
+        has_restoration = any(
             registration.feasibility_restoration for registration in self._operators
-        ):
+        ) or any(
+            self._operator_by_id[
+                registration.second_operator_id
+            ].feasibility_restoration
+            for registration in self._pre_registered_compositions
+        )
+        if self._config.feasibility_mode == 'relaxed' and not has_restoration:
             raise ValueError('relaxed mode requires a feasibility-restoration Operator')
         components = (
             self._solution_codec,
@@ -3578,15 +4382,24 @@ class MultiobjectiveVNS:
             'multiobjective-vns:random-source',
             'multiobjective-vns:run-logger',
         }
-        for registration in self._operators:
-            text = identifier_text(registration.operator_id)
+        for operator_registration in self._operators:
+            text = identifier_text(operator_registration.operator_id)
             if text in reserved:
                 raise ComponentRegistrationError(
                     'caller registration uses a reserved ID'
                 )
             if text in texts:
                 raise ComponentRegistrationError('component IDs must be unique')
-            texts[text] = registration.operator
+            texts[text] = operator_registration.operator
+        for composition_registration in self._pre_registered_compositions:
+            text = identifier_text(composition_registration.operator_id)
+            if text in reserved:
+                raise ComponentRegistrationError(
+                    'caller registration uses a reserved ID'
+                )
+            if text in texts:
+                raise ComponentRegistrationError('component IDs must be unique')
+            texts[text] = composition_registration
         for component in components:
             try:
                 component_id = component.component_id
@@ -3676,12 +4489,36 @@ class MultiobjectiveVNS:
                     identifier_text(objective.configuration_id),
                 )
             )
-        for registration in self._operators:
+        for operator_registration in self._operators:
             components.append(
                 (
                     'operator',
-                    identifier_text(registration.operator_id),
-                    identifier_text(registration.configuration_id),
+                    identifier_text(operator_registration.operator_id),
+                    identifier_text(operator_registration.configuration_id),
+                )
+            )
+        for composition_registration in self._pre_registered_compositions:
+            components.append(
+                (
+                    'operator',
+                    identifier_text(composition_registration.operator_id),
+                    identifier_text(composition_registration.configuration_id),
+                )
+            )
+            components.append(
+                (
+                    'operator_composition',
+                    identifier_text(composition_registration.operator_id),
+                    json.dumps(
+                        [
+                            identifier_text(composition_registration.first_operator_id),
+                            identifier_text(
+                                composition_registration.second_operator_id
+                            ),
+                        ],
+                        ensure_ascii=True,
+                        separators=(',', ':'),
+                    ),
                 )
             )
         for extension in self._extensions:
@@ -3696,13 +4533,295 @@ class MultiobjectiveVNS:
 
     def _configuration_signature(self) -> tuple[object, ...]:
         """Return configuration fields that must remain stable on resume."""
-        return tuple(
+        config_signature = tuple(
             getattr(self._config, field.name)
             for field in fields(self._config)
             if field.name != 'budget_limits'
         )
+        return (
+            *config_signature,
+            (
+                'promoted_composition_catalog_path',
+                (
+                    str(self._promoted_composition_catalog_path)
+                    if self._promoted_composition_catalog_path is not None
+                    else None
+                ),
+            ),
+        )
 
-    def _provenance(self) -> RunProvenance:
+    def _objective_bounds_match(
+        self, saved_bounds: tuple[ObjectiveValue | None, ...]
+    ) -> bool:
+        """Compare saved bounds with current bounds through objective ordering."""
+        current_bounds = cast(
+            tuple[ObjectiveValue | None, ...],
+            self._objective_declaration.upper_bounds,
+        )
+        if len(saved_bounds) != len(current_bounds):
+            return False
+        for objective, saved_bound, current_bound in zip(
+            self._objective_declaration.objectives,
+            saved_bounds,
+            current_bounds,
+            strict=True,
+        ):
+            if saved_bound is None or current_bound is None:
+                if saved_bound is not current_bound:
+                    return False
+                continue
+            try:
+                comparison = objective.compare(saved_bound, current_bound)
+            except Exception as error:
+                raise ComponentSetupError(
+                    self._failure(
+                        objective.component_id,
+                        'objective_bound_comparison',
+                        f'ObjectiveFunction.compare raised while matching bounds: {error}',
+                        FailureKind.CALLBACK_EXCEPTION,
+                    )
+                ) from error
+            if not isinstance(comparison, ObjectiveComparison):
+                raise ComponentSetupError(
+                    self._failure(
+                        objective.component_id,
+                        'objective_bound_comparison',
+                        'ObjectiveFunction.compare returned an invalid result while matching bounds',
+                        FailureKind.CONTRACT_VIOLATION,
+                    )
+                )
+            if comparison is not ObjectiveComparison.EQUAL:
+                return False
+        return True
+
+    def _promotion_catalog_compatibility(self) -> dict[str, object]:
+        """Build the stable application declaration for saved promotions."""
+        objectives = [
+            {
+                'objective_id': identifier_text(item.objective_id),
+                'configuration_id': identifier_text(item.configuration_id),
+            }
+            for item in self._objective_declaration.objectives
+        ]
+        operators: list[dict[str, object]] = []
+        for registration in self._operators:
+            operators.append(
+                {
+                    'catalog_kind': 'ordinary',
+                    'operator_id': identifier_text(registration.operator_id),
+                    'configuration_id': identifier_text(registration.configuration_id),
+                    'component_operator_ids': None,
+                    'max_neighborhood_size': registration.max_neighborhood_size,
+                    'feasibility_restoration': registration.feasibility_restoration,
+                    'modification_count_definition': (
+                        registration.modification_count_definition
+                    ),
+                }
+            )
+        for composition_registration in self._pre_registered_compositions:
+            first = self._operator_by_id[composition_registration.first_operator_id]
+            second = self._operator_by_id[composition_registration.second_operator_id]
+            maximum = min(
+                first.max_neighborhood_size,
+                second.max_neighborhood_size,
+            )
+            if self._config.max_neighborhood_size is not None:
+                maximum = min(maximum, self._config.max_neighborhood_size)
+            operators.append(
+                {
+                    'catalog_kind': 'pre_registered_composite',
+                    'operator_id': identifier_text(
+                        composition_registration.operator_id
+                    ),
+                    'configuration_id': identifier_text(
+                        composition_registration.configuration_id
+                    ),
+                    'component_operator_ids': [
+                        identifier_text(composition_registration.first_operator_id),
+                        identifier_text(composition_registration.second_operator_id),
+                    ],
+                    'max_neighborhood_size': maximum,
+                    'feasibility_restoration': second.feasibility_restoration,
+                    'modification_count_definition': (
+                        'min(m_first, m_second); component scales: '
+                        f'{first.modification_count_definition}; '
+                        f'{second.modification_count_definition}'
+                    ),
+                }
+            )
+        operator_groups = [
+            {
+                'group_id': identifier_text(group.group_id),
+                'operator_ids': sorted(
+                    identifier_text(operator_id) for operator_id in group.operator_ids
+                ),
+            }
+            for group in self._operator_groups
+        ]
+        return {
+            'objectives': objectives,
+            'operators': operators,
+            'operator_groups': operator_groups,
+        }
+
+    def _load_promoted_catalog(self, state: _SearchSnapshot) -> _SearchSnapshot:
+        """Restore validated promotion definitions into a fresh search state."""
+        if self._promoted_composition_catalog_path is None:
+            return state
+        try:
+            entries = self._promoted_composition_catalog.load(
+                identifier_text(self._problem_instance_id),
+                self._promotion_catalog_compatibility(),
+                configuration_id_aliases=getattr(
+                    self._solution_identity,
+                    'compatibility_configuration_id_aliases',
+                    {},
+                ),
+            )
+            for entry in entries:
+                specs = self._operator_specs(state)
+                specs_by_text = {
+                    identifier_text(spec.operator_id): spec for spec in specs
+                }
+                first = specs_by_text.get(entry.component_operator_id_texts[0])
+                second = specs_by_text.get(entry.component_operator_id_texts[1])
+                if first is None or second is None:
+                    raise ValueError('promotion references an unknown Operator')
+                expected_configuration_ids = (
+                    identifier_text(first.configuration_id),
+                    identifier_text(second.configuration_id),
+                )
+                if entry.component_configuration_id_texts != (
+                    expected_configuration_ids
+                ):
+                    raise ValueError('promotion component configuration differs')
+                composition_id = CompositionId(first.operator_id, second.operator_id)
+                if any(
+                    promoted.report.source_composition_id == composition_id
+                    for promoted in state.promoted_operators
+                ):
+                    raise ValueError('promotion composition is repeated')
+                maximum = min(
+                    first.max_neighborhood_size,
+                    second.max_neighborhood_size,
+                )
+                if entry.max_neighborhood_size > maximum:
+                    raise ValueError('promotion maximum neighborhood size is invalid')
+                inherited_groups = first.group_ids & second.group_ids
+                expected_group_texts = tuple(
+                    sorted(identifier_text(group_id) for group_id in inherited_groups)
+                )
+                if entry.inherited_group_id_texts != expected_group_texts:
+                    raise ValueError('promotion Operator groups differ')
+                if entry.feasibility_restoration != second.feasibility_restoration:
+                    raise ValueError('promotion restoration capability differs')
+                modification_count_definition = (
+                    'min(m_f, m_g); component scales: '
+                    f'{first.modification_count_definition}; '
+                    f'{second.modification_count_definition}'
+                )
+                if entry.modification_count_definition != modification_count_definition:
+                    raise ValueError('promotion modification-count definition differs')
+                operator_id = self._new_promoted_operator_id(state, composition_id)
+                if identifier_text(operator_id) != entry.operator_id_text:
+                    raise ValueError('promotion generated Operator ID differs')
+                report = PromotedCompositionReport(
+                    operator_id=operator_id,
+                    source_composition_id=composition_id,
+                    component_operator_ids=(first.operator_id, second.operator_id),
+                    first_admitted_solution_id=None,
+                    max_neighborhood_size=entry.max_neighborhood_size,
+                    feasibility_restoration=entry.feasibility_restoration,
+                    inherited_group_ids=inherited_groups,
+                    promoted_in_current_invocation=False,
+                )
+                promoted = _PromotedOperator(
+                    report,
+                    entry.modification_count_definition,
+                )
+                state = replace(
+                    state,
+                    promoted_operators=(*state.promoted_operators, promoted),
+                )
+            return state
+        except PromotedCompositionCatalogError as error:
+            raise ComponentSetupError(
+                self._failure(
+                    self._promoted_composition_catalog.component_id,
+                    'promotion_catalog_load',
+                    str(error),
+                    error.kind,
+                )
+            ) from error
+        except ComponentSetupError:
+            raise
+        except Exception as error:
+            raise ComponentSetupError(
+                self._failure(
+                    self._promoted_composition_catalog.component_id,
+                    'promotion_catalog_load',
+                    f'promoted composition catalog could not be restored: {error}',
+                    FailureKind.CONTRACT_VIOLATION,
+                )
+            ) from error
+
+    def _save_promoted_catalog(self, state: _SearchSnapshot) -> ComponentFailure | None:
+        """Persist all committed generated Operators for future fresh runs."""
+        if self._promoted_composition_catalog_path is None:
+            return None
+        specs = {spec.operator_id: spec for spec in self._operator_specs(state)}
+        entries: list[PromotedCatalogEntry] = []
+        for promoted in state.promoted_operators:
+            report = promoted.report
+            first = specs[report.component_operator_ids[0]]
+            second = specs[report.component_operator_ids[1]]
+            entries.append(
+                PromotedCatalogEntry(
+                    operator_id_text=identifier_text(report.operator_id),
+                    component_operator_id_texts=(
+                        identifier_text(first.operator_id),
+                        identifier_text(second.operator_id),
+                    ),
+                    component_configuration_id_texts=(
+                        identifier_text(first.configuration_id),
+                        identifier_text(second.configuration_id),
+                    ),
+                    max_neighborhood_size=report.max_neighborhood_size,
+                    feasibility_restoration=report.feasibility_restoration,
+                    inherited_group_id_texts=tuple(
+                        sorted(
+                            identifier_text(group_id)
+                            for group_id in report.inherited_group_ids
+                        )
+                    ),
+                    modification_count_definition=(
+                        promoted.modification_count_definition
+                    ),
+                )
+            )
+        try:
+            self._promoted_composition_catalog.save(
+                identifier_text(self._problem_instance_id),
+                self._promotion_catalog_compatibility(),
+                tuple(entries),
+            )
+        except PromotedCompositionCatalogError as error:
+            return self._failure(
+                self._promoted_composition_catalog.component_id,
+                'promotion_catalog_save',
+                str(error),
+                error.kind,
+            )
+        except Exception as error:
+            return self._failure(
+                self._promoted_composition_catalog.component_id,
+                'promotion_catalog_save',
+                f'promoted composition catalog could not be saved: {error}',
+                FailureKind.INFRASTRUCTURE_FAILURE,
+            )
+        return None
+
+    def _provenance(self, state: _SearchSnapshot) -> RunProvenance:
         role_by_name = {role.value: role for role in ComponentRole}
         entries = []
         for role_text, component_id, configuration_id in self._manifest:
@@ -3724,32 +4843,52 @@ class MultiobjectiveVNS:
                     objective_id,
                 )
             )
-        entries.extend(
-            ComponentConfigurationEntry(
-                ComponentRole.OPERATOR,
-                registration.operator_id,
-                registration.configuration_id,
-            )
-            for registration in self._operators
-        )
+        operator_specs = self._operator_specs(state)
         return RunProvenance(
             tuple(entries),
             tuple(
                 OperatorCatalogEntry(
-                    registration.operator_id,
-                    registration.max_neighborhood_size,
-                    registration.feasibility_restoration,
-                    registration.modification_count_definition,
+                    operator_id=spec.operator_id,
+                    configuration_id=spec.configuration_id,
+                    catalog_kind=spec.catalog_kind,
+                    max_neighborhood_size=spec.max_neighborhood_size,
+                    feasibility_restoration=spec.feasibility_restoration,
+                    modification_count_definition=(spec.modification_count_definition),
+                    component_operator_ids=spec.component_operator_ids,
                 )
-                for registration in self._operators
+                for spec in operator_specs
             ),
             self._operator_groups,
+            self._objective_bound_reports(),
         )
+
+    def _objective_bound_reports(self) -> tuple[ObjectiveBoundReport, ...]:
+        """Build declaration-ordered, safely formatted objective bounds."""
+        reports: list[ObjectiveBoundReport] = []
+        bounds = cast(
+            tuple[ObjectiveValue | None, ...],
+            self._objective_declaration.upper_bounds,
+        )
+        for objective, bound in zip(
+            self._objective_declaration.objectives, bounds, strict=True
+        ):
+            if bound is None:
+                continue
+            try:
+                formatted = objective.format(bound)
+                if not isinstance(formatted, str) or not formatted:
+                    formatted = '[unformatted]'
+            except Exception:
+                formatted = '[unformatted]'
+            reports.append(ObjectiveBoundReport(objective.objective_id, formatted))
+        return tuple(reports)
 
     def _eligible_pool_ids(self, state: _SearchSnapshot) -> frozenset[SolutionId]:
         eligible: set[SolutionId] = set()
         for record in state.registry.records:
             evaluation = record.evaluation_record
+            if record.objective_bound_findings:
+                continue
             if evaluation.processing_status is not ProcessingStatus.COMPLETED:
                 continue
             if evaluation.assessment is ApplicationAssessment.VALID:
@@ -3833,7 +4972,10 @@ class MultiobjectiveVNS:
         started: float,
         wall_limit: float,
         diagnostics: list[ComponentFailure],
-    ) -> None:
+    ) -> TerminationReason:
+        termination = self._publish_final_views(
+            coordinator, state, termination, diagnostics
+        )
         elapsed = self._elapsed(started)
         remaining = max(0.0, wall_limit - elapsed)
         try:
@@ -3863,6 +5005,31 @@ class MultiobjectiveVNS:
                     FailureKind.INFRASTRUCTURE_FAILURE,
                 )
             )
+        return termination
+
+    def _publish_final_views(
+        self,
+        coordinator: SearchCommitCoordinator,
+        state: _SearchSnapshot,
+        termination: TerminationReason,
+        diagnostics: list[ComponentFailure],
+    ) -> TerminationReason:
+        """Publish final registry and Pareto files before stopping the run."""
+        for scope in ('registry', 'pareto'):
+            failure = self._publish_view(
+                invocation_id=coordinator.run_log.invocation_id,
+                state=state,
+                scope=scope,
+                is_final=True,
+            )
+            if failure is None:
+                continue
+            diagnostics.append(failure)
+            logging_failure = self._try_append_failure_event(coordinator, failure)
+            if logging_failure is not None:
+                diagnostics.append(logging_failure)
+            termination = TerminationReason.COMPONENT_FAILURE
+        return termination
 
     def _finalize(
         self,
@@ -3906,6 +5073,35 @@ class MultiobjectiveVNS:
                 self._logger,
                 'run_logging',
                 f'RunLogger.finalize raised: {error}',
+                FailureKind.INFRASTRUCTURE_FAILURE,
+            )
+
+    def _publish_view(
+        self,
+        *,
+        invocation_id: InvocationId,
+        state: _SearchSnapshot,
+        scope: Literal['registry', 'pareto'],
+        is_final: bool,
+    ) -> ComponentFailure | None:
+        """Publish one immutable committed state through the configured logger."""
+        try:
+            self._logger.publish_view(
+                invocation_id,
+                self._problem_instance_id,
+                state,
+                state.commit_sequence,
+                self._objective_declaration,
+                scope,
+                is_final,
+                self._solution_formatter,
+            )
+            return None
+        except Exception as error:
+            return self._failure(
+                self._logger,
+                f'{scope}_view_publish',
+                f'RunLogger.publish_view failed: {error}',
                 FailureKind.INFRASTRUCTURE_FAILURE,
             )
 
@@ -4049,9 +5245,10 @@ def multiobjective_vns(
     solution_identity: SolutionIdentity,
     objective_declaration: ObjectiveDeclaration,
     operators: tuple[OperatorRegistration, ...],
+    pre_registered_compositions: tuple[OperatorCompositionRegistration, ...] = (),
     application_evaluator: ApplicationEvaluator,
     problem_instance_id: ProblemInstanceId,
-    config: MultiobjectiveVNSConfig = MultiobjectiveVNSConfig(),
+    config: MultiobjectiveVNSConfig,
     operator_groups: tuple[OperatorGroup, ...] = (),
     extensions: tuple[SearchExtensionRegistration, ...] = (),
     archive_policy: ArchivePolicy | None = None,
@@ -4064,6 +5261,9 @@ def multiobjective_vns(
     event_observers: tuple[EventObserver, ...] = (),
     checkpoint_store: CheckpointStore | None = None,
     solution_formatter: SolutionFormatter | None = None,
+    promoted_composition_catalog_path: Path | None = Path(
+        './multiobjective-vns-promoted-compositions.json'
+    ),
     initial_solutions: tuple[object, ...] | None = None,
     checkpoint: Checkpoint | object | None = None,
     checkpoint_interval: int | None = None,
@@ -4071,12 +5271,19 @@ def multiobjective_vns(
     log_directory: Path = Path('./multiobjective-vns-logs/'),
     stop_token: StopToken | None = None,
 ) -> RunResult:
-    """Create a search engine and execute one run invocation."""
+    """Create a search engine and execute one run invocation.
+
+    :param pre_registered_compositions: Ordered Operator pairs available as
+        standalone choices from the first search iteration.
+    :param promoted_composition_catalog_path: File that carries promoted
+        composition definitions across fresh searches, or ``None`` to disable.
+    """
     engine = MultiobjectiveVNS(
         solution_codec=solution_codec,
         solution_identity=solution_identity,
         objective_declaration=objective_declaration,
         operators=operators,
+        pre_registered_compositions=pre_registered_compositions,
         application_evaluator=application_evaluator,
         problem_instance_id=problem_instance_id,
         config=config,
@@ -4092,6 +5299,7 @@ def multiobjective_vns(
         event_observers=event_observers,
         checkpoint_store=checkpoint_store,
         solution_formatter=solution_formatter,
+        promoted_composition_catalog_path=promoted_composition_catalog_path,
     )
     return engine.run(
         initial_solutions=initial_solutions,

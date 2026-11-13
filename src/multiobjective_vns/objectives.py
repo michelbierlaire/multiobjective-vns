@@ -59,17 +59,28 @@ class ObjectiveDeclaration:
     """Ordered objective functions defining objective-vector positions.
 
     :param objectives: At least one distinct objective in declaration order.
-    :raises TypeError: If the objectives are not provided as a tuple.
-    :raises ValueError: If the tuple is empty or contains duplicate IDs.
+    :param upper_bounds: One optional maximum per objective, in matching order.
+        ``None`` expands to an unbounded entry for every objective.
+    :raises ComponentRegistrationError: If the objective list or bound tuple is
+        malformed, empty, has duplicate objective IDs, or has a different length.
     """
 
     objectives: tuple[ObjectiveFunction, ...]
+    upper_bounds: tuple[ObjectiveValue | None, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.objectives, tuple):
             raise ComponentRegistrationError('objectives must be a tuple')
         if not self.objectives:
             raise ComponentRegistrationError('at least one objective is required')
+        if self.upper_bounds is None:
+            object.__setattr__(self, 'upper_bounds', (None,) * len(self.objectives))
+        elif not isinstance(self.upper_bounds, tuple):
+            raise ComponentRegistrationError('upper_bounds must be a tuple or None')
+        elif len(self.upper_bounds) != len(self.objectives):
+            raise ComponentRegistrationError(
+                'upper_bounds length must match the objective count'
+            )
 
         seen_ids: set[ObjectiveId] = set()
         seen_text: set[str] = set()

@@ -5,6 +5,7 @@ Author: Michel Bierlaire, EPFL
 """
 
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -18,15 +19,19 @@ from multiobjective_vns.callbacks import (
     SolutionIdentity,
 )
 from multiobjective_vns.config import BudgetLimits, MultiobjectiveVNSConfig
+from multiobjective_vns.default_logger import DefaultRunLogger
 from multiobjective_vns.engine import MultiobjectiveVNS, multiobjective_vns
 from multiobjective_vns.exceptions import (
     ComponentRegistrationError,
+    ComponentSetupError,
+    InitialSolutionsError,
     ResumeCompatibilityError,
 )
 from multiobjective_vns.identifiers import (
     ChoiceId,
     ChoiceKind,
     CompositionId,
+    InvocationId,
     OperatorId,
     ProblemInstanceId,
     SolutionId,
@@ -41,6 +46,7 @@ from multiobjective_vns.random_source import RandomSource
 from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.records.evaluation import (
@@ -56,18 +62,28 @@ from multiobjective_vns.records.policies import (
     FeedbackObservation,
     OperatorChoiceCategory,
 )
-from multiobjective_vns.records.reporting import ComponentRole, ReportDiagnosticKind
-from multiobjective_vns.records.results import MaintenanceResult
-from multiobjective_vns.records.state import Checkpoint
+from multiobjective_vns.records.reporting import (
+    ComponentRole,
+    ObjectiveBoundEventFinding,
+    ReportDiagnosticKind,
+    RunProvenance,
+)
+from multiobjective_vns.records.results import MaintenanceResult, ViewerExportScope
+from multiobjective_vns.records.state import Checkpoint, SearchState
 from multiobjective_vns.records.status import (
     ApplicationAssessment,
     ArchiveStatus,
     CompositionPosition,
     ProcessingStatus,
     SearchDisposition,
+    SubmissionSource,
     TerminationReason,
 )
-from multiobjective_vns.registrations import OperatorGroup, OperatorRegistration
+from multiobjective_vns.registrations import (
+    OperatorCompositionRegistration,
+    OperatorGroup,
+    OperatorRegistration,
+)
 from multiobjective_vns.services import CheckpointStore, SolutionFormatter
 
 
@@ -103,20 +119,34 @@ class Codec:
     component_id = 'codec'
     configuration_id = 'codec-v1'
 
-    def capture(self, solution: object) -> object:
-        return solution
+    def capture(self, solution: object) -> bytes:
+        return pickle.dumps(solution)
 
-    def restore(self, payload: object) -> object:
-        return payload
+    def restore(self, payload: bytes) -> object:
+        return pickle.loads(payload)
 
 
 class FailingCaptureCodec(Codec):
     component_id = 'failing-capture-codec'
     configuration_id = 'failing-capture-codec-v1'
 
-    def capture(self, solution: object) -> object:
+    def capture(self, solution: object) -> bytes:
         del solution
         raise RuntimeError('cannot encode solution')
+
+
+class FailingSecondCaptureCodec(Codec):
+    component_id = 'failing-second-capture-codec'
+    configuration_id = 'failing-second-capture-codec-v1'
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def capture(self, solution: object) -> bytes:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError('checkpoint payload capture failed')
+        return super().capture(solution)
 
 
 class Evaluator:
@@ -129,6 +159,28 @@ class Evaluator:
         del objectives
         values = cast(tuple[int, int], solution)
         return ApplicationEvaluation(True, True, values)
+
+
+class TiedObjectiveEvaluator:
+    """Give distinct route plans the same objective vector."""
+
+    component_id = 'tied-objective-evaluator'
+    configuration_id = 'tied-objective-evaluator-v1'
+
+    def evaluate(
+        self, solution: object, objectives: ObjectiveDeclaration
+    ) -> ApplicationEvaluation:
+        del solution, objectives
+        return ApplicationEvaluation(True, True, (10, 20))
+
+
+class InfeasibleCandidateEvaluator(Evaluator):
+    def evaluate(
+        self, solution: object, objectives: ObjectiveDeclaration
+    ) -> ApplicationEvaluation:
+        del objectives
+        values = cast(tuple[int, int], solution)
+        return ApplicationEvaluation(True, values[0] != 4, values)
 
 
 class CandidateOperator:
@@ -149,7 +201,9 @@ class CandidateOperator:
         else:
             base = cast(tuple[int, int], context.base)
             solution = (base[0] - context.k, base[1] + context.k)
-        return OperatorResult(context.k, Candidate(solution))
+        return OperatorResult(
+            candidates=(CandidateProposal(Candidate(solution), context.k),)
+        )
 
 
 class CursorOperator:
@@ -164,7 +218,31 @@ class CursorOperator:
     def call(self, context: CandidateContext) -> OperatorResult:
         self.sizes.append(context.k)
         solution = (8, 8) if len(self.sizes) == self.admit_on_call else context.base
-        return OperatorResult(context.k, Candidate(solution))
+        return OperatorResult(
+            candidates=(CandidateProposal(Candidate(solution), context.k),)
+        )
+
+
+class CandidateListOperator:
+    """Return two ordered candidates or repeat the supplied base."""
+
+    def __init__(self, operator_id: str, *, candidates: bool) -> None:
+        self.component_id = operator_id
+        self.configuration_id = f'{operator_id}-v1'
+        self.return_candidates = candidates
+        self.calls: list[tuple[object, int, int]] = []
+
+    def call(self, context: CandidateContext) -> OperatorResult:
+        self.calls.append((context.base, context.k, context.max_candidates))
+        if not self.return_candidates:
+            candidate = Candidate(context.base)
+            return OperatorResult(candidates=(CandidateProposal(candidate, 1),))
+        return OperatorResult(
+            candidates=(
+                CandidateProposal(Candidate((9, 12)), 1),
+                CandidateProposal(Candidate((8, 13)), 1),
+            )
+        )
 
 
 class PreferDominatedBasePolicy:
@@ -262,7 +340,9 @@ class RelaxedOperator:
             candidate = (3, 7, not self.violate_restoration, True)
         else:
             candidate = (4, 6, False, True)
-        return OperatorResult(context.k, Candidate(candidate))
+        return OperatorResult(
+            candidates=(CandidateProposal(Candidate(candidate), context.k),)
+        )
 
 
 class CompositionEvaluator:
@@ -333,15 +413,50 @@ class CompositionStepOperator:
         if self.fail_on_internal and context.base == 'internal composition value':
             raise RuntimeError('second composition step failed')
         if self.modification_count == 0:
-            return OperatorResult(0, None)
+            return OperatorResult(candidates=())
         if self.intermediate:
             return OperatorResult(
-                min(context.k, self.modification_count),
-                Candidate('internal composition value'),
+                candidates=(
+                    CandidateProposal(
+                        Candidate('internal composition value'),
+                        min(context.k, self.modification_count),
+                    ),
+                )
             )
         return OperatorResult(
-            min(context.k, self.modification_count), Candidate((3, 7))
+            candidates=(
+                CandidateProposal(
+                    Candidate((3, 7)), min(context.k, self.modification_count)
+                ),
+            )
         )
+
+
+class BatchCompositionOperator:
+    """Return ordered intermediate or final candidates for composition tests."""
+
+    def __init__(self, operator_id: str, *, first: bool) -> None:
+        self.component_id = operator_id
+        self.configuration_id = f'{operator_id}-v1'
+        self.first = first
+        self.calls: list[tuple[object, int]] = []
+
+    def call(self, context: CandidateContext) -> OperatorResult:
+        self.calls.append((context.base, context.max_candidates))
+        proposals: tuple[CandidateProposal, ...]
+        if self.first:
+            proposals = (
+                CandidateProposal(Candidate(('intermediate', 0)), 1),
+                CandidateProposal(Candidate(('intermediate', 1)), 1),
+            )
+        elif context.base == ('intermediate', 0):
+            proposals = (
+                CandidateProposal(Candidate((4, 6)), 1),
+                CandidateProposal(Candidate((3, 8)), 1),
+            )
+        else:
+            proposals = (CandidateProposal(Candidate((6, 4)), 1),)
+        return OperatorResult(candidates=proposals[: context.max_candidates])
 
 
 class SelectCompositionFeedback:
@@ -507,8 +622,15 @@ def make_composition_engine(
     feedback: SelectCompositionFeedback,
     operator_groups: tuple[OperatorGroup, ...] | None = None,
     max_candidate_attempts: int = 1,
+    max_candidates_per_attempt: int = 1,
     composition_selection_probability: float = 1.0,
     random_source: RandomSource | None = None,
+    pre_registered_compositions: tuple[OperatorCompositionRegistration, ...] = (),
+    promoted_composition_catalog_path: Path | None = None,
+    operator_configuration_ids: tuple[str, str] = (
+        'first-step-v1',
+        'second-step-v1',
+    ),
 ) -> MultiobjectiveVNS:
     groups = operator_groups or (
         OperatorGroup('promising-pair', frozenset(('first-step', 'second-step'))),
@@ -522,7 +644,7 @@ def make_composition_engine(
         operators=(
             OperatorRegistration(
                 operator_id='first-step',
-                configuration_id='first-step-v1',
+                configuration_id=operator_configuration_ids[0],
                 operator=first,
                 initial_state=None,
                 max_neighborhood_size=2,
@@ -531,7 +653,7 @@ def make_composition_engine(
             ),
             OperatorRegistration(
                 operator_id='second-step',
-                configuration_id='second-step-v1',
+                configuration_id=operator_configuration_ids[1],
                 operator=second,
                 initial_state=None,
                 max_neighborhood_size=1,
@@ -539,22 +661,203 @@ def make_composition_engine(
                 modification_count_definition='one final step',
             ),
         ),
+        pre_registered_compositions=pre_registered_compositions,
         operator_groups=groups,
         application_evaluator=cast(ApplicationEvaluator, evaluator),
         problem_instance_id=cast(ProblemInstanceId, 'composition-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=max_candidates_per_attempt,
             max_neighborhood_size=2,
             composition_selection_probability=composition_selection_probability,
             feedback_selection_mode='uniform',
             budget_limits=BudgetLimits(
                 max_wall_time_seconds=60,
                 max_candidate_attempts=max_candidate_attempts,
-                max_evaluation_requests=max_candidate_attempts,
+                max_evaluation_requests=max_candidate_attempts
+                * max_candidates_per_attempt,
             ),
         ),
         feedback_policy=cast(FeedbackPolicy, feedback),
         random_source=random_source,
+        promoted_composition_catalog_path=promoted_composition_catalog_path,
     )
+
+
+def test_pre_registered_composition_is_a_standalone_choice_with_component_events(
+    tmp_path: Path,
+) -> None:
+    first = CompositionStepOperator('first-step', intermediate=True)
+    second = CompositionStepOperator('second-step', intermediate=False)
+    composition = OperatorCompositionRegistration(
+        operator_id='pre-registered-move-and-repair',
+        configuration_id='pre-registered-move-and-repair-v1',
+        first_operator_id='first-step',
+        second_operator_id='second-step',
+    )
+    feedback = SelectCompositionFeedback(
+        'first-step',
+        'second-step',
+        fallback_operator_id='pre-registered-move-and-repair',
+    )
+    engine = make_composition_engine(
+        first,
+        second,
+        CompositionEvaluator(),
+        feedback,
+        max_candidate_attempts=1,
+        composition_selection_probability=0.0,
+        pre_registered_compositions=(composition,),
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.run_log is not None
+    selected = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'choice_selected'
+    )
+    assert selected.choice_id == ChoiceId.for_operator('pre-registered-move-and-repair')
+    outcome = result.candidate_outcomes[-1]
+    assert outcome.choice_id == selected.choice_id
+    assert outcome.component_position is CompositionPosition.SECOND
+    assert outcome.submitted_solution == (3, 7)
+    assert first.calls == [((5, 5), 1, False)]
+    assert second.calls == [('internal composition value', 1, True)]
+    assert second.base_evaluations == [None]
+
+    operator_events = tuple(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'operator_result'
+    )
+    assert tuple(event.source_id for event in operator_events) == (
+        'first-step',
+        'second-step',
+    )
+    assert tuple(event.data['component_position'] for event in operator_events) == (
+        CompositionPosition.FIRST,
+        CompositionPosition.SECOND,
+    )
+    composition_event = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'composition_result'
+    )
+    assert composition_event.data['execution_source'] == 'pre_registered'
+    assert composition_event.data['component_operator_ids'] == (
+        'first-step',
+        'second-step',
+    )
+
+    available = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'choice_set_available'
+    )
+    choice_ids = {
+        item.choice_id
+        for item in cast(
+            tuple[ChoiceDescriptor, ...],
+            available.data['newly_eligible_choices'],
+        )
+    }
+    assert ChoiceId.for_operator('pre-registered-move-and-repair') in choice_ids
+    assert (
+        ChoiceId.for_composition(CompositionId('first-step', 'second-step'))
+        not in choice_ids
+    )
+    assert result.executive_summary is not None
+    entry = next(
+        item
+        for item in result.executive_summary.provenance.operators
+        if item.operator_id == 'pre-registered-move-and-repair'
+    )
+    assert entry.catalog_kind == 'pre_registered_composite'
+    assert entry.component_operator_ids == ('first-step', 'second-step')
+    assert entry.configuration_id == 'pre-registered-move-and-repair-v1'
+
+
+def test_pre_registered_composition_references_and_ordered_pairs_are_validated() -> (
+    None
+):
+    first = CompositionStepOperator('first-step', intermediate=True)
+    second = CompositionStepOperator('second-step', intermediate=False)
+    feedback = SelectCompositionFeedback('first-step', 'second-step')
+
+    with pytest.raises(ComponentRegistrationError, match='unknown'):
+        make_composition_engine(
+            first,
+            second,
+            CompositionEvaluator(),
+            feedback,
+            pre_registered_compositions=(
+                OperatorCompositionRegistration(
+                    'unknown-pair', 'unknown-pair-v1', 'missing', 'second-step'
+                ),
+            ),
+        )
+
+    repeated = OperatorCompositionRegistration(
+        'first-composite', 'first-composite-v1', 'first-step', 'second-step'
+    )
+    repeated_pair = OperatorCompositionRegistration(
+        'second-composite', 'second-composite-v1', 'first-step', 'second-step'
+    )
+    with pytest.raises(ComponentRegistrationError, match='pair'):
+        make_composition_engine(
+            first,
+            second,
+            CompositionEvaluator(),
+            feedback,
+            pre_registered_compositions=(repeated, repeated_pair),
+        )
+
+
+def test_checkpoint_rejects_changed_pre_registered_component_order(
+    tmp_path: Path,
+) -> None:
+    first = CompositionStepOperator('first-step', intermediate=True)
+    second = CompositionStepOperator('second-step', intermediate=False)
+    registered = OperatorCompositionRegistration(
+        'pre-registered-move-and-repair',
+        'pre-registered-move-and-repair-v1',
+        'first-step',
+        'second-step',
+    )
+    first_result = make_composition_engine(
+        first,
+        second,
+        CompositionEvaluator(),
+        SelectCompositionFeedback('first-step', 'second-step'),
+        pre_registered_compositions=(registered,),
+    ).run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path / 'original',
+    )
+    reversed_registration = OperatorCompositionRegistration(
+        registered.operator_id,
+        registered.configuration_id,
+        'second-step',
+        'first-step',
+    )
+    resumed = make_composition_engine(
+        first,
+        second,
+        CompositionEvaluator(),
+        SelectCompositionFeedback('first-step', 'second-step'),
+        pre_registered_compositions=(reversed_registration,),
+    )
+
+    with pytest.raises(ResumeCompatibilityError, match='manifest'):
+        resumed.run(
+            checkpoint=Checkpoint(first_result.search_state),
+            log_directory=tmp_path / 'resumed',
+        )
 
 
 def make_relaxed_engine(
@@ -603,6 +906,7 @@ def make_relaxed_engine(
         application_evaluator=cast(ApplicationEvaluator, RelaxedEvaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'relaxed-test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=1,
             composition_selection_probability=0.0,
             feasibility_mode='relaxed',
@@ -779,7 +1083,10 @@ def test_composition_processes_only_its_final_output_and_logs_pair_feedback(
     )
     target_descriptor = next(
         descriptor
-        for descriptor in cast(tuple[ChoiceDescriptor, ...], available.data['choices'])
+        for descriptor in cast(
+            tuple[ChoiceDescriptor, ...],
+            available.data['newly_eligible_choices'],
+        )
         if descriptor.choice_id == target_choice
     )
     assert target_descriptor.max_neighborhood_size == 1
@@ -811,8 +1118,10 @@ def test_composition_processes_only_its_final_output_and_logs_pair_feedback(
         for event in result.run_log.events
         if event.event_type == 'composition_result'
     )
-    assert composition_event.data['m'] == 1
-    assert composition_event.data['components_completed'] == 2
+    assert composition_event.data['final_candidate_count'] == 1
+    assert composition_event.data['final_modification_counts'] == (1,)
+    assert composition_event.data['first_candidate_count'] == 1
+    assert composition_event.data['second_call_count'] == 1
     assert len(feedback.observations) == 1
     assert result.executive_summary is not None
     pair_stats = [
@@ -823,6 +1132,89 @@ def test_composition_processes_only_its_final_output_and_logs_pair_feedback(
     assert len(pair_stats) == 1
     assert pair_stats[0].attempt_count == 1
     assert pair_stats[0].archive_admission_count == 1
+
+
+def test_composition_applies_second_operator_to_each_intermediate_in_order(
+    tmp_path: Path,
+) -> None:
+    first = BatchCompositionOperator('first-step', first=True)
+    second = BatchCompositionOperator('second-step', first=False)
+    engine = make_composition_engine(
+        cast(CompositionStepOperator, first),
+        cast(CompositionStepOperator, second),
+        CompositionEvaluator(),
+        SelectCompositionFeedback('first-step', 'second-step'),
+        max_candidates_per_attempt=3,
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert tuple(
+        outcome.submitted_solution for outcome in result.candidate_outcomes[1:]
+    ) == ((4, 6), (3, 8), (6, 4))
+    assert tuple(
+        outcome.candidate_index for outcome in result.candidate_outcomes[1:]
+    ) == (1, 2, 3)
+    assert first.calls == [((5, 5), 3)]
+    assert second.calls == [
+        (('intermediate', 0), 3),
+        (('intermediate', 1), 1),
+    ]
+    assert result.run_log is not None
+    component_events = tuple(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'operator_result'
+    )
+    assert tuple(event.data['candidate_count'] for event in component_events) == (
+        2,
+        2,
+        1,
+    )
+    assert tuple(event.data['modification_counts'] for event in component_events) == (
+        (1, 1),
+        (1, 1),
+        (1,),
+    )
+    assert tuple(event.data['component_call_index'] for event in component_events) == (
+        1,
+        2,
+        3,
+    )
+    assert tuple(event.data['input_candidate_index'] for event in component_events) == (
+        None,
+        1,
+        2,
+    )
+    processed_events = tuple(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'candidate_processed'
+        and event.data['source'] is SubmissionSource.OPERATOR
+    )
+    assert tuple(event.data['candidate_index'] for event in processed_events) == (
+        1,
+        2,
+        3,
+    )
+    composition_event = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'composition_result'
+    )
+    assert composition_event.data['final_candidate_count'] == 3
+    assert composition_event.data['final_modification_counts'] == (1, 1, 1)
+    feedback = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'feedback_observed'
+    )
+    assert feedback.data['archive_admission_count'] == 3
+    assert feedback.data['attempt_admitted'] is True
 
 
 def test_archive_admission_promotes_composition_and_reports_it(
@@ -912,14 +1304,14 @@ def test_archive_admission_promotes_composition_and_reports_it(
     for category_event, choice_set_event in zip(
         category_events, choice_set_events, strict=True
     ):
-        inventory = cast(tuple[ChoiceDescriptor, ...], choice_set_event.data['choices'])
-        expected_kind = (
-            ChoiceKind.COMPOSITION
+        expected_count_key = (
+            'eligible_composition_count'
             if category_event.data['category'] is OperatorChoiceCategory.COMPOSITION
-            else ChoiceKind.OPERATOR
+            else 'eligible_standalone_count'
         )
-        assert category_event.data['eligible_choice_count'] == sum(
-            descriptor.choice_id.kind is expected_kind for descriptor in inventory
+        assert (
+            category_event.data['eligible_choice_count']
+            == choice_set_event.data[expected_count_key]
         )
         assert category_event.data['selection_source'] == 'configured_probability'
     assert result.summary_path is not None
@@ -1034,6 +1426,137 @@ def test_promoted_composition_is_restored_from_search_state(tmp_path: Path) -> N
     )
 
 
+def test_promoted_composition_catalog_seeds_a_fresh_search(tmp_path: Path) -> None:
+    catalog_path = tmp_path / 'promoted-compositions.json'
+    first_engine = make_composition_engine(
+        CompositionStepOperator('first-step', intermediate=True),
+        CompositionStepOperator('second-step', intermediate=False),
+        CompositionEvaluator(),
+        cast(SelectCompositionFeedback, SelectPromotedCompositionFeedback()),
+        max_candidate_attempts=1,
+        composition_selection_probability=1.0,
+        random_source=cast(RandomSource, SequenceRandomSource((0.0, 0.0, 0.0))),
+        promoted_composition_catalog_path=catalog_path,
+    )
+    first_run = first_engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert first_run.executive_summary is not None
+    promoted_id = first_run.executive_summary.promoted_compositions[0].operator_id
+    assert catalog_path.is_file()
+
+    second_engine = make_composition_engine(
+        CompositionStepOperator('first-step', intermediate=True),
+        CompositionStepOperator('second-step', intermediate=False),
+        CompositionEvaluator(),
+        cast(SelectCompositionFeedback, SelectPromotedCompositionFeedback()),
+        max_candidate_attempts=1,
+        composition_selection_probability=0.0,
+        random_source=cast(RandomSource, SequenceRandomSource((0.0, 0.0, 0.0))),
+        promoted_composition_catalog_path=catalog_path,
+    )
+    second_run = second_engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert second_run.executive_summary is not None
+    loaded_report = second_run.executive_summary.promoted_compositions[0]
+    assert loaded_report.operator_id == promoted_id
+    assert loaded_report.first_admitted_solution_id is None
+    assert loaded_report.promoted_in_current_invocation is False
+    assert second_run.run_log is not None
+    started_event = next(
+        event
+        for event in second_run.run_log.events
+        if event.event_type == 'invocation_started'
+    )
+    provenance = cast(RunProvenance, started_event.data['provenance'])
+    assert any(
+        entry.operator_id == promoted_id and entry.catalog_kind == 'promoted_composite'
+        for entry in provenance.operators
+    )
+    choice_event = next(
+        event
+        for event in second_run.run_log.events
+        if event.event_type == 'choice_selected'
+    )
+    assert choice_event.choice_id == ChoiceId.for_operator(promoted_id)
+
+
+def test_promoted_composition_catalog_rejects_changed_operator_configuration(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / 'promoted-compositions.json'
+    first_engine = make_composition_engine(
+        CompositionStepOperator('first-step', intermediate=True),
+        CompositionStepOperator('second-step', intermediate=False),
+        CompositionEvaluator(),
+        cast(SelectCompositionFeedback, SelectPromotedCompositionFeedback()),
+        max_candidate_attempts=1,
+        composition_selection_probability=1.0,
+        random_source=cast(RandomSource, SequenceRandomSource((0.0, 0.0, 0.0))),
+        promoted_composition_catalog_path=catalog_path,
+    )
+    first_engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+    changed_engine = make_composition_engine(
+        CompositionStepOperator('first-step', intermediate=True),
+        CompositionStepOperator('second-step', intermediate=False),
+        CompositionEvaluator(),
+        cast(SelectCompositionFeedback, SelectPromotedCompositionFeedback()),
+        promoted_composition_catalog_path=catalog_path,
+        operator_configuration_ids=('first-step-v2', 'second-step-v1'),
+    )
+
+    with pytest.raises(ComponentSetupError) as error:
+        changed_engine.run(
+            initial_solutions=((5, 5),),
+            log_directory=tmp_path,
+            progress_report_interval_seconds=60,
+        )
+    assert error.value.failure.phase == 'promotion_catalog_load'
+
+
+def test_promotion_catalog_write_failure_keeps_committed_promotion(
+    tmp_path: Path,
+) -> None:
+    blocking_file = tmp_path / 'not-a-directory'
+    blocking_file.write_text('block', encoding='utf-8')
+    catalog_path = blocking_file / 'promoted-compositions.json'
+    engine = make_composition_engine(
+        CompositionStepOperator('first-step', intermediate=True),
+        CompositionStepOperator('second-step', intermediate=False),
+        CompositionEvaluator(),
+        cast(SelectCompositionFeedback, SelectPromotedCompositionFeedback()),
+        max_candidate_attempts=1,
+        composition_selection_probability=1.0,
+        random_source=cast(RandomSource, SequenceRandomSource((0.0, 0.0, 0.0))),
+        promoted_composition_catalog_path=catalog_path,
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.termination_reason is TerminationReason.COMPONENT_FAILURE
+    assert result.search_state is not None
+    assert result.executive_summary is not None
+    assert len(result.executive_summary.promoted_compositions) == 1
+    assert any(
+        failure.phase == 'promotion_catalog_save' for failure in result.diagnostics
+    )
+
+
 def test_promoted_operator_can_be_composed_again(tmp_path: Path) -> None:
     first = CompositionStepOperator('first-step', intermediate=True)
     second = CompositionStepOperator('second-step', intermediate=False)
@@ -1110,14 +1633,17 @@ def test_composition_zero_modification_submits_no_candidate(
         for event in result.run_log.events
         if event.event_type == 'composition_result'
     )
-    assert composition_event.data['m'] == 0
-    assert composition_event.data['final_candidate_returned'] is False
-    assert composition_event.data['components_completed'] == (
-        1 if zero_position == 'first' else 2
+    assert composition_event.data['final_candidate_count'] == 0
+    assert composition_event.data['final_modification_counts'] == ()
+    assert composition_event.data['first_candidate_count'] == (
+        0 if zero_position == 'first' else 1
+    )
+    assert composition_event.data['second_call_count'] == (
+        0 if zero_position == 'first' else 1
     )
     assert len(feedback.observations) == 1
     observation = cast(FeedbackObservation, feedback.observations[0])
-    assert observation.m == 0
+    assert observation.modification_counts == ()
     assert observation.outcomes == ()
     assert len(second.calls) == (0 if zero_position == 'first' else 1)
 
@@ -1192,17 +1718,7 @@ def test_component_failure_disables_composition_but_keeps_operator_available(
         for event in result.run_log.events
         if event.event_type == 'component_failure'
     )
-    second_choice_set = [
-        event
-        for event in result.run_log.events
-        if event.event_type == 'choice_set_available'
-    ][1]
-    assert feedback.choice_id not in {
-        descriptor.choice_id
-        for descriptor in cast(
-            tuple[ChoiceDescriptor, ...], second_choice_set.data['choices']
-        )
-    }
+    assert feedback.choice_id not in selected[1:]
 
 
 def make_engine(
@@ -1218,6 +1734,8 @@ def make_engine(
     base_selection_policy: BaseSelectionPolicy | None = None,
     solution_codec: SolutionCodec | None = None,
     composition_selection_probability: float = 0.0,
+    promoted_composition_catalog_path: Path | None = None,
+    application_evaluator: ApplicationEvaluator | None = None,
 ) -> tuple[MultiobjectiveVNS, CandidateOperator]:
     operator = CandidateOperator(candidate_mode)
     engine = MultiobjectiveVNS(
@@ -1236,9 +1754,11 @@ def make_engine(
                 modification_count_definition='number of requested size units realized',
             ),
         ),
-        application_evaluator=cast(ApplicationEvaluator, Evaluator()),
+        application_evaluator=application_evaluator
+        or cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=max_neighborhood_size,
             composition_selection_probability=composition_selection_probability,
             budget_limits=BudgetLimits(
@@ -1251,6 +1771,7 @@ def make_engine(
         solution_formatter=solution_formatter,
         feedback_policy=feedback_policy,
         base_selection_policy=base_selection_policy,
+        promoted_composition_catalog_path=promoted_composition_catalog_path,
     )
     return engine, operator
 
@@ -1282,7 +1803,7 @@ def test_default_base_selection_uses_only_pareto_members_after_no_progress(
     assert [event.data['eligible_base_count'] for event in base_events] == [1, 1]
 
 
-def test_default_base_selection_skips_previous_when_another_pareto_base_exists(
+def test_default_base_selection_can_choose_another_pareto_base(
     tmp_path: Path,
 ) -> None:
     engine, _ = make_engine(
@@ -1304,10 +1825,10 @@ def test_default_base_selection_skips_previous_when_another_pareto_base_exists(
     ]
     assert len(base_events) == 2
     assert base_events[0].solution_id != base_events[1].solution_id
-    assert [event.data['eligible_base_count'] for event in base_events] == [2, 1]
+    assert [event.data['eligible_base_count'] for event in base_events] == [2, 2]
 
 
-def test_custom_base_selection_can_choose_a_dominated_active_solution(
+def test_custom_base_selection_is_limited_to_pareto_archive(
     tmp_path: Path,
 ) -> None:
     engine, _ = make_engine(
@@ -1328,11 +1849,8 @@ def test_custom_base_selection_can_choose_a_dominated_active_solution(
     base_events = [
         event for event in run_log.events if event.event_type == 'base_selected'
     ]
-    assert [event.solution_id for event in base_events] == [
-        SolutionId(1),
-        SolutionId(0),
-    ]
-    assert [event.data['eligible_base_count'] for event in base_events] == [2, 1]
+    assert [event.solution_id for event in base_events] == [SolutionId(0)] * 2
+    assert [event.data['eligible_base_count'] for event in base_events] == [1, 1]
 
 
 def test_run_processes_initial_candidate_and_pareto_admission(
@@ -1389,6 +1907,16 @@ def test_run_processes_initial_candidate_and_pareto_admission(
     assert len(result.executive_summary.final_pareto_solutions) == 2
     assert result.event_log_path is not None and result.event_log_path.is_file()
     assert result.summary_path is not None and result.summary_path.is_file()
+    assert result.registry_view_path is not None and result.registry_view_path.is_file()
+    assert result.pareto_view_path is not None and result.pareto_view_path.is_file()
+    registry_view = json.loads(result.registry_view_path.read_text(encoding='utf-8'))
+    pareto_view = json.loads(result.pareto_view_path.read_text(encoding='utf-8'))
+    assert registry_view['record_scope'] == 'registry'
+    assert pareto_view['record_scope'] == 'pareto'
+    assert registry_view['is_final'] is True
+    assert pareto_view['is_final'] is True
+    assert len(registry_view['solutions']) == 2
+    assert len(pareto_view['solutions']) == 2
     event_records = [
         json.loads(line)
         for line in result.event_log_path.read_text(encoding='utf-8').splitlines()
@@ -1408,6 +1936,54 @@ def test_run_processes_initial_candidate_and_pareto_admission(
     assert 'Assessment counts:' in summary_text
     assert 'Disposition counts:' in summary_text
     assert 'Component failures:' in summary_text
+
+
+def test_distinct_plans_with_equal_objectives_stay_in_registry_not_pareto(
+    tmp_path: Path,
+) -> None:
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        application_evaluator=cast(ApplicationEvaluator, TiedObjectiveEvaluator()),
+    )
+
+    with pytest.warns(UserWarning, match='search symmetry'):
+        result = engine.run(
+            initial_solutions=((1, 2), (2, 1)),
+            log_directory=tmp_path,
+            progress_report_interval_seconds=60,
+        )
+
+    registry = result.search_state.visited_solutions()
+    pareto = result.search_state.pareto_solutions()
+    assert [record.solution for record in registry] == [(1, 2), (2, 1)]
+    assert [record.solution for record in pareto] == [(1, 2)]
+    assert registry[0].archive_status is ArchiveStatus.PARETO_OPTIMAL
+    assert registry[1].archive_status is ArchiveStatus.OBJECTIVE_VECTOR_DUPLICATE
+    assert result.candidate_outcomes[1].disposition is (
+        SearchDisposition.OBJECTIVE_VECTOR_DUPLICATE
+    )
+    assert result.executive_summary is not None
+    assert result.executive_summary.objective_vector_duplicate_count == 1
+
+    assert result.registry_view_path is not None
+    assert result.pareto_view_path is not None
+    registry_view = json.loads(result.registry_view_path.read_text(encoding='utf-8'))
+    pareto_view = json.loads(result.pareto_view_path.read_text(encoding='utf-8'))
+    assert [record['solution_id'] for record in registry_view['solutions']] == [
+        'solution:0',
+        'solution:1',
+    ]
+    assert [record['solution_id'] for record in pareto_view['solutions']] == [
+        'solution:0',
+    ]
+    assert registry_view['solutions'][1]['archive_status'] == (
+        'objective_vector_duplicate'
+    )
+    assert result.summary_path is not None
+    assert 'WARNING:' in result.summary_path.read_text(encoding='utf-8')
+    assert 'search symmetry' in result.summary_path.read_text(encoding='utf-8')
 
 
 def test_choice_sizes_advance_independently_and_reset_on_pareto_admission(
@@ -1437,6 +2013,7 @@ def test_choice_sizes_advance_independently_and_reset_on_pareto_admission(
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'cursor-test-problem'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=2,
             composition_selection_probability=0.0,
             feedback_selection_mode='uniform',
@@ -1457,8 +2034,8 @@ def test_choice_sizes_advance_independently_and_reset_on_pareto_admission(
         progress_report_interval_seconds=60,
     )
 
-    assert first.sizes == [1, 2]
-    assert second.sizes == [1, 2, 1]
+    assert first.sizes == [1, 2, 1]
+    assert second.sizes == [1, 2]
     assert result.run_log is not None
     selected = [
         event
@@ -1473,29 +2050,139 @@ def test_choice_sizes_advance_independently_and_reset_on_pareto_admission(
         ('cursor-first', 2),
         ('cursor-second', 1),
         ('cursor-second', 2),
-        ('cursor-second', 1),
+        ('cursor-first', 1),
     ]
     choice_sets = [
         event
         for event in result.run_log.events
         if event.event_type == 'choice_set_available'
     ]
-    second_iteration = {
-        descriptor.choice_id.operator_id: descriptor.current_k
+    observed_ids = [
+        descriptor.choice_id
+        for event in choice_sets
         for descriptor in cast(
-            tuple[ChoiceDescriptor, ...], choice_sets[1].data['choices']
+            tuple[ChoiceDescriptor, ...],
+            event.data['newly_eligible_choices'],
         )
-        if descriptor.choice_id.kind is ChoiceKind.OPERATOR
-    }
-    third_iteration = {
-        descriptor.choice_id.operator_id: descriptor.current_k
-        for descriptor in cast(
-            tuple[ChoiceDescriptor, ...], choice_sets[2].data['choices']
-        )
-        if descriptor.choice_id.kind is ChoiceKind.OPERATOR
-    }
-    assert second_iteration == {'cursor-first': 2, 'cursor-second': 1}
-    assert third_iteration == {'cursor-second': 1}
+    ]
+    assert len(observed_ids) == len(set(observed_ids))
+    assert choice_sets[0].data['eligible_choice_count'] == len(observed_ids)
+    assert all(not event.data['newly_eligible_choices'] for event in choice_sets[1:])
+    assert all(event.schema_version == 4 for event in choice_sets)
+
+
+def test_attempt_processes_every_ordered_candidate_after_archive_admission(
+    tmp_path: Path,
+) -> None:
+    operator = CandidateListOperator('candidate-list', candidates=True)
+    engine = MultiobjectiveVNS(
+        solution_codec=cast(SolutionCodec, Codec()),
+        solution_identity=Identity(),
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('candidate-list-a'), Objective('candidate-list-b'))
+        ),
+        operators=(
+            OperatorRegistration(
+                operator_id=operator.component_id,
+                configuration_id=operator.configuration_id,
+                operator=cast(Operator, operator),
+                initial_state=None,
+                max_neighborhood_size=1,
+                feasibility_restoration=False,
+                modification_count_definition='one relocation',
+            ),
+        ),
+        application_evaluator=cast(ApplicationEvaluator, Evaluator()),
+        problem_instance_id=cast(ProblemInstanceId, 'candidate-list-problem'),
+        config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=2,
+            max_neighborhood_size=1,
+            composition_selection_probability=0.0,
+            feedback_selection_mode='uniform',
+            budget_limits=BudgetLimits(
+                max_wall_time_seconds=60,
+                max_candidate_attempts=1,
+                max_evaluation_requests=4,
+            ),
+        ),
+        random_source=cast(RandomSource, SequenceRandomSource((0.1, 0.1))),
+    )
+
+    result = engine.run(
+        initial_solutions=((10, 10),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert len(result.candidate_outcomes) == 3
+    assert [outcome.candidate_index for outcome in result.candidate_outcomes] == [
+        None,
+        1,
+        2,
+    ]
+    assert [outcome.disposition for outcome in result.candidate_outcomes[1:]] == [
+        SearchDisposition.ARCHIVED,
+        SearchDisposition.ARCHIVED,
+    ]
+    assert [record.solution for record in result.search_state.pareto_solutions()] == [
+        (10, 10),
+        (9, 12),
+        (8, 13),
+    ]
+    assert operator.calls == [((10, 10), 1, 2)]
+    assert result.run_log is not None
+    feedback = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'feedback_observed'
+    )
+    assert feedback.data['archive_admission_count'] == 2
+    assert feedback.data['attempt_admitted'] is True
+
+
+def test_size_cursor_is_independent_for_each_pareto_base(tmp_path: Path) -> None:
+    operator = CandidateListOperator('base-cursor', candidates=False)
+    engine = MultiobjectiveVNS(
+        solution_codec=cast(SolutionCodec, Codec()),
+        solution_identity=Identity(),
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('base-cursor-a'), Objective('base-cursor-b'))
+        ),
+        operators=(
+            OperatorRegistration(
+                operator_id=operator.component_id,
+                configuration_id=operator.configuration_id,
+                operator=cast(Operator, operator),
+                initial_state=None,
+                max_neighborhood_size=3,
+                feasibility_restoration=False,
+                modification_count_definition='one move',
+            ),
+        ),
+        application_evaluator=cast(ApplicationEvaluator, Evaluator()),
+        problem_instance_id=cast(ProblemInstanceId, 'base-cursor-problem'),
+        config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
+            max_neighborhood_size=3,
+            composition_selection_probability=0.0,
+            feedback_selection_mode='uniform',
+            budget_limits=BudgetLimits(
+                max_wall_time_seconds=60,
+                max_candidate_attempts=2,
+                max_evaluation_requests=4,
+            ),
+        ),
+        random_source=cast(RandomSource, SequenceRandomSource((0.1, 0.1, 0.1))),
+    )
+
+    engine.run(
+        initial_solutions=((10, 0), (0, 10)),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert [size for _, size, _ in operator.calls] == [1, 1]
+    assert len({base for base, _, _ in operator.calls}) == 2
 
 
 def test_choice_size_cursor_is_restored_from_checkpoint(tmp_path: Path) -> None:
@@ -1521,6 +2208,7 @@ def test_choice_size_cursor_is_restored_from_checkpoint(tmp_path: Path) -> None:
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'checkpoint-cursor-problem'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=3,
             composition_selection_probability=0.0,
             feedback_selection_mode='uniform',
@@ -1634,7 +2322,32 @@ def test_codec_capture_failure_is_attributed_to_codec_and_keeps_search_state(
     assert store.checkpoints == []
     assert len(result.diagnostics) == 1
     assert result.diagnostics[0].source == 'failing-capture-codec'
+    assert result.diagnostics[0].phase == 'pareto_snapshot_save'
+
+
+def test_checkpoint_capture_failure_remains_separate_from_pareto_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = RecordingCheckpointStore()
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        checkpoint_store=cast(CheckpointStore, store),
+        solution_codec=cast(SolutionCodec, FailingSecondCaptureCodec()),
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        checkpoint_interval=1,
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.termination_reason is TerminationReason.COMPONENT_FAILURE
+    assert result.pareto_snapshot_path is not None
     assert result.diagnostics[0].phase == 'checkpoint_save'
+    assert store.checkpoints == []
 
 
 def test_checkpoint_store_failure_is_logged_after_committed_search_state(
@@ -1863,6 +2576,7 @@ def test_run_advances_size_after_duplicate_full_modifications(tmp_path: Path) ->
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=2,
             composition_selection_probability=1.0,
             budget_limits=BudgetLimits(
@@ -1871,6 +2585,7 @@ def test_run_advances_size_after_duplicate_full_modifications(tmp_path: Path) ->
                 max_evaluation_requests=2,
             ),
         ),
+        promoted_composition_catalog_path=None,
         initial_solutions=((5, 5),),
         log_directory=tmp_path,
         progress_report_interval_seconds=60,
@@ -1921,7 +2636,9 @@ def test_constructor_rejects_relaxed_search_without_restoration_choice() -> None
             application_evaluator=cast(ApplicationEvaluator, Evaluator()),
             problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
             config=MultiobjectiveVNSConfig(
-                feasibility_mode='relaxed', max_infeasible_steps=2
+                max_candidates_per_attempt=1,
+                feasibility_mode='relaxed',
+                max_infeasible_steps=2,
             ),
         )
 
@@ -1994,6 +2711,7 @@ def test_malformed_operator_result_is_a_contract_failure_and_disables_operator(
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=1,
             composition_selection_probability=0.0,
             random_seed=1,
@@ -2048,7 +2766,9 @@ def test_random_source_failure_during_operator_call_commits_failed_attempt(
     class RandomOperator:
         def call(self, context: CandidateContext) -> OperatorResult:
             context.random_source.random()
-            return OperatorResult(context.k, Candidate((4, 6)))
+            return OperatorResult(
+                candidates=(CandidateProposal(Candidate((4, 6)), context.k),)
+            )
 
     engine = MultiobjectiveVNS(
         solution_codec=cast(SolutionCodec, Codec()),
@@ -2070,6 +2790,7 @@ def test_random_source_failure_during_operator_call_commits_failed_attempt(
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=1,
             composition_selection_probability=0.0,
             budget_limits=BudgetLimits(
@@ -2099,7 +2820,7 @@ def test_random_source_failure_during_operator_call_commits_failed_attempt(
         if event.event_type == 'feedback_observed'
     )
     assert len(feedback_events) == 1
-    assert feedback_events[0].data['m'] is None
+    assert feedback_events[0].data['modification_counts'] is None
     failure_events = tuple(
         event
         for event in result.run_log.events
@@ -2155,11 +2876,11 @@ def test_objective_comparison_failure_commits_failed_candidate_attempt(
         if event.event_type == 'feedback_observed'
     )
     assert len(feedback_events) == 1
-    assert feedback_events[0].data['m'] == 1
+    assert feedback_events[0].data['modification_counts'] == (1,)
     assert feedback_events[0].data['candidate_event_sequences'] == ()
 
 
-def test_archive_reward_increases_with_attempts_since_last_admission(
+def test_feedback_event_records_admission_count_without_reward_scoring(
     tmp_path: Path,
 ) -> None:
     class DuplicateThenImprove:
@@ -2173,7 +2894,9 @@ def test_archive_reward_increases_with_attempts_since_last_admission(
             self.calls += 1
             candidates = {1: (4, 6), 3: (3, 8)}
             solution = candidates.get(self.calls, context.base)
-            return OperatorResult(context.k, Candidate(solution))
+            return OperatorResult(
+                candidates=(CandidateProposal(Candidate(solution), context.k),)
+            )
 
     class SelectStandalone:
         component_id = 'select-standalone-feedback'
@@ -2222,9 +2945,9 @@ def test_archive_reward_increases_with_attempts_since_last_admission(
         application_evaluator=cast(ApplicationEvaluator, Evaluator()),
         problem_instance_id=cast(ProblemInstanceId, 'test-problem-v1'),
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             max_neighborhood_size=3,
             composition_selection_probability=0.0,
-            feedback_stagnation_scale=1,
             budget_limits=BudgetLimits(
                 max_wall_time_seconds=60,
                 max_candidate_attempts=4,
@@ -2246,23 +2969,17 @@ def test_archive_reward_increases_with_attempts_since_last_admission(
         for event in result.run_log.events
         if event.event_type == 'feedback_observed'
     )
-    assert tuple(event.data['stagnation_attempts'] for event in observations) == (
-        0,
-        0,
-        1,
-        0,
-    )
-    assert tuple(event.data['pareto_admission_count'] for event in observations) == (
+    assert tuple(event.data['archive_admission_count'] for event in observations) == (
         1,
         0,
         1,
         0,
     )
-    assert tuple(event.data['archive_reward'] for event in observations) == (
-        0.5,
-        0.0,
-        0.75,
-        0.0,
+    assert tuple(event.data['attempt_admitted'] for event in observations) == (
+        True,
+        False,
+        True,
+        False,
     )
 
 
@@ -2298,3 +3015,429 @@ def test_report_formatting_failures_are_returned_as_report_diagnostics(
     )
     assert result.summary_path is not None
     assert '[unformatted]' in result.summary_path.read_text(encoding='utf-8')
+
+
+def test_run_saves_and_loads_the_current_pareto_set_by_default(
+    tmp_path: Path,
+) -> None:
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5), (4, 6)),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.pareto_snapshot_path is not None
+    assert result.run_log is not None
+    assert result.pareto_snapshot_path == (
+        tmp_path / f'{result.run_log.invocation_id.to_log_text()}.pareto.json'
+    )
+    assert result.pareto_snapshot_path.is_file()
+    restored = engine.load_pareto_snapshot(result.pareto_snapshot_path)
+    assert restored == ((5, 5), (4, 6))
+
+
+def test_pareto_snapshot_compatibility_is_checked_before_restore(
+    tmp_path: Path,
+) -> None:
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+    )
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+    assert result.pareto_snapshot_path is not None
+
+    other_engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('different-a'), Objective('different-b'))
+        ),
+    )
+
+    with pytest.raises(ResumeCompatibilityError, match='Pareto snapshot'):
+        other_engine.load_pareto_snapshot(result.pareto_snapshot_path)
+
+
+def test_objective_upper_bound_screens_candidate_and_is_reported(
+    tmp_path: Path,
+) -> None:
+    declaration = ObjectiveDeclaration(
+        (Objective('cost_a'), Objective('cost_b')),
+        upper_bounds=(None, 5),
+    )
+    engine, _ = make_engine(
+        candidate_mode='improve',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=declaration,
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert [record.solution for record in result.search_state.pareto_solutions()] == [
+        (5, 5)
+    ]
+    assert [record.solution for record in result.search_state.active_solutions()] == [
+        (5, 5)
+    ]
+    candidate = result.candidate_outcomes[-1]
+    assert candidate.assessment is ApplicationAssessment.VALID
+    assert candidate.disposition is SearchDisposition.OBJECTIVE_BOUND_EXCEEDED
+    assert len(candidate.objective_bound_findings) == 1
+    finding = candidate.objective_bound_findings[0]
+    assert (finding.objective_id, finding.objective_value, finding.upper_bound) == (
+        'cost_b',
+        6,
+        5,
+    )
+    assert result.search_state.visited_solutions()[-1].objective_bound_findings == (
+        finding,
+    )
+    assert result.run_log is not None
+    processed = [
+        event
+        for event in result.run_log.events
+        if event.event_type == 'candidate_processed'
+    ][-1]
+    event_findings = cast(
+        tuple[ObjectiveBoundEventFinding, ...],
+        processed.data['objective_bound_findings'],
+    )
+    event_finding = event_findings[0]
+    assert event_finding.objective_id == 'cost_b'
+    assert event_finding.objective_value == '6'
+    assert event_finding.upper_bound == '5'
+    assert result.executive_summary is not None
+    assert result.executive_summary.provenance.objective_bounds[0].objective_id == (
+        'cost_b'
+    )
+    assert result.executive_summary.objective_bound_counts[0].count == 1
+
+
+def test_bound_equal_value_is_accepted_and_infeasible_exceedance_is_screened(
+    tmp_path: Path,
+) -> None:
+    declaration = ObjectiveDeclaration(
+        (Objective('cost_a'), Objective('cost_b')),
+        upper_bounds=(None, 5),
+    )
+    engine, _ = make_engine(
+        candidate_mode='improve',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=declaration,
+        application_evaluator=cast(
+            ApplicationEvaluator, InfeasibleCandidateEvaluator()
+        ),
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.candidate_outcomes[0].objective_bound_findings == ()
+    candidate = result.candidate_outcomes[-1]
+    assert candidate.assessment is ApplicationAssessment.INFEASIBLE
+    assert candidate.disposition is SearchDisposition.OBJECTIVE_BOUND_EXCEEDED
+    assert candidate.objective_bound_findings[0].objective_value == 6
+    assert all(
+        record.solution != (4, 6) for record in result.search_state.active_solutions()
+    )
+
+
+def test_initial_solutions_outside_bounds_raise_after_all_are_processed(
+    tmp_path: Path,
+) -> None:
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 0),
+        ),
+    )
+
+    with pytest.raises(InitialSolutionsError) as captured:
+        engine.run(
+            initial_solutions=((5, 5), (5, 5)),
+            log_directory=tmp_path,
+            progress_report_interval_seconds=60,
+        )
+
+    outcomes = captured.value.candidate_outcomes
+    assert len(outcomes) == 2
+    assert all(outcome.objective_bound_findings for outcome in outcomes)
+    assert captured.value.run_log is not None
+    failed = next(
+        event
+        for event in captured.value.run_log.events
+        if event.event_type == 'initialization_failed'
+    )
+    assert failed.data['submission_count'] == 2
+    assert failed.data['application_feasible_count'] == 2
+    assert failed.data['eligible_count'] == 0
+
+
+def test_resume_requires_comparator_equal_objective_bounds(tmp_path: Path) -> None:
+    original, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 10),
+        ),
+    )
+    result = original.run(
+        initial_solutions=((1, 1),),
+        log_directory=tmp_path / 'first',
+        progress_report_interval_seconds=60,
+    )
+    changed, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 11),
+        ),
+    )
+
+    with pytest.raises(ResumeCompatibilityError, match='objective bounds'):
+        changed.run(
+            checkpoint=Checkpoint(result.search_state),
+            log_directory=tmp_path / 'resumed',
+            progress_report_interval_seconds=60,
+        )
+
+
+def test_resume_accepts_comparator_equal_objective_bounds(tmp_path: Path) -> None:
+    original, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 10),
+        ),
+    )
+    result = original.run(
+        initial_solutions=((1, 1),),
+        log_directory=tmp_path / 'first',
+        progress_report_interval_seconds=60,
+    )
+    equivalent, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 10.0),
+        ),
+    )
+
+    resumed = equivalent.run(
+        checkpoint=Checkpoint(result.search_state),
+        log_directory=tmp_path / 'resumed',
+        progress_report_interval_seconds=60,
+    )
+
+    assert resumed.search_state.pareto_solutions()[0].solution == (1, 1)
+
+
+def test_resume_bound_comparison_callback_failure_is_a_setup_error(
+    tmp_path: Path,
+) -> None:
+    original, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), Objective('cost_b')),
+            upper_bounds=(None, 10),
+        ),
+    )
+    result = original.run(
+        initial_solutions=((1, 1),),
+        log_directory=tmp_path / 'first',
+        progress_report_interval_seconds=60,
+    )
+
+    class ResumeComparisonFailure(Objective):
+        def compare(self, left: object, right: object) -> ObjectiveComparison:
+            if left == 10 and right == 11:
+                raise RuntimeError('resume comparison failed')
+            return super().compare(left, right)
+
+    changed, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), ResumeComparisonFailure('cost_b')),
+            upper_bounds=(None, 11),
+        ),
+    )
+
+    with pytest.raises(ComponentSetupError) as captured:
+        changed.run(
+            checkpoint=Checkpoint(result.search_state),
+            log_directory=tmp_path / 'resumed',
+            progress_report_interval_seconds=60,
+        )
+
+    assert captured.value.failure.phase == 'objective_bound_comparison'
+
+
+def test_objective_bound_comparison_failure_stops_candidate_processing(
+    tmp_path: Path,
+) -> None:
+    class FailingBoundObjective(Objective):
+        def compare(self, left: object, right: object) -> ObjectiveComparison:
+            if left == 6 and right == 5:
+                raise RuntimeError('bound comparison failed')
+            return super().compare(left, right)
+
+    engine, _ = make_engine(
+        candidate_mode='improve',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), FailingBoundObjective('cost_b')),
+            upper_bounds=(None, 5),
+        ),
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.termination_reason is TerminationReason.COMPONENT_FAILURE
+    assert result.run_log is not None
+    failure_event = next(
+        event
+        for event in result.run_log.events
+        if event.event_type == 'component_failure'
+        and cast(ComponentFailure, event.data['failure']).phase
+        == 'objective_bound_comparison'
+    )
+    failure = cast(ComponentFailure, failure_event.data['failure'])
+    assert failure.source == 'cost_b-component'
+    assert [record.solution for record in result.search_state.pareto_solutions()] == [
+        (5, 5)
+    ]
+
+
+def test_objective_bound_formatting_failure_is_reported_without_stopping_search(
+    tmp_path: Path,
+) -> None:
+    class UnformattableObjective(Objective):
+        def format(self, value: object) -> str:
+            del value
+            raise RuntimeError('cannot format value')
+
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+        objective_declaration=ObjectiveDeclaration(
+            (Objective('cost_a'), UnformattableObjective('cost_b')),
+            upper_bounds=(None, 5),
+        ),
+    )
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.termination_reason is TerminationReason.BUDGET_EXHAUSTED
+    assert result.executive_summary is not None
+    assert any(
+        diagnostic.kind is ReportDiagnosticKind.OBJECTIVE_BOUND_FORMAT_FAILURE
+        and diagnostic.objective_id == 'cost_b'
+        and diagnostic.solution_id is None
+        for diagnostic in result.report_diagnostics
+    )
+
+
+def test_final_view_publication_failure_changes_termination_and_keeps_other_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _ = make_engine(
+        candidate_mode='duplicate',
+        max_neighborhood_size=1,
+        max_candidate_attempts=1,
+    )
+    original_publish = DefaultRunLogger.publish_view
+
+    def fail_registry_view(
+        logger: DefaultRunLogger,
+        invocation_id: InvocationId,
+        problem_instance_id: ProblemInstanceId,
+        committed_state: SearchState,
+        commit_sequence: int,
+        objective_declaration: ObjectiveDeclaration,
+        scope: ViewerExportScope,
+        is_final: bool,
+        solution_formatter: SolutionFormatter | None,
+    ) -> Path:
+        if scope == 'registry' and is_final:
+            raise OSError('registry export unavailable')
+        return original_publish(
+            logger,
+            invocation_id,
+            problem_instance_id,
+            committed_state,
+            commit_sequence,
+            objective_declaration,
+            scope,
+            is_final,
+            solution_formatter,
+        )
+
+    monkeypatch.setattr(DefaultRunLogger, 'publish_view', fail_registry_view)
+
+    result = engine.run(
+        initial_solutions=((5, 5),),
+        log_directory=tmp_path,
+        progress_report_interval_seconds=60,
+    )
+
+    assert result.termination_reason is TerminationReason.COMPONENT_FAILURE
+    assert any(
+        failure.phase == 'registry_view_publish' for failure in result.diagnostics
+    )
+    assert result.registry_view_path is None
+    assert result.pareto_view_path is not None and result.pareto_view_path.is_file()
+    assert result.run_log is not None
+    stopped = [
+        event
+        for event in result.run_log.events
+        if event.event_type == 'invocation_stopped'
+    ]
+    assert len(stopped) == 1
+    assert stopped[0].data['termination_reason'] is TerminationReason.COMPONENT_FAILURE

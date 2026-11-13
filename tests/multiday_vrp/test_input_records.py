@@ -10,7 +10,9 @@ import pytest
 
 from multiobjective_vns.multiday_vrp.input_records import (
     FrozenTomlTable,
+    NodeCoordinateRecord,
     VrpFeatureProfile,
+    VrpSpatialData,
 )
 
 
@@ -51,6 +53,7 @@ def test_feature_profile_uses_the_closed_design_feature_catalog() -> None:
         'scenario_uncertainty',
         'network_event_exposure',
         'multi_day_planning',
+        'variable_active_vehicle_count',
         'overnight_depot_choice',
         'multiple_tours_per_day',
         'restricted_vehicle_availability',
@@ -76,4 +79,14 @@ def test_feature_profile_uses_the_closed_design_feature_catalog() -> None:
         'objective_declaration',
         'multiple_objectives',
         'scenario_aggregation',
+        'planar_node_coordinates',
     }
+
+
+def test_spatial_data_records_are_immutable_normalized_values() -> None:
+    coordinate = NodeCoordinateRecord('node-a', 1.25, -3.5)
+    spatial = VrpSpatialData('local-grid', 'km', (coordinate,))
+
+    assert spatial.coordinate_system_id == 'local-grid'
+    assert spatial.coordinate_unit == 'km'
+    assert spatial.node_coordinates == (coordinate,)

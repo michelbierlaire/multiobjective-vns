@@ -10,16 +10,16 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from functools import cmp_to_key
-from itertools import product
 from math import inf, isfinite
 from typing import cast
 
-from multiobjective_vns.identifiers import ObjectiveId
+from multiobjective_vns.identifiers import ObjectiveId, identifier_text
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
 from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
     choose_uniformly,
     operator_result,
+    randomized_order,
     randomized_sample,
     require_vrp_base,
     validate_neighborhood_size,
@@ -28,10 +28,22 @@ from multiobjective_vns.multiday_vrp.operators.feature_common import (
     assess_complete_candidate,
     objective_position,
 )
+from multiobjective_vns.multiday_vrp.operators.package_chain import (
+    PackageChainRelocationOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.path_search import (
+    PathSearchIndex,
+    build_path_search_index,
+    rebuild_changed_routes,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_common import (
+    select_window_first_candidates,
+)
+from multiobjective_vns.multiday_vrp.operators.vehicle_insertion_search import (
+    target_first_nondominated_scored_plans,
+)
 from multiobjective_vns.multiday_vrp.operators.vehicle_route_assignment_helpers import (
     _bounded_limit,
-    _rebuild_paths,
-    _ScoredPlan,
 )
 from multiobjective_vns.multiday_vrp.solution import (
     ActivityStop,
@@ -43,13 +55,21 @@ from multiobjective_vns.objectives import (
     ObjectiveComparison,
     ObjectiveDeclaration,
 )
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.values import require_integer
 
 __all__ = ['TimeWindowRegretBasedReinsertionOperator']
 
 type _UnitKey = tuple[str, ...]
 type _RouteStops = tuple[int, tuple[RouteStop, ...]]
+type _ScoredPlan = tuple[VrpSolution, tuple[object, ...]]
+type _ScoredTrial = tuple[VrpSolution, tuple[object, ...], int]
+type _WindowKey = tuple[str, str, int | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,23 +109,28 @@ class TimeWindowRegretBasedReinsertionOperator:
     :param instance: Validated VRP instance.
     :param objective_declaration: Ordered objectives for complete-plan ranking.
     :param assess_plan: Shared complete-plan assessment callback.
-    :param objective_id: Objective used to rank alternatives and calculate regret.
+    :param objective_id: Dedicated time-window-violation objective.
     :param max_neighborhood_size: Largest supported value of ``k``.
-    :param max_candidate_alternatives: Placements assessed per service unit.
+    :param max_candidate_alternatives: Placement alternatives and trial limit.
     :param max_paths_per_leg: Maximum sampled paths for a route leg.
     :param max_arc_expansion_steps: Search bound for each sampled path.
+    :raises ValueError: If the instance lacks its dedicated window objective or
+        the operator is configured for a different objective.
     """
 
     __slots__ = (
         '_instance',
         '_objectives',
         '_assess_plan',
-        '_objective_id',
         '_objective_position',
         '_maximum_size',
         '_candidate_limit',
         '_path_limit',
         '_expansion_limit',
+        '_window_objective_position',
+        '_windowed_activity_keys',
+        '_path_search_index',
+        '_package_chain_operator',
     )
 
     def __init__(
@@ -123,9 +148,22 @@ class TimeWindowRegretBasedReinsertionOperator:
         self._instance = instance
         self._objectives = objective_declaration
         self._assess_plan = assess_plan
-        self._objective_id = objective_id
+        window_objective_id = instance.time_window_violation_objective_id
+        if window_objective_id is None:
+            raise ValueError(
+                'time-window regret reinsertion requires the dedicated '
+                'time-window objective'
+            )
+        if identifier_text(objective_id) != identifier_text(window_objective_id):
+            raise ValueError(
+                'time-window regret reinsertion must target the dedicated '
+                'time-window objective'
+            )
         self._objective_position = objective_position(
             objective_declaration, objective_id
+        )
+        self._window_objective_position = objective_position(
+            objective_declaration, window_objective_id
         )
         self._maximum_size = require_integer(
             max_neighborhood_size, name='max_neighborhood_size', minimum=1
@@ -137,42 +175,76 @@ class TimeWindowRegretBasedReinsertionOperator:
         self._expansion_limit = _bounded_limit(
             max_arc_expansion_steps, 'max_arc_expansion_steps', 10000
         )
+        self._windowed_activity_keys = _windowed_activity_keys(instance)
+        self._path_search_index: PathSearchIndex = build_path_search_index(instance)
+        self._package_chain_operator = PackageChainRelocationOperator(
+            instance,
+            objective_declaration,
+            assess_plan,
+            mode='requests',
+            max_neighborhood_size=self._maximum_size,
+            max_candidate_alternatives=self._candidate_limit,
+            max_paths_per_leg=self._path_limit,
+            max_arc_expansion_steps=self._expansion_limit,
+        )
 
     def call(self, context: CandidateContext) -> OperatorResult:
         """Relocate at most ``k`` distinct windowed service units.
 
         :param context: Base plan, requested size, feasibility request, and RNG.
-        :returns: Changed plan and number of units relocated, or ``m=0``.
+        :returns: Ranked complete candidates with their relocated-unit counts.
         :raises TypeError: If the base or a complete assessment is malformed.
         :raises ValueError: If ``k`` exceeds the registered maximum.
         """
         size = validate_neighborhood_size(context.k, self._maximum_size)
-        working = require_vrp_base(context)
-        moved_units: set[_UnitKey] = set()
-        modifications = 0
+        base = require_vrp_base(context)
+        completed: list[_ScoredTrial] = []
+        seen_solutions: set[VrpSolution] = set()
 
-        for _ in range(size):
-            alternatives_list: list[_UnitAlternatives] = []
-            for unit in _windowed_units(self._instance, working):
-                if unit.key in moved_units:
-                    continue
-                result = self._unit_alternatives(working, unit, context)
-                if result is not None:
-                    alternatives_list.append(result)
-            alternatives = tuple(alternatives_list)
-            if not alternatives:
-                break
-            selected = self._select_unit(alternatives, context)
-            working = selected.candidates[
-                self._choose_best_candidate(selected.candidates, context)
-            ][0]
-            moved_units.add(selected.unit_key)
-            modifications += 1
+        for _trial in range(self._candidate_limit):
+            working = base
+            selected_units: list[_UnitKey] = []
+            final_values: tuple[object, ...] | None = None
 
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
+            for _ in range(size):
+                alternatives_list: list[_UnitAlternatives] = []
+                for unit in _windowed_units(working, self._windowed_activity_keys):
+                    if unit.key in selected_units:
+                        continue
+                    result = self._unit_alternatives(working, unit, context)
+                    if result is not None:
+                        alternatives_list.append(result)
+                if not alternatives_list:
+                    break
+
+                selected = self._select_unit(alternatives_list, context)
+                chosen = selected.candidates[
+                    self._choose_best_candidate(selected.candidates, context)
+                ]
+                working, final_values = chosen
+                selected_units.append(selected.unit_key)
+
+            modifications = sum(
+                _unit_position_signature(base, unit_key)
+                != _unit_position_signature(working, unit_key)
+                for unit_key in selected_units
+            )
+            if (
+                final_values is not None
+                and modifications > 0
+                and working not in seen_solutions
+            ):
+                seen_solutions.add(working)
+                completed.append((working, final_values, modifications))
+
+        if not completed:
+            return operator_result(None, modifications=0, requested_size=size)
+        ranked = self._rank_trials(completed, context)
+        return OperatorResult(
+            candidates=tuple(
+                CandidateProposal(Candidate(solution), modifications)
+                for solution, _values, modifications in ranked[: context.max_candidates]
+            )
         )
 
     def _unit_alternatives(
@@ -226,6 +298,11 @@ class TimeWindowRegretBasedReinsertionOperator:
         unit: _ServiceUnit,
         context: CandidateContext,
     ) -> tuple[VrpSolution, ...]:
+        if unit.key[0] == 'package':
+            return self._package_chain_operator._candidate_placements_for_package(
+                base, unit.key[1], context
+            )
+
         base_stops = [list(route.stops) for route in base.routes]
         for route_index, stops in unit.route_stops:
             removed = set(stops)
@@ -233,48 +310,69 @@ class TimeWindowRegretBasedReinsertionOperator:
                 stop for stop in base_stops[route_index] if stop not in removed
             ]
 
-        positions = tuple(
-            tuple(range(len(base_stops[route_index]) + 1))
-            for route_index, _stops in unit.route_stops
+        service_stops = tuple(
+            stop for _route_index, stops in unit.route_stops for stop in stops
         )
-        has_transfers = any(
-            isinstance(stop, TransferOperationStop)
-            for _route_index, stops in unit.route_stops
-            for stop in stops
+        sampled = _sample_service_block_placements(
+            base,
+            base_stops,
+            service_stops,
+            self._candidate_limit,
+            context,
         )
-        if unit.key[0] == 'activity' or not has_transfers:
-            service_stops = tuple(
-                stop for _route_index, stops in unit.route_stops for stop in stops
-            )
-            sampled = _sample_service_block_placements(
-                base,
-                base_stops,
-                service_stops,
-                self._candidate_limit,
-                context,
-            )
-        else:
-            sampled = _sample_distinct_placements(
-                base,
-                base_stops,
-                unit.route_stops,
-                positions,
-                self._candidate_limit,
-                context,
-            )
         completed: list[VrpSolution] = []
-        for candidate in sampled:
-            with_paths = _rebuild_paths(
+        base_signature = _unit_position_signature(base, unit.key)
+        for placement_index, candidate in enumerate(sampled):
+            if _unit_position_signature(candidate, unit.key) == base_signature:
+                continue
+            placements_remaining = len(sampled) - placement_index
+            candidate_budget = self._candidate_limit - len(completed)
+            path_assignment_limit = min(
+                self._path_limit,
+                max(1, candidate_budget // placements_remaining),
+            )
+            changed_stops = {
+                route_index: route.stops
+                for route_index, route in enumerate(candidate.routes)
+                if route.stops != base.routes[route_index].stops
+            }
+            rebuilt_candidates = rebuild_changed_routes(
                 self._instance,
                 base,
-                candidate,
-                context,
-                max_paths=self._path_limit,
-                max_expansions=self._expansion_limit,
+                changed_stops,
+                random_source=context.random_source,
+                max_paths_per_leg=path_assignment_limit,
+                max_arc_expansion_steps=self._expansion_limit,
+                max_candidate_alternatives=path_assignment_limit,
+                path_search_index=self._path_search_index,
             )
-            if with_paths is not None and with_paths not in completed:
-                completed.append(with_paths)
+            for rebuilt in rebuilt_candidates:
+                if rebuilt not in completed:
+                    completed.append(rebuilt)
+                    if len(completed) == self._candidate_limit:
+                        return tuple(completed)
         return tuple(completed)
+
+    def _rank_trials(
+        self,
+        candidates: list[_ScoredTrial],
+        context: CandidateContext,
+    ) -> tuple[_ScoredTrial, ...]:
+        scored = tuple((candidate, candidate[1]) for candidate in candidates)
+        window_best = select_window_first_candidates(
+            scored,
+            self._objectives.objectives[self._window_objective_position],
+            window_objective_position=self._window_objective_position,
+        )
+        frontier = target_first_nondominated_scored_plans(
+            window_best,
+            self._objectives,
+            objective_position=self._objective_position,
+        )
+        return randomized_order(
+            tuple(candidate for candidate, _values in frontier),
+            context.random_source,
+        )
 
     def _select_unit(
         self,
@@ -332,8 +430,8 @@ class TimeWindowRegretBasedReinsertionOperator:
 
 
 def _windowed_units(
-    instance: LoadedVrpInstance,
     solution: VrpSolution,
+    windowed_activity_keys: frozenset[_WindowKey],
 ) -> tuple[_ServiceUnit, ...]:
     by_key: dict[_UnitKey, dict[int, list[tuple[int, RouteStop]]]] = defaultdict(
         lambda: defaultdict(list)
@@ -348,11 +446,11 @@ def _windowed_units(
                 else:
                     unit_key = ('activity', reference.kind, reference.activity_id)
                 by_key[unit_key][route_index].append((stop_index, stop))
-                if _activity_has_window(
-                    instance,
+                if _is_windowed_activity(
                     reference.kind,
                     reference.activity_id,
                     route.day_index,
+                    windowed_activity_keys,
                 ):
                     windowed_keys.add(unit_key)
             elif isinstance(stop, TransferOperationStop):
@@ -373,67 +471,50 @@ def _windowed_units(
     return tuple(units)
 
 
-def _activity_has_window(
-    instance: LoadedVrpInstance,
+def _is_windowed_activity(
     kind: str,
     activity_id: str,
     day_index: int,
+    windowed_activity_keys: frozenset[_WindowKey],
 ) -> bool:
     if kind in {'pickup', 'delivery'}:
-        return any(
-            record.package_id == activity_id and record.activity == kind
-            for record in instance.package_data.package_time_windows
-        )
-    if kind == 'intervention':
-        return any(
-            record.intervention_id == activity_id and record.day_index == day_index
-            for record in instance.intervention_data.intervention_time_windows
-        )
-    return False
+        return ('package', activity_id, None) in windowed_activity_keys
+    return (kind, activity_id, day_index) in windowed_activity_keys
 
 
-def _sample_distinct_placements(
-    base: VrpSolution,
-    route_stops_without_unit: list[list[RouteStop]],
-    route_stops: tuple[_RouteStops, ...],
-    insertion_positions: tuple[tuple[int, ...], ...],
-    limit: int,
-    context: CandidateContext,
-) -> tuple[VrpSolution, ...]:
-    generated: list[VrpSolution] = []
+def _windowed_activity_keys(
+    instance: LoadedVrpInstance,
+) -> frozenset[_WindowKey]:
+    return frozenset(
+        ('package', item.package_id, None)
+        for item in instance.package_data.package_time_windows
+    ) | frozenset(
+        ('intervention', item.intervention_id, item.day_index)
+        for item in instance.intervention_data.intervention_time_windows
+    )
 
-    def add(selected_positions: tuple[int, ...]) -> None:
-        updated_routes = list(base.routes)
-        for (route_index, unit_stops), insertion_position in zip(
-            route_stops, selected_positions, strict=True
-        ):
-            current = route_stops_without_unit[route_index]
-            updated_routes[route_index] = replace(
-                updated_routes[route_index],
-                stops=(
-                    *current[:insertion_position],
-                    *unit_stops,
-                    *current[insertion_position:],
-                ),
-            )
-        candidate = replace(base, routes=tuple(updated_routes))
-        if candidate != base and candidate not in generated:
-            generated.append(candidate)
 
-    for _ in range(max(20, limit * 20)):
-        selected_positions = tuple(
-            choose_uniformly(positions, context.random_source)
-            for positions in insertion_positions
-        )
-        add(selected_positions)
-        if len(generated) >= limit:
-            return tuple(generated[:limit])
-
-    for selected_positions in product(*insertion_positions):
-        add(tuple(selected_positions))
-        if len(generated) >= limit:
-            break
-    return tuple(generated[:limit])
+def _unit_position_signature(
+    solution: VrpSolution,
+    unit_key: _UnitKey,
+) -> tuple[tuple[int, int], ...]:
+    positions: list[tuple[int, int]] = []
+    for route_index, route in enumerate(solution.routes):
+        for stop_index, stop in enumerate(route.stops):
+            if isinstance(stop, ActivityStop):
+                reference = stop.activity_ref
+                stop_key = (
+                    ('package', reference.activity_id)
+                    if reference.kind in {'pickup', 'delivery'}
+                    else ('activity', reference.kind, reference.activity_id)
+                )
+            elif isinstance(stop, TransferOperationStop):
+                stop_key = ('package', stop.transfer_step_ref.package_id)
+            else:
+                continue
+            if stop_key == unit_key:
+                positions.append((route_index, stop_index))
+    return tuple(positions)
 
 
 def _sample_service_block_placements(

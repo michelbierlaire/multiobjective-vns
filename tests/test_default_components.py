@@ -4,6 +4,8 @@ Created: 2026-10-29T14:26:25+00:00
 Author: Michel Bierlaire, EPFL
 """
 
+import math
+
 import pytest
 
 from multiobjective_vns.config import MultiobjectiveVNSConfig
@@ -41,7 +43,8 @@ def test_seeded_random_source_restores_its_stream() -> None:
 
 
 def test_default_feedback_policy_returns_a_complete_probability_distribution() -> None:
-    policy = DefaultFeedbackPolicy(MultiobjectiveVNSConfig())
+    config = MultiobjectiveVNSConfig(max_candidates_per_attempt=1)
+    policy = DefaultFeedbackPolicy(config)
     choices = (
         ChoiceDescriptor(
             ChoiceId.for_operator('first'),
@@ -68,18 +71,20 @@ def test_default_feedback_policy_returns_a_complete_probability_distribution() -
     )
 
     assert set(probabilities) == {choice.choice_id for choice in choices}
-    assert sum(probabilities.values()) == 1.0
-    assert all(probability >= 0.05 for probability in probabilities.values())
+    assert sum(probabilities.values()) == pytest.approx(1.0)
+    assert all(
+        probability >= config.feedback_epsilon for probability in probabilities.values()
+    )
+    assert probabilities[choices[0].choice_id] == pytest.approx(0.5)
+    assert probabilities[choices[1].choice_id] == pytest.approx(0.5)
 
 
-def test_performance_matching_uses_group_priors_and_pair_success_feedback() -> None:
+def test_performance_matching_uses_group_prior_and_unit_score_updates() -> None:
     config = MultiobjectiveVNSConfig(
+        max_candidates_per_attempt=1,
         feedback_selection_mode='performance_matching',
         feedback_epsilon=0.1,
-        feedback_prior_attempts=5,
-        standalone_prior_reward=0.5,
-        grouped_composition_prior_reward=0.9,
-        ungrouped_composition_prior_reward=0.1,
+        feedback_mu=math.log(2.0),
     )
     grouped_id = ChoiceId.for_composition(CompositionId('first', 'second'))
     ungrouped_id = ChoiceId.for_composition(CompositionId('second', 'first'))
@@ -107,8 +112,8 @@ def test_performance_matching_uses_group_priors_and_pair_success_feedback() -> N
     policy = DefaultFeedbackPolicy(config)
 
     prior_distribution = policy.distribution(request)
-    assert prior_distribution[grouped_id] == pytest.approx(0.86)
-    assert prior_distribution[ungrouped_id] == pytest.approx(0.14)
+    assert prior_distribution[grouped_id] == pytest.approx(0.1 + 0.8 * (2 / 3))
+    assert prior_distribution[ungrouped_id] == pytest.approx(0.1 + 0.8 * (1 / 3))
 
     outcome = CandidateOutcome(
         source=SubmissionSource.OPERATOR,
@@ -119,35 +124,135 @@ def test_performance_matching_uses_group_priors_and_pair_success_feedback() -> N
         base_solution_id=SolutionId(0),
         k=1,
         m=1,
+        candidate_index=1,
         solution_id=SolutionId(1),
         assessment=ApplicationAssessment.VALID,
         disposition=SearchDisposition.ARCHIVED,
     )
-    policy.observe(
-        FeedbackObservation(
-            grouped_id,
-            1,
-            1,
-            (outcome,),
-            (),
-            stagnation_attempts=50,
-            archive_reward=0.99,
-        )
+    policy.observe(FeedbackObservation(grouped_id, 1, (1,), (outcome,), (), 1))
+    grouped_success_distribution = policy.distribution(request)
+    assert grouped_success_distribution[grouped_id] == pytest.approx(0.74)
+    assert grouped_success_distribution[ungrouped_id] == pytest.approx(0.26)
+
+    ungrouped_outcome = CandidateOutcome(
+        source=SubmissionSource.OPERATOR,
+        submitted_solution=(4, 6),
+        processing_status=ProcessingStatus.COMPLETED,
+        choice_id=ungrouped_id,
+        component_position=CompositionPosition.SECOND,
+        base_solution_id=SolutionId(0),
+        k=1,
+        m=1,
+        candidate_index=1,
+        solution_id=SolutionId(2),
+        assessment=ApplicationAssessment.VALID,
+        disposition=SearchDisposition.ARCHIVED,
     )
+    for _ in range(3):
+        policy.observe(
+            FeedbackObservation(ungrouped_id, 1, (1,), (ungrouped_outcome,), (), 1)
+        )
     updated_distribution = policy.distribution(request)
 
-    assert updated_distribution[grouped_id] > prior_distribution[grouped_id]
+    assert updated_distribution[grouped_id] == pytest.approx(0.1 + 0.8 / 3)
+    assert updated_distribution[ungrouped_id] == pytest.approx(0.1 + 0.8 * (2 / 3))
+    assert updated_distribution[ungrouped_id] > updated_distribution[grouped_id]
     payload = policy.capture_state()
     restored_policy = DefaultFeedbackPolicy(config)
     restored_policy.restore_state(payload)
     assert restored_policy.distribution(request) == updated_distribution
 
 
-def test_feedback_uses_recent_rewards_and_reset_clears_the_window() -> None:
+def test_feedback_floor_is_per_choice_and_epsilon_must_be_below_one_over_n() -> None:
     config = MultiobjectiveVNSConfig(
-        feedback_prior_attempts=1,
-        feedback_recent_attempt_window=2,
-        standalone_prior_reward=0.5,
+        max_candidates_per_attempt=1,
+        feedback_selection_mode='performance_matching',
+        feedback_epsilon=0.1,
+        feedback_mu=100.0,
+    )
+    favored_id = ChoiceId.for_operator('favored')
+    other_id = ChoiceId.for_operator('other')
+    choices = (
+        ChoiceDescriptor(favored_id, ('favored',), 1, 1, False, frozenset(), 'units'),
+        ChoiceDescriptor(other_id, ('other',), 1, 1, False, frozenset(), 'units'),
+    )
+    request = ChoiceSelectionRequest(OperatorChoiceCategory.STANDALONE, choices)
+    policy = DefaultFeedbackPolicy(config)
+    admitted = CandidateOutcome(
+        source=SubmissionSource.OPERATOR,
+        submitted_solution=(1,),
+        processing_status=ProcessingStatus.COMPLETED,
+        choice_id=favored_id,
+        base_solution_id=SolutionId(0),
+        k=1,
+        m=1,
+        candidate_index=1,
+        solution_id=SolutionId(1),
+        assessment=ApplicationAssessment.VALID,
+        disposition=SearchDisposition.ARCHIVED,
+    )
+    policy.observe(FeedbackObservation(favored_id, 1, (1,), (admitted,), (), 1))
+
+    probabilities = policy.distribution(request)
+
+    assert probabilities[favored_id] == pytest.approx(0.9)
+    assert probabilities[other_id] == pytest.approx(0.1)
+    assert min(probabilities.values()) == pytest.approx(config.feedback_epsilon)
+
+    invalid_floor_policy = DefaultFeedbackPolicy(
+        MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
+            feedback_epsilon=0.5,
+        )
+    )
+    with pytest.raises(ValueError, match='strictly below 1 / n'):
+        invalid_floor_policy.distribution(request)
+
+
+def test_zero_feedback_intensity_gives_uniform_probability_after_score_changes() -> (
+    None
+):
+    first_id = ChoiceId.for_operator('first')
+    second_id = ChoiceId.for_operator('second')
+    choices = (
+        ChoiceDescriptor(first_id, ('first',), 1, 1, False, frozenset(), 'units'),
+        ChoiceDescriptor(second_id, ('second',), 1, 1, False, frozenset(), 'units'),
+    )
+    request = ChoiceSelectionRequest(OperatorChoiceCategory.STANDALONE, choices)
+    policy = DefaultFeedbackPolicy(
+        MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
+            feedback_epsilon=0.1,
+            feedback_mu=0.0,
+        )
+    )
+    admitted = CandidateOutcome(
+        source=SubmissionSource.OPERATOR,
+        submitted_solution=(1,),
+        processing_status=ProcessingStatus.COMPLETED,
+        choice_id=first_id,
+        base_solution_id=SolutionId(0),
+        k=1,
+        m=1,
+        candidate_index=1,
+        solution_id=SolutionId(1),
+        assessment=ApplicationAssessment.VALID,
+        disposition=SearchDisposition.ARCHIVED,
+    )
+    policy.observe(FeedbackObservation(first_id, 1, (1,), (admitted,), (), 1))
+
+    probabilities = policy.distribution(request)
+
+    assert probabilities == {
+        first_id: pytest.approx(0.5),
+        second_id: pytest.approx(0.5),
+    }
+
+
+def test_feedback_decrements_without_admission_and_reset_clears_scores() -> None:
+    config = MultiobjectiveVNSConfig(
+        max_candidates_per_attempt=1,
+        feedback_epsilon=0.1,
     )
     first_id = ChoiceId.for_operator('first')
     second_id = ChoiceId.for_operator('second')
@@ -158,7 +263,7 @@ def test_feedback_uses_recent_rewards_and_reset_clears_the_window() -> None:
     request = ChoiceSelectionRequest(OperatorChoiceCategory.STANDALONE, choices)
     policy = DefaultFeedbackPolicy(config)
 
-    def observe(choice_id: ChoiceId, solution_id: int, reward: float) -> None:
+    def observe(choice_id: ChoiceId, solution_id: int, admitted: bool) -> None:
         outcome = CandidateOutcome(
             source=SubmissionSource.OPERATOR,
             submitted_solution=(solution_id,),
@@ -167,29 +272,34 @@ def test_feedback_uses_recent_rewards_and_reset_clears_the_window() -> None:
             base_solution_id=SolutionId(0),
             k=1,
             m=1,
+            candidate_index=1,
             solution_id=SolutionId(solution_id),
             assessment=ApplicationAssessment.VALID,
-            disposition=SearchDisposition.ARCHIVED,
+            disposition=(
+                SearchDisposition.ARCHIVED if admitted else SearchDisposition.DOMINATED
+            ),
         )
         policy.observe(
             FeedbackObservation(
                 choice_id,
                 1,
-                1,
+                (1,),
                 (outcome,),
                 (),
-                stagnation_attempts=1,
-                archive_reward=reward,
+                int(admitted),
             )
         )
 
-    observe(first_id, 1, 0.9)
-    observe(first_id, 2, 0.9)
+    observe(first_id, 1, True)
     first_favored = policy.distribution(request)
     assert first_favored[first_id] > first_favored[second_id]
 
-    observe(second_id, 3, 0.9)
-    observe(second_id, 4, 0.9)
+    observe(first_id, 2, False)
+    balanced = policy.distribution(request)
+    assert balanced[first_id] == pytest.approx(0.5)
+    assert balanced[second_id] == pytest.approx(0.5)
+
+    observe(second_id, 3, True)
     second_favored = policy.distribution(request)
     assert second_favored[second_id] > second_favored[first_id]
 
@@ -205,7 +315,10 @@ def test_feedback_uses_recent_rewards_and_reset_clears_the_window() -> None:
 
 def test_uniform_feedback_ignores_operator_group_hints() -> None:
     policy = DefaultFeedbackPolicy(
-        MultiobjectiveVNSConfig(feedback_selection_mode='uniform')
+        MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
+            feedback_selection_mode='uniform',
+        )
     )
     choices = (
         ChoiceDescriptor(
@@ -245,7 +358,7 @@ def test_default_budget_policy_allows_work_until_engine_ceiling() -> None:
     decision = DefaultBudgetPolicy().decide(
         BudgetRequest(
             counters=InvocationCounters(),
-            limits=MultiobjectiveVNSConfig().budget_limits,
+            limits=MultiobjectiveVNSConfig(max_candidates_per_attempt=1).budget_limits,
             elapsed_seconds=0.0,
         )
     )

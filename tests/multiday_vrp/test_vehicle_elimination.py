@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
+
+import pytest
 
 from multiobjective_vns.multiday_vrp.input_records import (
     LoadedVrpInstance,
@@ -73,9 +75,9 @@ def test_vehicle_elimination_reassigns_all_services_and_removes_a_vehicle(
 
     result = operator.call(_context(base))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert len(candidate.routes) == 1
     assert candidate.routes[0].vehicle_id == 'vehicle-2'
     assert {
@@ -104,11 +106,15 @@ def test_vehicle_elimination_returns_zero_when_no_receiver_exists(
 
     result = operator.call(_context(base))
 
-    assert result.m == 0
-    assert result.candidate is None
+    assert result.candidates == ()
+    assert not result.candidates
 
 
-def test_vehicle_elimination_preserves_package_chain_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize('insertion_strategy', ('best', 'regret'))
+def test_vehicle_elimination_preserves_package_chain_order(
+    tmp_path: Path,
+    insertion_strategy: Literal['best', 'regret'],
+) -> None:
     instance, objectives, base = _service_plan(tmp_path)
     package = PackageRecord('parcel', 'b', 'c', 1.0, 0.0, 0.0, 0, 0.0, 0.0)
     instance = instance._replace(
@@ -119,7 +125,7 @@ def test_vehicle_elimination_preserves_package_chain_order(tmp_path: Path) -> No
         source,
         stops=(
             ActivityStop(
-                ActivityRef('pickup', 'parcel'), frozenset(), 0.0, 0.0, 0.0, False
+                ActivityRef('pickup', 'parcel'), frozenset(), 0.0, 0.0, 0.0, True
             ),
             ActivityStop(
                 ActivityRef('delivery', 'parcel'), frozenset(), 0.0, 0.0, 0.0, False
@@ -135,13 +141,14 @@ def test_vehicle_elimination_preserves_package_chain_order(tmp_path: Path) -> No
         max_candidate_alternatives=8,
         max_paths_per_leg=4,
         max_arc_expansion_steps=100,
+        insertion_strategy=insertion_strategy,
     )
 
     result = operator.call(_context(base))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert len(candidate.routes) == 1
     package_stops = tuple(
         stop
@@ -152,3 +159,4 @@ def test_vehicle_elimination_preserves_package_chain_order(tmp_path: Path) -> No
         'pickup',
         'delivery',
     )
+    assert not any(stop.tour_end for stop in candidate.routes[0].stops)

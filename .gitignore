@@ -230,3 +230,9 @@ examples/multiday_vrp/solomon/C101-25/.DS_Store
 /examples/multiday_vrp/solomon/C101-25-3-vehicles/run-bounds-window150-wait30-symmetry-v4-overnight-20261113
 /examples/multiday_vrp/solomon/C101-25-3-vehicles/run-logs-6h-warmstart-20261112-0842-seed-0
 /examples/multiday_vrp/solomon/C101-25-3-vehicles/run-logs-overnight-symmetry-operators-20261112-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-1h-compositions-50-20261105-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-1h-multiple-candidates-20261108-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-1h-separated-window-objective-20261106-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-1h-window-operators-20261106-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-2h-20261105-seed-0
+/examples/multiday_vrp/solomon/C101-25/run-logs-best-regret-20261105-seed-0

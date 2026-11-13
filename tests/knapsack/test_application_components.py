@@ -4,6 +4,8 @@ Created: 2026-10-29T17:44:53+00:00
 Author: Michel Bierlaire, EPFL
 """
 
+from typing import cast
+
 import pytest
 
 from multiobjective_vns.knapsack.codec import KnapsackSolutionCodec
@@ -57,7 +59,7 @@ def test_solution_codec_round_trips_valid_and_malformed_tuples() -> None:
     assert codec.restore(codec.capture(valid)) == valid
     assert codec.restore(codec.capture(malformed)) == malformed
     assert codec.restore(codec.capture(malformed_boolean)) == malformed_boolean
-    assert codec.capture(malformed) is malformed
+    assert codec.capture(valid) == b'[0,1,0]'
 
 
 def test_solution_codec_rejects_values_outside_its_tuple_contract() -> None:
@@ -66,7 +68,9 @@ def test_solution_codec_rejects_values_outside_its_tuple_contract() -> None:
     with pytest.raises(TypeError):
         codec.capture([0, 1])
     with pytest.raises(TypeError):
-        codec.restore([0, 1])
+        codec.restore(cast(bytes, [0, 1]))
+    with pytest.raises(ValueError):
+        codec.restore(b'{bad json')
 
 
 def test_objective_declaration_minimizes_negated_profit(

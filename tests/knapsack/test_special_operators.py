@@ -64,9 +64,9 @@ def run(
 
 
 def result_solution(result: OperatorResult) -> tuple[int, ...] | None:
-    if result.candidate is None:
+    if not result.candidates:
         return None
-    return cast(tuple[int, ...], result.candidate.solution)
+    return cast(tuple[int, ...], result.candidates[0].candidate.solution)
 
 
 def test_exact_flip_changes_exactly_k_distinct_bits() -> None:
@@ -77,7 +77,7 @@ def test_exact_flip_changes_exactly_k_distinct_bits() -> None:
         ensure_feasible=False,
     )
 
-    assert result.m == 2
+    assert result.candidates[0].m == 2
     assert result_solution(result) == (0, 0, 0, 0)
 
 
@@ -89,8 +89,7 @@ def test_exact_flip_discards_infeasible_final_vector_when_requested() -> None:
         ensure_feasible=True,
     )
 
-    assert result.m == 0
-    assert result.candidate is None
+    assert result.candidates == ()
 
 
 def test_capacity_repair_stops_at_first_feasible_removal() -> None:
@@ -101,7 +100,7 @@ def test_capacity_repair_stops_at_first_feasible_removal() -> None:
         ensure_feasible=True,
     )
 
-    assert result.m == 1
+    assert result.candidates[0].m == 1
     assert result_solution(result) == (0, 1, 1, 0)
 
 
@@ -113,7 +112,7 @@ def test_capacity_repair_unfiltered_call_returns_infeasible_sample() -> None:
         ensure_feasible=False,
     )
 
-    assert result.m == 1
+    assert result.candidates[0].m == 1
     assert result_solution(result) == (0, 1, 1, 1)
 
 
@@ -125,5 +124,5 @@ def test_capacity_repair_from_feasible_base_retains_all_sampled_removals() -> No
         ensure_feasible=True,
     )
 
-    assert result.m == 2
+    assert result.candidates[0].m == 2
     assert result_solution(result) == (0, 0, 0, 0)

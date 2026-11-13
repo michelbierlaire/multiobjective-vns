@@ -40,7 +40,7 @@ class ExchangeItemsOperator:
         unselected_order = randomized_sample(unselected, context.k, context)
         pair_count = min(len(selected_order), len(unselected_order))
         if pair_count == 0:
-            return OperatorResult(m=0, candidate=None)
+            return OperatorResult(candidates=())
 
         base_feasible = knapsack_is_feasible(self._instance, base)
         working = list(base)

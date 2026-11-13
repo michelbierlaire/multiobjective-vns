@@ -92,6 +92,9 @@ def test_run_result_has_stable_empty_optional_collections() -> None:
 
     assert result.candidate_outcomes == ()
     assert result.run_log is None
+    assert result.pareto_snapshot_path is None
+    assert result.registry_view_path is None
+    assert result.pareto_view_path is None
     assert run_log.events == (event,)
     with pytest.raises((AttributeError, TypeError)):
         result.termination_reason = TerminationReason.INTERRUPTED  # type: ignore[misc]

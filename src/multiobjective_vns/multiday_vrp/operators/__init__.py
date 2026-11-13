@@ -12,6 +12,7 @@ from multiobjective_vns.multiday_vrp.operators.aggregation_contribution import (
     AggregationContributionOperator,
 )
 from multiobjective_vns.multiday_vrp.operators.catalog import (
+    VrpOperatorCatalog,
     VrpOperatorCatalogSettings,
     VrpOperatorId,
     VrpOperatorSpecId,
@@ -90,11 +91,39 @@ from multiobjective_vns.multiday_vrp.operators.schedule_features import (
 from multiobjective_vns.multiday_vrp.operators.service_coverage import (
     ServiceCoverageChangeOperator,
 )
+from multiobjective_vns.multiday_vrp.operators.service_window_cluster import (
+    WindowCompatiblePackageClusterReassignmentOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_common import (
+    select_window_first_candidates,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_ejection_chain import (
+    WindowPrioritizedEjectionChainConsolidationOperator,
+)
 from multiobjective_vns.multiday_vrp.operators.service_window_regret import (
     TimeWindowRegretBasedReinsertionOperator,
 )
 from multiobjective_vns.multiday_vrp.operators.service_window_repair import (
     TimeWindowFocusedDestroyRepairOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_route_cluster import (
+    SpatialTimeWindowRouteClusterRebuildOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_schedule import (
+    TimeWindowScheduleComplianceOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_structural import (
+    SlackGuidedOrOptRelocationOperator,
+    WindowFeasibleSwapStarOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.service_window_tour import (
+    ObjectiveGuidedBacktrackingTourConstructionOperator,
+    ObjectiveGuidedFeasibleDeliveryEdgeExchangeOperator,
+    ObjectiveGuidedTourRegretInsertionOperator,
+    TimeWindowFeasibleTourInsertionOperator,
+)
+from multiobjective_vns.multiday_vrp.operators.spatial_strip_sweep import (
+    DaganzoStripSweepRouteRebuildOperator,
 )
 from multiobjective_vns.multiday_vrp.operators.timing import TimingAdjustmentOperator
 from multiobjective_vns.multiday_vrp.operators.tool_capacity import (
@@ -122,11 +151,13 @@ from multiobjective_vns.multiday_vrp.operators.vehicle_route_split import (
 )
 
 __all__ = [
+    'VrpOperatorCatalog',
     'VrpPlanAssessor',
     'AggregationContributionOperator',
     'CapacityAwarePackageChainRelocationOperator',
     'VrpOperatorCatalogSettings',
     'VrpOperatorId',
+    'DaganzoStripSweepRouteRebuildOperator',
     'VrpOperatorSpecId',
     'ActivityRelocationMode',
     'ActivityRelocationOperator',
@@ -164,6 +195,17 @@ __all__ = [
     'TransferStepMode',
     'TransferStepOperator',
     'TimeWindowRegretBasedReinsertionOperator',
+    'TimeWindowScheduleComplianceOperator',
+    'ObjectiveGuidedTourRegretInsertionOperator',
+    'ObjectiveGuidedBacktrackingTourConstructionOperator',
+    'ObjectiveGuidedFeasibleDeliveryEdgeExchangeOperator',
+    'TimeWindowFeasibleTourInsertionOperator',
+    'SlackGuidedOrOptRelocationOperator',
+    'WindowFeasibleSwapStarOperator',
+    'WindowCompatiblePackageClusterReassignmentOperator',
+    'SpatialTimeWindowRouteClusterRebuildOperator',
+    'WindowPrioritizedEjectionChainConsolidationOperator',
+    'select_window_first_candidates',
     'VehicleEliminationDestroyRepairOperator',
     'VehicleRouteConsolidationOperator',
     'VehicleRouteSplitOperator',

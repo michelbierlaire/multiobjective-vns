@@ -11,11 +11,13 @@ from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
     CandidateOutcome,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.records.evaluation import (
     ApplicationEvaluation,
     EvaluationRecord,
+    ObjectiveBoundFinding,
 )
 from multiobjective_vns.records.failures import ComponentFailure, FailureKind
 from multiobjective_vns.records.status import (
@@ -27,16 +29,13 @@ from multiobjective_vns.records.status import (
 )
 
 
-def test_operator_result_requires_candidate_exactly_when_modified() -> None:
-    assert OperatorResult(m=0, candidate=None).candidate is None
-    assert OperatorResult(m=2, candidate=Candidate(solution=(1, 0))).m == 2
+def test_operator_result_requires_candidate_proposal_records() -> None:
+    proposal = CandidateProposal(Candidate(solution=(1, 0)), 2)
+    assert OperatorResult(candidates=(proposal,)).candidates == (proposal,)
+    assert OperatorResult(candidates=()).candidates == ()
 
-    with pytest.raises(ValueError):
-        OperatorResult(m=0, candidate=Candidate(solution=(1,)))
-    with pytest.raises(ValueError):
-        OperatorResult(m=1, candidate=None)
     with pytest.raises(TypeError):
-        OperatorResult(m=1, candidate='not a Candidate')  # type: ignore[arg-type]
+        OperatorResult(candidates=('not a proposal',))  # type: ignore[arg-type]
 
 
 def test_candidate_can_wrap_none_as_an_application_solution() -> None:
@@ -162,6 +161,7 @@ def test_candidate_outcomes_distinguish_initial_and_operator_fields() -> None:
         base_solution_id=SolutionId(1),
         k=1,
         m=1,
+        candidate_index=1,
         solution_id=SolutionId(2),
         assessment=ApplicationAssessment.VALID,
         disposition=SearchDisposition.ARCHIVED,
@@ -169,6 +169,43 @@ def test_candidate_outcomes_distinguish_initial_and_operator_fields() -> None:
 
     assert initial.choice_id is None
     assert operator.component_position is None
+
+    registered_composition = CandidateOutcome(
+        source=SubmissionSource.OPERATOR,
+        submitted_solution=(2, 3),
+        processing_status=ProcessingStatus.COMPLETED,
+        choice_id=ChoiceId.for_operator('repair-after-move'),
+        component_position=CompositionPosition.SECOND,
+        base_solution_id=SolutionId(1),
+        k=1,
+        m=1,
+        candidate_index=1,
+        solution_id=SolutionId(3),
+        assessment=ApplicationAssessment.VALID,
+        disposition=SearchDisposition.ARCHIVED,
+    )
+    assert registered_composition.component_position is CompositionPosition.SECOND
+
+
+def test_objective_bound_finding_is_a_stable_record() -> None:
+    finding = ObjectiveBoundFinding('cost', 12, 10)
+    assert finding.objective_id == 'cost'
+    assert finding.objective_value == 12
+    assert finding.upper_bound == 10
+
+    with pytest.raises(ValueError, match='candidate_index'):
+        CandidateOutcome(
+            source=SubmissionSource.OPERATOR,
+            submitted_solution=(0, 1),
+            processing_status=ProcessingStatus.COMPLETED,
+            choice_id=ChoiceId.for_operator('swap'),
+            base_solution_id=SolutionId(1),
+            k=1,
+            m=1,
+            solution_id=SolutionId(4),
+            assessment=ApplicationAssessment.VALID,
+            disposition=SearchDisposition.ARCHIVED,
+        )
 
     with pytest.raises(ValueError):
         CandidateOutcome(
@@ -180,6 +217,7 @@ def test_candidate_outcomes_distinguish_initial_and_operator_fields() -> None:
             base_solution_id=SolutionId(1),
             k=1,
             m=1,
+            candidate_index=1,
             solution_id=SolutionId(2),
             assessment=ApplicationAssessment.VALID,
             disposition=SearchDisposition.ARCHIVED,

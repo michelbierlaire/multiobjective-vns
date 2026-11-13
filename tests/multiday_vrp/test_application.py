@@ -16,6 +16,7 @@ from multiobjective_vns import (
     MultiobjectiveVNSConfig,
     TerminationReason,
 )
+from multiobjective_vns.candidate_batch import CandidateBatchAdapter
 from multiobjective_vns.multiday_vrp import (
     VrpApplication,
     VrpApplicationEvaluator,
@@ -29,10 +30,20 @@ from multiobjective_vns.multiday_vrp import (
     load_vrp_application,
     load_vrp_instance,
 )
+from multiobjective_vns.multiday_vrp.input_records import VrpFeatureProfile
+from multiobjective_vns.multiday_vrp.solution import (
+    ActivityRef,
+    ActivityStop,
+    RouteLeg,
+    VehicleDayRoute,
+)
 from multiobjective_vns.records.status import ApplicationAssessment
 from multiobjective_vns.registrations import OperatorGroup
 
-from .input_fixtures import write_minimal_vrp_bundle
+from .input_fixtures import (
+    write_minimal_vrp_bundle,
+    write_pickup_symmetry_bundle,
+)
 
 
 def _search(application: VrpApplication) -> MultiobjectiveVNS:
@@ -41,9 +52,11 @@ def _search(application: VrpApplication) -> MultiobjectiveVNS:
         solution_identity=application.solution_identity,
         objective_declaration=application.objective_declaration,
         operators=application.operators,
+        pre_registered_compositions=application.pre_registered_compositions,
         application_evaluator=application.application_evaluator,
         problem_instance_id=application.problem_instance_id,
         config=MultiobjectiveVNSConfig(
+            max_candidates_per_attempt=1,
             budget_limits=BudgetLimits(
                 max_wall_time_seconds=10.0,
                 max_candidate_attempts=1,
@@ -52,6 +65,7 @@ def _search(application: VrpApplication) -> MultiobjectiveVNS:
             random_seed=11,
         ),
         operator_groups=application.operator_groups,
+        promoted_composition_catalog_path=None,
     )
 
 
@@ -66,6 +80,7 @@ def test_application_loading_assembles_a_searchable_vrp(
     assert isinstance(application.application_evaluator, VrpApplicationEvaluator)
     assert application.problem_instance_id == application.instance.instance_id
     assert application.operators
+    assert isinstance(application.pre_registered_compositions, tuple)
     assert application.operator_groups == ()
 
     result = _search(application).run(
@@ -106,6 +121,72 @@ def test_builder_binds_registry_problem_identity_settings_and_groups(
         application.application_evaluator.configuration_id
     )
     assert all(item.max_neighborhood_size == 2 for item in application.operators)
+
+
+def test_application_binds_declared_pickup_symmetry_to_identity(
+    tmp_path: Path,
+) -> None:
+    application = load_vrp_application(write_pickup_symmetry_bundle(tmp_path))
+    first = _two_pickup_solution(('package-a', 'package-b'))
+    second = _two_pickup_solution(('package-b', 'package-a'))
+
+    assert application.solution_identity.equivalent(first, second)
+    adapter = application.operators[0].operator
+    assert isinstance(adapter, CandidateBatchAdapter)
+    assert adapter._equivalent(first, second)
+
+
+def _two_pickup_solution(package_ids: tuple[str, str]) -> VrpSolution:
+    stops = tuple(
+        ActivityStop(
+            ActivityRef('pickup', package_id),
+            frozenset(),
+            0.0,
+            0.0,
+            0.0,
+            False,
+        )
+        for package_id in package_ids
+    )
+    route = VehicleDayRoute(
+        'vehicle-1',
+        1,
+        'depot-1',
+        0.0,
+        'driver-1',
+        stops,
+        (RouteLeg(()), RouteLeg(()), RouteLeg(())),
+    )
+    return VrpSolution((route,), ())
+
+
+def test_builder_accepts_groups_that_include_a_pre_registered_composite(
+    tmp_path: Path,
+) -> None:
+    instance = load_vrp_instance(write_minimal_vrp_bundle(tmp_path))
+    instance = instance._replace(
+        feature_profile=VrpFeatureProfile(
+            frozenset(
+                {
+                    *instance.feature_profile.active_features,
+                    'restrictive_service_windows',
+                }
+            )
+        ),
+    )
+    catalog_application = build_vrp_application(instance)
+    composite = catalog_application.pre_registered_compositions[0]
+    group = OperatorGroup(
+        'window-structure',
+        frozenset((composite.operator_id, composite.first_operator_id)),
+    )
+
+    application = build_vrp_application(instance, operator_groups=(group,))
+
+    assert application.operator_groups == (group,)
+    assert composite.operator_id in {
+        item.operator_id for item in application.pre_registered_compositions
+    }
 
 
 def test_build_application_rejects_operator_groups_with_unknown_members(

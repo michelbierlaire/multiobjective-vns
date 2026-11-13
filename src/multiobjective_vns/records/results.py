@@ -6,6 +6,7 @@ Author: Michel Bierlaire, EPFL
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from multiobjective_vns.events import AlgorithmEvent
 from multiobjective_vns.identifiers import InvocationId
@@ -23,6 +24,9 @@ from multiobjective_vns.records.reporting import (
     ExecutiveSummary,
     FailureCount,
     ModificationCountFrequency,
+    ObjectiveBoundCount,
+    ObjectiveBoundEventFinding,
+    ObjectiveBoundReport,
     OperatorCatalogEntry,
     ParetoSolutionReport,
     PromotedCompositionReport,
@@ -36,6 +40,8 @@ from multiobjective_vns.records.state import (
     SearchState,
 )
 from multiobjective_vns.records.status import TerminationReason
+
+ViewerExportScope = Literal['registry', 'pareto']
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +73,8 @@ class LogArtifactPaths:
 
     event_log_path: Path | None
     summary_path: Path | None
+    registry_view_path: Path | None = None
+    pareto_view_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +85,8 @@ class LogFinalizationResult:
     event_log_path: Path
     summary_path: Path
     report_diagnostics: tuple[ReportDiagnostic, ...]
+    registry_view_path: Path | None = None
+    pareto_view_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +116,9 @@ class RunResult:
     checkpoint_reference: CheckpointReference | None = None
     event_log_path: Path | None = None
     summary_path: Path | None = None
+    pareto_snapshot_path: Path | None = None
+    registry_view_path: Path | None = None
+    pareto_view_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.candidate_outcomes, tuple) or any(
@@ -121,6 +134,14 @@ class RunResult:
             raise TypeError('diagnostics must be a tuple of ComponentFailure')
         if not isinstance(self.counters, InvocationCounters):
             raise TypeError('counters must be InvocationCounters')
+        if self.pareto_snapshot_path is not None and not isinstance(
+            self.pareto_snapshot_path, Path
+        ):
+            raise TypeError('pareto_snapshot_path must be a Path or None')
+        for name in ('registry_view_path', 'pareto_view_path'):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Path):
+                raise TypeError(f'{name} must be a Path or None')
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +158,8 @@ class MaintenanceResult:
     checkpoint_reference: CheckpointReference | None = None
     event_log_path: Path | None = None
     summary_path: Path | None = None
+    registry_view_path: Path | None = None
+    pareto_view_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.checkpoint, Checkpoint):
@@ -148,6 +171,10 @@ class MaintenanceResult:
             raise ValueError('invalid maintenance termination reason')
         if self.counters != InvocationCounters():
             raise ValueError('maintenance counters are zero')
+        for name in ('registry_view_path', 'pareto_view_path'):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Path):
+                raise TypeError(f'{name} must be a Path or None')
 
 
 __all__ = [
@@ -164,6 +191,9 @@ __all__ = [
     'LogFinalizationResult',
     'MaintenanceResult',
     'ModificationCountFrequency',
+    'ObjectiveBoundCount',
+    'ObjectiveBoundEventFinding',
+    'ObjectiveBoundReport',
     'OperatorCatalogEntry',
     'ParetoSolutionReport',
     'PromotedCompositionReport',
@@ -171,5 +201,6 @@ __all__ = [
     'ReportDiagnosticKind',
     'RunLog',
     'RunProvenance',
+    'ViewerExportScope',
     'RunResult',
 ]

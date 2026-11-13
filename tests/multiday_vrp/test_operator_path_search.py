@@ -19,6 +19,7 @@ from multiobjective_vns.multiday_vrp.input_records import (
     NodeRecord,
 )
 from multiobjective_vns.multiday_vrp.operators.path_search import (
+    build_path_search_index,
     rebuild_changed_routes,
     route_node_sequence,
     sample_loopless_paths,
@@ -91,6 +92,29 @@ def test_path_search_returns_all_bounded_loopless_directed_paths(
         len(set(_nodes_for_path(instance, 'a', path))) == len(path) + 1
         for path in paths
     )
+
+
+def test_path_search_index_preserves_sampled_paths(tmp_path: Path) -> None:
+    instance = _branching_instance(tmp_path)
+    limits = {'max_paths': 8, 'max_arc_expansion_steps': 100}
+
+    without_index = sample_loopless_paths(
+        instance,
+        'a',
+        'd',
+        random_source=_random_source(*((0.0,) * 100)),
+        **limits,
+    )
+    with_index = sample_loopless_paths(
+        instance,
+        'a',
+        'd',
+        random_source=_random_source(*((0.0,) * 100)),
+        path_search_index=build_path_search_index(instance),
+        **limits,
+    )
+
+    assert with_index == without_index
 
 
 def test_path_search_keeps_parallel_arcs_as_distinct_paths(tmp_path: Path) -> None:

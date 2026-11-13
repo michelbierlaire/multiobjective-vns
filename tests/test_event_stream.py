@@ -89,6 +89,10 @@ def test_event_journal_assigns_contiguous_sequence_and_commit_numbers() -> None:
     assert logger.batches == [invocation_events, commit_events]
 
 
+def test_event_draft_uses_the_architecture_schema_version() -> None:
+    assert draft().schema_version == 4
+
+
 def test_choice_category_selection_is_an_invocation_event() -> None:
     logger = RecordingLogger()
     journal = EventJournal(InvocationId(UUID(int=5)), cast(RunLogger, logger))

@@ -17,6 +17,7 @@ from multiobjective_vns.random_source import RandomSource
 from multiobjective_vns.records.candidates import (
     Candidate,
     CandidateContext,
+    CandidateProposal,
     OperatorResult,
 )
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
@@ -161,14 +162,15 @@ def operator_result(
     if count == 0:
         if solution is not None:
             raise ValueError('a zero modification count requires no candidate')
-        return OperatorResult(m=0, candidate=None)
+        return OperatorResult(candidates=())
     if solution is None:
         raise ValueError('a positive modification count requires a candidate')
     if not isinstance(solution, VrpSolution):
         raise TypeError('VRP Operator candidates must be VrpSolution values')
     return OperatorResult(
-        m=count,
-        candidate=Candidate(solution=solution, metadata=metadata),
+        candidates=(
+            CandidateProposal(Candidate(solution=solution, metadata=metadata), count),
+        )
     )
 
 

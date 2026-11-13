@@ -7,7 +7,12 @@ Author: Michel Bierlaire, EPFL
 from multiobjective_vns.records.failures import ComponentFailure, FailureKind
 from multiobjective_vns.records.results import ExecutionResult
 from multiobjective_vns.records.state import Checkpoint, CheckpointReference
-from multiobjective_vns.services import CheckpointStore, Executor, SolutionFormatter
+from multiobjective_vns.services import (
+    CheckpointStore,
+    Executor,
+    RunLogger,
+    SolutionFormatter,
+)
 
 
 class FakeServices:
@@ -48,3 +53,4 @@ def test_service_interfaces_are_structural() -> None:
     assert result.failure is not None
     assert store.save(None) == 'checkpoint-ref'  # type: ignore[arg-type]
     assert formatter.describe(('solution',)) == "('solution',)"
+    assert callable(RunLogger.publish_view)

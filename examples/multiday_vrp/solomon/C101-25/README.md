@@ -13,10 +13,11 @@ The benchmark convention used for comparison is Euclidean arc distance
 truncated to one decimal, with total distance reported to one decimal. Solomon
 time windows are hard constraints in the benchmark. The package-format input
 bundle in [`input/`](input/README.md) records how C101-25 is translated to the
-VRP model, including its soft-penalty treatment of time windows and the
-service-duration adjustment needed to preserve the Solomon latest-start
-convention. For direct benchmark comparison, use plans with zero window and
-availability penalties.
+VRP model, including its separate objective for soft time-window and
+availability violations and the service-duration adjustment needed to
+preserve the Solomon latest-start convention. The objective vector also
+includes planned waiting time. For direct benchmark comparison, select plans
+with a zero violation-objective value and compare vehicle count and distance.
 
 The bundle manifest is [`input/instance.toml`](input/instance.toml). Its
 ScenarioBank is in [`input/scenario-bank/`](input/scenario-bank/).

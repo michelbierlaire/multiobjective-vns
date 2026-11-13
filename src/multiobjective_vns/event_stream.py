@@ -79,7 +79,7 @@ class EventDraft:
     event_type: EventType
     phase: EventPhase
     data: EventPayload
-    schema_version: EventSchemaVersion = 1
+    schema_version: EventSchemaVersion = 4
     source_id: ComponentId | None = None
     choice_id: ChoiceId | None = None
     solution_id: SolutionId | None = None

@@ -54,6 +54,7 @@ class CandidateProcessor:
         k: int | None = None,
         m: int | None = None,
         component_position: CompositionPosition | None = None,
+        candidate_index: int | None = None,
     ) -> CandidateProcessingResult:
         """Prepare one initial or Operator-produced candidate submission.
 
@@ -65,6 +66,7 @@ class CandidateProcessor:
         :param k: Requested neighborhood size for an Operator submission.
         :param m: Actual modification count for an Operator submission.
         :param component_position: Position of the final Operator in a composition.
+        :param candidate_index: 1-based position in the returned candidate list.
         :returns: Candidate result and staged registry state.
         """
         resolution = registry.resolve(candidate.solution)
@@ -82,6 +84,7 @@ class CandidateProcessor:
                 k=k,
                 m=m,
                 component_position=component_position,
+                candidate_index=candidate_index,
             )
             return CandidateProcessingResult(
                 registry, outcome, False, identity_failures
@@ -101,6 +104,7 @@ class CandidateProcessor:
                 k=k,
                 m=m,
                 component_position=component_position,
+                candidate_index=candidate_index,
                 solution_id=existing.solution_id,
                 assessment=stored.assessment,
                 disposition=SearchDisposition.DUPLICATE,
@@ -139,6 +143,7 @@ class CandidateProcessor:
                 k=k,
                 m=m,
                 component_position=component_position,
+                candidate_index=candidate_index,
             )
             return CandidateProcessingResult(registry, outcome, True, (failure,))
 
@@ -165,6 +170,7 @@ class CandidateProcessor:
             k=k,
             m=m,
             component_position=component_position,
+            candidate_index=candidate_index,
             solution_id=solution_record.solution_id,
             assessment=assessment,
             disposition=disposition,
@@ -183,6 +189,7 @@ class CandidateProcessor:
         k: int | None,
         m: int | None,
         component_position: CompositionPosition | None,
+        candidate_index: int | None,
         solution_id: SolutionId | None = None,
         assessment: ApplicationAssessment | None = None,
         disposition: SearchDisposition | None = None,
@@ -201,6 +208,7 @@ class CandidateProcessor:
             assessment=assessment,
             disposition=disposition,
             metadata=candidate.metadata,
+            candidate_index=candidate_index,
         )
 
 

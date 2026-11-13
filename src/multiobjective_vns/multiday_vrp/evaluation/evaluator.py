@@ -147,6 +147,8 @@ class VrpApplicationEvaluator(
 
         traces: list[VrpScenarioEvaluation] = []
         rule_measures_by_scenario: list[tuple[RuleMeasure, ...]] = []
+        storage_hard_failure: HardFeasibilityFinding | None = None
+        resource_findings_list: list[ResourceFinding] = []
         for scenario in self._instance.scenario_bank.scenarios:
             trace = simulate_scenario(
                 self._instance,
@@ -157,6 +159,19 @@ class VrpApplicationEvaluator(
             traces.append(trace)
             hard_reason = self._scenario_hard_failure(trace, solution)
             if hard_reason is not None:
+                if hard_reason.startswith('transfer facility ') and (
+                    'exceeds storage capacity' in hard_reason
+                ):
+                    resource_findings_list.extend(
+                        self._transfer_storage_resource_findings(solution, trace)
+                    )
+                    if storage_hard_failure is None:
+                        storage_hard_failure = HardFeasibilityFinding(
+                            'scenario_constraint', hard_reason, trace.scenario_id
+                        )
+                    continue
+                if storage_hard_failure is not None:
+                    continue
                 return self._infeasible(
                     objectives,
                     tuple(traces),
@@ -165,6 +180,8 @@ class VrpApplicationEvaluator(
                         'scenario_constraint', hard_reason, trace.scenario_id
                     ),
                 )
+            if storage_hard_failure is not None:
+                continue
             measures = (
                 *assess_simple_rules(self._instance, solution, trace),
                 *self._hos_rule_measures(solution, trace),
@@ -201,25 +218,39 @@ class VrpApplicationEvaluator(
                         ),
                     )
 
+        if storage_hard_failure is not None:
+            return self._infeasible(
+                objectives,
+                tuple(traces),
+                tuple(resource_findings_list),
+                storage_hard_failure,
+            )
+
         window_guidance: dict[
             tuple[int, int, int], tuple[WindowScenarioAssessment, ...]
         ] = {}
         raw_findings: dict[
             tuple[int, int], dict[ViolationCategory, list[tuple[str | None, float]]]
         ] = {}
-        resource_findings_list: list[ResourceFinding] = []
         for objective_index, objective in enumerate(
             self._instance.objective_data.objectives
         ):
             for scenario_index, (scenario, trace) in enumerate(
                 zip(self._instance.scenario_bank.scenarios, traces, strict=True)
             ):
+                assigned_categories = self._objective_categories(objective.objective_id)
                 category_values: dict[
                     ViolationCategory, list[tuple[str | None, float]]
-                ] = {category: [] for category in self._active_categories()}
-                assessments = self._window_assessments(
-                    objective, scenario, trace, category_values
-                )
+                ] = {category: [] for category in assigned_categories}
+                if (
+                    objective.objective_id
+                    == self._instance.time_window_violation_objective_id
+                ):
+                    assessments = self._window_assessments(
+                        objective, scenario, trace, category_values
+                    )
+                else:
+                    assessments = {}
                 for (route_index, stop_index), values in assessments.items():
                     key = (scenario_index, route_index, stop_index)
                     window_guidance[key] = window_guidance.get(key, ()) + values
@@ -231,6 +262,7 @@ class VrpApplicationEvaluator(
                     solution,
                     rule_measures_by_scenario[scenario_index],
                     resource_findings_list,
+                    frozenset(assigned_categories),
                 )
                 raw_findings[(objective_index, scenario_index)] = category_values
 
@@ -261,7 +293,7 @@ class VrpApplicationEvaluator(
                             ].get(category, [])
                         ),
                     )
-                    for category in self._active_categories()
+                    for category in self._objective_categories(objective.objective_id)
                 )
                 penalty = self._penalty_aggregate(
                     objective, category_inputs, scenario.scenario_id

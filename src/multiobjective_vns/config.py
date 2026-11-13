@@ -20,6 +20,13 @@ def _positive_real(value: FiniteReal, *, name: str) -> float:
     return normalized
 
 
+def _nonnegative_real(value: FiniteReal, *, name: str) -> float:
+    normalized = finite_real(value, name=name)
+    if normalized < 0:
+        raise ValueError(f'{name} must be nonnegative')
+    return normalized
+
+
 def _probability(value: FiniteReal, *, name: str) -> float:
     normalized = finite_real(value, name=name)
     if not 0.0 <= normalized <= 1.0:
@@ -57,6 +64,8 @@ class BudgetLimits:
 class MultiobjectiveVNSConfig:
     """Built-in search settings shared by all invocations of a search.
 
+    :param max_candidates_per_attempt: Required maximum number of ordered
+        candidates requested from a choice in one attempt.
     :param budget_limits: Per-invocation hard limits.
     :param max_neighborhood_size: Optional run-level cap for Operator sizes.
     :param feasibility_mode: ``strict`` or ``relaxed`` search mode.
@@ -65,38 +74,29 @@ class MultiobjectiveVNSConfig:
     :param composition_selection_probability: Probability of selecting the
         composition category when both categories are available.
     :param feedback_selection_mode: Built-in choice-selection strategy.
-    :param feedback_epsilon: Strictly positive minimum choice probability.
-    :param feedback_prior_attempts: Positive prior sample weight.
-    :param feedback_admission_reward_floor: Positive reward for a new Pareto
-        admission before stagnation adjustment.
-    :param feedback_stagnation_scale: Stagnation count where the reward reaches
-        halfway between its floor and one.
-    :param feedback_recent_attempt_window: Number of committed attempts kept
-        for feedback selection.
-    :param standalone_prior_reward: Prior reward for standalone choices.
-    :param grouped_composition_prior_reward: Prior reward for grouped pairs.
-    :param ungrouped_composition_prior_reward: Prior reward for ungrouped pairs.
+    :param feedback_epsilon: Strictly positive per-choice probability floor.
+    :param feedback_mu: Nonnegative softmax selection intensity.
     :param random_seed: Seed for the package-provided random source.
     """
 
+    max_candidates_per_attempt: int
     budget_limits: BudgetLimits = BudgetLimits()
     max_neighborhood_size: int | None = None
     feasibility_mode: FeasibilityMode = 'strict'
     max_infeasible_steps: int | None = None
     exhaustive_identity_validation: bool = False
-    composition_selection_probability: FiniteReal = 0.20
+    composition_selection_probability: FiniteReal = 0.50
     feedback_selection_mode: FeedbackSelectionMode = 'performance_matching'
-    feedback_epsilon: FiniteReal = 0.10
-    feedback_prior_attempts: FiniteReal = 5.0
-    feedback_admission_reward_floor: FiniteReal = 0.50
-    feedback_stagnation_scale: int = 50
-    feedback_recent_attempt_window: int = 500
-    standalone_prior_reward: FiniteReal = 0.50
-    grouped_composition_prior_reward: FiniteReal = 0.90
-    ungrouped_composition_prior_reward: FiniteReal = 0.10
+    feedback_epsilon: FiniteReal = 1e-6
+    feedback_mu: FiniteReal = 1.0
     random_seed: int = 0
 
     def __post_init__(self) -> None:
+        require_integer(
+            self.max_candidates_per_attempt,
+            name='max_candidates_per_attempt',
+            minimum=1,
+        )
         if not isinstance(self.budget_limits, BudgetLimits):
             raise TypeError('budget_limits must be a BudgetLimits record')
         if self.max_neighborhood_size is not None:
@@ -131,37 +131,12 @@ class MultiobjectiveVNSConfig:
             raise ValueError('unsupported feedback_selection_mode')
 
         epsilon = _positive_real(self.feedback_epsilon, name='feedback_epsilon')
-        if epsilon > 1.0:
-            raise ValueError('feedback_epsilon must be in (0, 1]')
+        if epsilon >= 1.0:
+            raise ValueError('feedback_epsilon must be in (0, 1)')
         object.__setattr__(self, 'feedback_epsilon', epsilon)
         object.__setattr__(
             self,
-            'feedback_prior_attempts',
-            _positive_real(
-                self.feedback_prior_attempts, name='feedback_prior_attempts'
-            ),
+            'feedback_mu',
+            _nonnegative_real(self.feedback_mu, name='feedback_mu'),
         )
-        reward_floor = _positive_real(
-            self.feedback_admission_reward_floor,
-            name='feedback_admission_reward_floor',
-        )
-        if reward_floor > 1.0:
-            raise ValueError('feedback_admission_reward_floor must be in (0, 1]')
-        object.__setattr__(self, 'feedback_admission_reward_floor', reward_floor)
-        require_integer(
-            self.feedback_stagnation_scale,
-            name='feedback_stagnation_scale',
-            minimum=1,
-        )
-        require_integer(
-            self.feedback_recent_attempt_window,
-            name='feedback_recent_attempt_window',
-            minimum=1,
-        )
-        for name in (
-            'standalone_prior_reward',
-            'grouped_composition_prior_reward',
-            'ungrouped_composition_prior_reward',
-        ):
-            object.__setattr__(self, name, _probability(getattr(self, name), name=name))
         require_integer(self.random_seed, name='random_seed')

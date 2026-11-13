@@ -9,10 +9,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
+from multiobjective_vns.multiday_vrp.evaluation.objectives import (
+    VrpObjectiveFunction,
+)
 from multiobjective_vns.multiday_vrp.input_records import (
     InterventionRecord,
     LoadedVrpInstance,
@@ -140,6 +143,15 @@ def test_consolidation_removes_source_route_and_preserves_all_services(
     tmp_path: Path,
 ) -> None:
     instance, objectives, base = _service_plan(tmp_path)
+    source_route = base.routes[0]
+    source_stops = (
+        replace(source_route.stops[0], tour_end=True),
+        *source_route.stops[1:],
+    )
+    base = replace(
+        base,
+        routes=(replace(source_route, stops=source_stops), base.routes[1]),
+    )
     operator = VehicleRouteConsolidationOperator(
         instance,
         objectives,
@@ -152,9 +164,9 @@ def test_consolidation_removes_source_route_and_preserves_all_services(
 
     result = operator.call(_context(base, ensure_feasible=True))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert len(candidate.routes) == 1
     assert candidate.routes[0].vehicle_id == 'vehicle-2'
     assert {
@@ -162,30 +174,63 @@ def test_consolidation_removes_source_route_and_preserves_all_services(
         for stop in candidate.routes[0].stops
         if isinstance(stop, ActivityStop)
     } == {'job-1', 'job-2', 'job-3', 'job-4'}
+    assert not any(stop.tour_end for stop in candidate.routes[0].stops)
     _assert_route_legs_connect(instance, candidate)
 
 
-def test_targeted_consolidation_ranks_alternatives_across_route_pairs(
+def test_fixed_vehicle_count_blocks_one_day_consolidation(
     tmp_path: Path,
 ) -> None:
     instance, objectives, base = _service_plan(tmp_path)
+    instance = instance._replace(
+        settings=instance.settings._replace(exact_active_vehicle_count=2)
+    )
+    operator = VehicleRouteConsolidationOperator(
+        instance,
+        objectives,
+        cast(VrpPlanAssessor, _always_assess),
+        max_neighborhood_size=1,
+        max_candidate_alternatives=8,
+        max_paths_per_leg=4,
+        max_arc_expansion_steps=100,
+    )
 
-    def prefer_vehicle_one(
+    result = operator.call(_context(base))
+
+    assert result.candidates == ()
+
+
+def test_targeted_consolidation_uses_secondary_objectives_across_route_pairs(
+    tmp_path: Path,
+) -> None:
+    instance, objectives, base = _service_plan(tmp_path)
+    objectives = ObjectiveDeclaration(
+        (
+            *objectives.objectives,
+            VrpObjectiveFunction(
+                'distance-tie-break',
+                'test-distance-objective',
+                'test-distance-objective-v1',
+            ),
+        )
+    )
+
+    def prefer_vehicle_one_after_target_tie(
         _instance: LoadedVrpInstance,
         declaration: ObjectiveDeclaration,
         solution: VrpSolution,
     ) -> ApplicationEvaluation:
-        value = 0.0 if solution.routes[0].vehicle_id == 'vehicle-1' else 10.0
+        distance = 0.0 if solution.routes[0].vehicle_id == 'vehicle-1' else 10.0
         return ApplicationEvaluation(
             True,
             True,
-            (value,) + tuple(0.0 for _ in declaration.objectives[1:]),
+            (0.0, distance) + tuple(0.0 for _ in declaration.objectives[2:]),
         )
 
     operator = VehicleRouteConsolidationOperator(
         instance,
         objectives,
-        cast(VrpPlanAssessor, prefer_vehicle_one),
+        cast(VrpPlanAssessor, prefer_vehicle_one_after_target_tie),
         max_neighborhood_size=1,
         max_candidate_alternatives=8,
         max_paths_per_leg=4,
@@ -195,14 +240,16 @@ def test_targeted_consolidation_ranks_alternatives_across_route_pairs(
 
     result = operator.call(_context(base))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert tuple(route.vehicle_id for route in candidate.routes) == ('vehicle-1',)
 
 
+@pytest.mark.parametrize('insertion_strategy', ('best', 'regret'))
 def test_consolidation_places_depot_pickups_before_deliveries(
     tmp_path: Path,
+    insertion_strategy: Literal['best', 'regret'],
 ) -> None:
     instance, objectives, base = _service_plan(tmp_path)
     packages = (
@@ -256,12 +303,13 @@ def test_consolidation_places_depot_pickups_before_deliveries(
         max_candidate_alternatives=8,
         max_paths_per_leg=4,
         max_arc_expansion_steps=100,
+        insertion_strategy=insertion_strategy,
     )
 
     result = operator.call(_context(base))
 
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert tuple(
         stop.activity_ref.kind
         for stop in candidate.routes[0].stops
@@ -301,9 +349,9 @@ def test_split_adds_sorted_vehicle_route_and_preserves_services(
 
     result = operator.call(_context(base, k=2, ensure_feasible=True))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     assert tuple(route.vehicle_id for route in candidate.routes) == (
         'vehicle-1',
         'vehicle-2',
@@ -358,9 +406,9 @@ def test_split_keeps_complete_package_chain_together(tmp_path: Path) -> None:
 
     result = operator.call(_context(base))
 
-    assert result.m == 1
-    assert result.candidate is not None
-    candidate = cast(VrpSolution, result.candidate.solution)
+    assert result.candidates[0].m == 1
+    assert result.candidates
+    candidate = cast(VrpSolution, result.candidates[0].candidate.solution)
     package_routes = {
         route.vehicle_id
         for route in candidate.routes
@@ -388,8 +436,39 @@ def test_split_returns_no_candidate_when_all_vehicles_are_active(
 
     result = operator.call(_context(base))
 
-    assert result.m == 0
-    assert result.candidate is None
+    assert result.candidates == ()
+    assert not result.candidates
+
+
+def test_fixed_vehicle_count_blocks_split_to_new_vehicle(tmp_path: Path) -> None:
+    instance, objectives, base = _service_plan(tmp_path)
+    fleet = instance.fleet_data
+    instance = instance._replace(
+        settings=instance.settings._replace(exact_active_vehicle_count=2),
+        fleet_data=fleet._replace(
+            vehicles=(
+                *fleet.vehicles,
+                VehicleRecord('vehicle-3', 100.0, 1, 'depot-a', 1),
+            ),
+            vehicle_overnight_depots=(
+                *fleet.vehicle_overnight_depots,
+                VehicleOvernightDepotRecord('vehicle-3', 'depot-a'),
+            ),
+        ),
+    )
+    operator = VehicleRouteSplitOperator(
+        instance,
+        objectives,
+        cast(VrpPlanAssessor, _always_assess),
+        max_neighborhood_size=1,
+        max_candidate_alternatives=8,
+        max_paths_per_leg=4,
+        max_arc_expansion_steps=100,
+    )
+
+    result = operator.call(_context(base))
+
+    assert result.candidates == ()
 
 
 def test_split_keeps_package_chain_spanning_routes_together(
@@ -440,8 +519,8 @@ def test_split_keeps_package_chain_spanning_routes_together(
 
     result = operator.call(_context(base))
 
-    assert result.m == 0
-    assert result.candidate is None
+    assert result.candidates == ()
+    assert not result.candidates
 
 
 def test_route_assignment_operators_enforce_registered_size_limit(

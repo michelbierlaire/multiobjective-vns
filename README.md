@@ -9,6 +9,20 @@ The multi-day VRP application includes a runnable example in
 [`examples/multiday_vrp/minimal/`](examples/multiday_vrp/minimal/README.md).
 Run it from that directory with `uv run python run.py`.
 
+## Pareto viewer
+
+Launch the desktop viewer with:
+
+```console
+uv run multiobjective-vns-view [path-to-view-export.json]
+```
+
+Without a path, it looks for the current invocation's viewer export in the
+current directory and opens a file chooser when it cannot select one
+automatically. The viewer refreshes while the algorithm publishes newer
+exports. The selected Python installation must include working Tk/Tcl support
+and run in a desktop session.
+
 ## Development setup
 
 Use Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). Install the

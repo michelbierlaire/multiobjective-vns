@@ -36,6 +36,7 @@ from multiobjective_vns.multiday_vrp.input_records import (
 )
 from multiobjective_vns.multiday_vrp.solution import (
     ActivityStop,
+    DepotOnlyStop,
     RouteLeg,
     VehicleDayRoute,
     VrpSolution,
@@ -43,6 +44,40 @@ from multiobjective_vns.multiday_vrp.solution import (
 
 from .input_fixtures import write_minimal_vrp_bundle
 from .test_evaluation_capacity import _package_instance, _package_plan
+
+
+def test_total_waiting_time_counts_all_stop_wait_fields_once(tmp_path: Path) -> None:
+    instance = _package_instance(tmp_path, package_loads=(1.0,), vehicle_capacity=2.0)
+    objectives = instance.objective_data.objectives
+    instance = instance._replace(
+        objective_data=instance.objective_data._replace(
+            objectives=(
+                objectives[0]._replace(base_measure_id='total_waiting_time'),
+                *objectives[1:],
+            )
+        )
+    )
+    solution = _package_plan(('pickup', 'package-1'), ('delivery', 'package-1'))
+    pickup, delivery = solution.routes[0].stops
+    assert isinstance(pickup, ActivityStop)
+    assert isinstance(delivery, ActivityStop)
+    depot_wait = DepotOnlyStop('node-a', 0.0, 7.0, 2.0, False)
+    updated_route = replace(
+        solution.routes[0],
+        stops=(
+            depot_wait,
+            replace(pickup, pre_service_wait=2.0, wait=3.0),
+            replace(delivery, pre_service_wait=4.0, wait=5.0),
+        ),
+        legs=(RouteLeg(()), RouteLeg(()), RouteLeg(()), RouteLeg(())),
+    )
+    solution = VrpSolution((updated_route,), ())
+
+    result = VrpApplicationEvaluator(instance).evaluate(
+        solution, build_vrp_objective_declaration(instance)
+    )
+
+    assert result.objective_values == (21.0, 0.0)
 
 
 def test_window_penalty_uses_service_start_and_finish_with_planned_wait(
@@ -88,8 +123,8 @@ def test_window_penalty_uses_service_start_and_finish_with_planned_wait(
         late_solution, build_vrp_objective_declaration(instance)
     )
 
-    assert on_time.objective_values == (1.0,)
-    assert late.objective_values == (6.0,)
+    assert on_time.objective_values == (1.0, 0.0)
+    assert late.objective_values == (1.0, 5.0)
     analysis = cast(VrpOperatorAnalysis, on_time.analysis)
     assessment = analysis.scenario_evaluations[0].vehicle_days[0].stops[0]
     assert assessment.window_assessments_by_objective[0].early_violation == 0.0
@@ -120,7 +155,7 @@ def test_optional_omissions_add_the_declared_per_objective_cost(
 
     assert result.representation_valid is True
     assert result.feasible is True
-    assert result.objective_values == (7.0,)
+    assert result.objective_values == (7.0, 0.0)
 
 
 def test_event_count_observes_node_visits_and_arc_traversals(tmp_path: Path) -> None:
@@ -229,17 +264,19 @@ def test_registered_penalty_aggregation_receives_scaled_category_findings(
     tmp_path: Path,
 ) -> None:
     instance = _package_instance(tmp_path, package_loads=(1.0,), vehicle_capacity=2.0)
-    objective = instance.objective_data.objectives[0]._replace(
+    objective = instance.objective_data.objectives[1]._replace(
         penalty_aggregation=AggregationSpec(
             'custom_penalty_sum', None, FrozenTomlTable({})
         ),
         penalty_scales={
-            **instance.objective_data.objectives[0].penalty_scales,
+            **instance.objective_data.objectives[1].penalty_scales,
             'early_window': 2.0,
         },
     )
     instance = instance._replace(
-        objective_data=instance.objective_data._replace(objectives=(objective,)),
+        objective_data=instance.objective_data._replace(
+            objectives=(instance.objective_data.objectives[0], objective)
+        ),
         package_data=instance.package_data._replace(
             package_time_windows=(
                 PackageTimeWindowRecord('package-1', 'pickup', 1, 10.0, 20.0),
@@ -278,7 +315,7 @@ def test_registered_penalty_aggregation_receives_scaled_category_findings(
         solution, build_vrp_objective_declaration(instance)
     )
 
-    assert result.objective_values == (21.0,)
+    assert result.objective_values == (1.0, 20.0)
     assert len(seen) == 1
     early_window = next(
         item for item in seen[0].category_values if item.category_id == 'early_window'

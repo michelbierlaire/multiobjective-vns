@@ -21,6 +21,7 @@ from multiobjective_vns.identifiers import (
     ChoiceId,
     ComponentId,
     InvocationId,
+    ProblemInstanceId,
     SolutionId,
     identifier_text,
 )
@@ -35,6 +36,8 @@ from multiobjective_vns.records.reporting import (
     ExecutiveSummary,
     FailureCount,
     ModificationCountFrequency,
+    ObjectiveBoundCount,
+    ObjectiveBoundEventFinding,
     ParetoSolutionReport,
     PromotedCompositionReport,
     ReportDiagnostic,
@@ -45,10 +48,16 @@ from multiobjective_vns.records.results import LogFinalizationResult, RunLog
 from multiobjective_vns.records.state import SearchState
 from multiobjective_vns.records.status import (
     ApplicationAssessment,
+    ArchiveStatus,
     SearchDisposition,
     TerminationReason,
 )
 from multiobjective_vns.services import SolutionFormatter
+from multiobjective_vns.viewer_exports import (
+    ViewerExportScope,
+    build_view_export,
+    write_view_export,
+)
 
 
 def _json_value(value: object) -> object:
@@ -95,7 +104,9 @@ class DefaultRunLogger:
         self._invocation_id: InvocationId | None = None
         self._event_path: Path | None = None
         self._summary_path: Path | None = None
-        self._events: tuple[AlgorithmEvent, ...] = ()
+        self._registry_view_path: Path | None = None
+        self._pareto_view_path: Path | None = None
+        self._view_diagnostics: dict[str, tuple[ReportDiagnostic, ...]] = {}
 
     def begin(self, invocation_id: InvocationId, log_directory: Path) -> None:
         """Reserve unique event and summary files for one invocation."""
@@ -115,15 +126,52 @@ class DefaultRunLogger:
         self._invocation_id = invocation_id
         self._event_path = event_path
         self._summary_path = summary_path
-        self._events = ()
+        self._registry_view_path = None
+        self._pareto_view_path = None
+        self._view_diagnostics = {}
+
+    def publish_view(
+        self,
+        invocation_id: InvocationId,
+        problem_instance_id: ProblemInstanceId,
+        committed_state: SearchState,
+        commit_sequence: int,
+        objective_declaration: ObjectiveDeclaration,
+        scope: ViewerExportScope,
+        is_final: bool,
+        solution_formatter: SolutionFormatter | None,
+    ) -> Path:
+        """Build and atomically publish one committed viewer scope."""
+        if self._event_path is None or self._invocation_id is None:
+            raise RuntimeError('begin() must run before publish_view()')
+        if invocation_id != self._invocation_id:
+            raise ValueError('viewer export invocation differs from logger invocation')
+        document, diagnostics = build_view_export(
+            invocation_id=invocation_id,
+            problem_instance_id=problem_instance_id,
+            committed_state=committed_state,
+            commit_sequence=commit_sequence,
+            objective_declaration=objective_declaration,
+            scope=scope,
+            is_final=is_final,
+            solution_formatter=solution_formatter,
+        )
+        filename = f'{invocation_id.to_log_text()}.{scope}-view.json'
+        path = self._event_path.parent / filename
+        write_view_export(path, document)
+        if scope == 'registry':
+            self._registry_view_path = path
+        else:
+            self._pareto_view_path = path
+        self._view_diagnostics[scope] = diagnostics
+        return path
 
     def append(self, events: tuple[AlgorithmEvent, ...]) -> None:
-        """Atomically replace the structured event file with the appended log."""
+        """Append one complete event batch and roll back failed writes."""
         if self._event_path is None:
             raise RuntimeError('begin() must run before append()')
         if not events or any(not isinstance(event, AlgorithmEvent) for event in events):
             raise TypeError('events must be a nonempty tuple of AlgorithmEvent values')
-        next_events = (*self._events, *events)
         lines = '\n'.join(
             json.dumps(
                 self._event_record(event),
@@ -131,10 +179,9 @@ class DefaultRunLogger:
                 allow_nan=False,
                 separators=(',', ':'),
             )
-            for event in next_events
+            for event in events
         )
-        self._atomic_write(self._event_path, f'{lines}\n')
-        self._events = next_events
+        self._append_batch(self._event_path, f'{lines}\n'.encode('utf-8'))
 
     def finalize(
         self,
@@ -185,6 +232,51 @@ class DefaultRunLogger:
             if event.event_type == 'candidate_processed'
             and event.data.get('disposition') is not None
         )
+        diagnostics: list[ReportDiagnostic] = [
+            diagnostic
+            for scope_diagnostics in self._view_diagnostics.values()
+            for diagnostic in scope_diagnostics
+        ]
+        bound_counts: Counter[object] = Counter()
+        objective_by_id = {
+            objective.objective_id: objective
+            for objective in objective_declaration.objectives
+        }
+        for bound in provenance.objective_bounds:
+            if bound.formatted_upper_bound == '[unformatted]':
+                objective = objective_by_id[bound.objective_id]
+                diagnostics.append(
+                    ReportDiagnostic(
+                        ReportDiagnosticKind.OBJECTIVE_BOUND_FORMAT_FAILURE,
+                        objective.component_id,
+                        None,
+                        bound.objective_id,
+                        'ObjectiveFunction.format failed for a configured upper bound',
+                    )
+                )
+        for event in run_log.events:
+            if event.event_type != 'candidate_processed':
+                continue
+            findings = cast(
+                tuple[ObjectiveBoundEventFinding, ...],
+                event.data.get('objective_bound_findings', ()),
+            )
+            for finding in findings:
+                bound_counts[finding.objective_id] += 1
+                if (
+                    finding.objective_value == '[unformatted]'
+                    or finding.upper_bound == '[unformatted]'
+                ):
+                    objective = objective_by_id[finding.objective_id]
+                    diagnostics.append(
+                        ReportDiagnostic(
+                            ReportDiagnosticKind.OBJECTIVE_BOUND_FORMAT_FAILURE,
+                            objective.component_id,
+                            event.solution_id,
+                            finding.objective_id,
+                            'ObjectiveFunction.format failed for an objective-bound finding',
+                        )
+                    )
         failures: Counter[tuple[ComponentId, FailureKind, str]] = Counter()
         for event in run_log.events:
             if event.event_type == 'component_failure':
@@ -193,7 +285,6 @@ class DefaultRunLogger:
                     failure = failure_value
                     failures[(failure.source, failure.kind, failure.phase)] += 1
         reports: list[ParetoSolutionReport] = []
-        diagnostics: list[ReportDiagnostic] = []
         for record in final_state.pareto_solutions():
             evaluation = record.evaluation_record.application_evaluation
             if evaluation is None or evaluation.objective_values is None:
@@ -223,6 +314,10 @@ class DefaultRunLogger:
                 )
             )
         excursions = self._excursion_frequencies(run_log)
+        objective_vector_duplicate_count = sum(
+            record.archive_status is ArchiveStatus.OBJECTIVE_VECTOR_DUPLICATE
+            for record in final_state.visited_solutions()
+        )
         summary = ExecutiveSummary(
             invocation_id=run_log.invocation_id,
             invocation_kind=invocation_kind,
@@ -253,27 +348,25 @@ class DefaultRunLogger:
                 configuration.composition_selection_probability
             ),
             feedback_selection_mode=feedback_selection_mode,
-        )
-        readable = self._render_summary(summary, objective_declaration, diagnostics)
-        self._atomic_write(self._summary_path, readable)
-        self._atomic_write(
-            self._event_path,
-            '\n'.join(
-                json.dumps(
-                    self._event_record(event),
-                    ensure_ascii=True,
-                    allow_nan=False,
-                    separators=(',', ':'),
+            objective_vector_duplicate_count=objective_vector_duplicate_count,
+            objective_bound_counts=tuple(
+                ObjectiveBoundCount(
+                    bound.objective_id, bound_counts[bound.objective_id]
                 )
-                for event in run_log.events
-            )
-            + '\n',
+                for bound in provenance.objective_bounds
+            ),
         )
+        diagnostics = list(dict.fromkeys(diagnostics))
+        readable = self._render_summary(summary, objective_declaration, diagnostics)
+        diagnostics = list(dict.fromkeys(diagnostics))
+        self._atomic_write(self._summary_path, readable)
         return LogFinalizationResult(
-            summary,
-            self._event_path,
-            self._summary_path,
-            tuple(diagnostics),
+            executive_summary=summary,
+            event_log_path=self._event_path,
+            summary_path=self._summary_path,
+            report_diagnostics=tuple(diagnostics),
+            registry_view_path=self._registry_view_path,
+            pareto_view_path=self._pareto_view_path,
         )
 
     @staticmethod
@@ -308,16 +401,41 @@ class DefaultRunLogger:
         os.replace(temporary, path)
 
     @staticmethod
+    def _append_batch(path: Path, content: bytes) -> None:
+        """Append a serialized batch and restore the previous length on failure."""
+        with path.open('r+b') as stream:
+            stream.seek(0, os.SEEK_END)
+            previous_length = stream.tell()
+            try:
+                written = stream.write(content)
+                if written != len(content):
+                    raise OSError('event batch write was incomplete')
+                stream.flush()
+                os.fsync(stream.fileno())
+            except BaseException as write_error:
+                try:
+                    stream.truncate(previous_length)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                except BaseException as rollback_error:
+                    write_error.add_note(
+                        f'Event-file rollback also failed: {rollback_error}'
+                    )
+                raise
+
+    @staticmethod
     def _choice_statistics(run_log: RunLog) -> tuple[ChoiceStatistics, ...]:
         descriptors: dict[tuple[ChoiceId, int], ChoiceDescriptor] = {}
         attempts: Counter[tuple[ChoiceId, int]] = Counter()
         admissions: Counter[tuple[ChoiceId, int]] = Counter()
-        reward_totals: defaultdict[tuple[ChoiceId, int], float] = defaultdict(float)
+        candidates: Counter[tuple[ChoiceId, int]] = Counter()
+        admitting_attempts: Counter[tuple[ChoiceId, int]] = Counter()
         modifications: Counter[tuple[ChoiceId, int, int | None]] = Counter()
         for event in run_log.events:
             if event.event_type == 'choice_set_available':
                 for descriptor in cast(
-                    tuple[ChoiceDescriptor, ...], event.data['choices']
+                    tuple[ChoiceDescriptor, ...],
+                    event.data['newly_eligible_choices'],
                 ):
                     for size in range(1, descriptor.max_neighborhood_size + 1):
                         descriptors[(descriptor.choice_id, size)] = descriptor
@@ -326,9 +444,20 @@ class DefaultRunLogger:
                 size = cast(int, event.data['k'])
                 key = (choice_id, size)
                 attempts[key] += 1
-                admissions[key] += cast(int, event.data['pareto_admission_count'])
-                reward_totals[key] += cast(float, event.data['archive_reward'])
-                modifications[(choice_id, size, cast(int | None, event.data['m']))] += 1
+                admissions[key] += cast(int, event.data['archive_admission_count'])
+                if cast(bool, event.data['attempt_admitted']):
+                    admitting_attempts[key] += 1
+                modification_counts = cast(
+                    tuple[int, ...] | None, event.data['modification_counts']
+                )
+                if modification_counts is None:
+                    modifications[(choice_id, size, None)] += 1
+                elif not modification_counts:
+                    modifications[(choice_id, size, 0)] += 1
+                else:
+                    candidates[key] += len(modification_counts)
+                    for modification_count in modification_counts:
+                        modifications[(choice_id, size, modification_count)] += 1
         result = []
         for key in sorted(
             descriptors, key=lambda pair: (str(pair[0].to_json_value()), pair[1])
@@ -352,8 +481,9 @@ class DefaultRunLogger:
                     key[1],
                     descriptor.modification_count_definition,
                     attempts[key],
+                    candidates[key],
+                    admitting_attempts[key],
                     admissions[key],
-                    reward_totals[key],
                     frequency_values,
                 )
             )
@@ -424,6 +554,16 @@ class DefaultRunLogger:
             f'{summary.composition_selection_probability:.6g}',
             f'Feedback selection mode: {feedback_mode}',
         ]
+        if summary.objective_vector_duplicate_count:
+            count = summary.objective_vector_duplicate_count
+            lines.extend(
+                (
+                    '',
+                    f'WARNING: {count} distinct visited plan(s) matched a Pareto '
+                    'objective vector. This may indicate search symmetry and can '
+                    'divert evaluations from discovering new objective trade-offs.',
+                )
+            )
         if summary.wall_time_limit_seconds is not None:
             lines.extend(
                 (
@@ -453,6 +593,19 @@ class DefaultRunLogger:
                 f'{identifier_text(entry.component_id)}; '
                 f'configuration={configuration}'
             )
+        lines.append('Objective upper bounds:')
+        bound_counts = {
+            item.objective_id: item.count for item in summary.objective_bound_counts
+        }
+        if summary.provenance.objective_bounds:
+            lines.extend(
+                f'- {identifier_text(bound.objective_id)}: '
+                f'{bound.formatted_upper_bound}; exceeded occurrences='
+                f'{bound_counts.get(bound.objective_id, 0)}'
+                for bound in summary.provenance.objective_bounds
+            )
+        else:
+            lines.append('- none')
         lines.extend(
             (
                 '',
@@ -580,11 +733,6 @@ class DefaultRunLogger:
                 if statistic.admission_rate is None
                 else f'{statistic.admission_rate:.1%}'
             )
-            reward_rate = (
-                'n/a'
-                if statistic.archive_reward_rate is None
-                else f'{statistic.archive_reward_rate:.3f}'
-            )
             modification_counts = (
                 ', '.join(
                     (
@@ -598,10 +746,10 @@ class DefaultRunLogger:
             )
             lines.append(
                 f'- {statistic.choice_id.to_json_value()!r}, k={statistic.k}: '
-                f'{statistic.archive_admission_count}/'
-                f'{statistic.attempt_count} admissions ({rate}); '
-                f'archive reward={statistic.archive_reward_total:.3f} '
-                f'(mean {reward_rate}); '
+                f'{statistic.admitting_attempt_count}/'
+                f'{statistic.attempt_count} admitting attempts ({rate}); '
+                f'{statistic.archive_admission_count} Pareto admissions; '
+                f'{statistic.candidate_count} candidates; '
                 f'm counts: {modification_counts}; '
                 f'm definition: {statistic.modification_count_definition}'
             )
@@ -650,6 +798,7 @@ class DefaultRunLogger:
                     else solution_id
                 )
                 lines.append(f'- {label}: {", ".join(rendered)}')
+        diagnostics[:] = list(dict.fromkeys(diagnostics))
         if diagnostics:
             lines.extend(('', 'Reporting diagnostics:'))
             lines.extend(f'- {diagnostic.reason}' for diagnostic in diagnostics)

@@ -11,7 +11,7 @@ from math import isfinite
 from typing import Literal
 
 from multiobjective_vns.multiday_vrp.extensions import VrpScenarioEvaluation
-from multiobjective_vns.multiday_vrp.solution import ActivityRef
+from multiobjective_vns.multiday_vrp.solution import ActivityRef, TransferStepRef
 
 type ResourceFindingKind = Literal[
     'vehicle_availability',
@@ -79,6 +79,7 @@ class ResourceFinding:
     :param activity_ref: Affected service activity when applicable.
     :param measure: Nonnegative violation amount in the model's declared unit.
     :param penalty_by_objective: Objective-specific scaled guidance values.
+    :param transfer_step_ref: Transfer step contributing to a storage finding.
     """
 
     kind: ResourceFindingKind
@@ -89,6 +90,7 @@ class ResourceFinding:
     activity_ref: ActivityRef | None
     measure: float
     penalty_by_objective: tuple[tuple[str, float], ...]
+    transfer_step_ref: TransferStepRef | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {
@@ -116,6 +118,13 @@ class ResourceFinding:
             raise ValueError('day_index must be a positive integer or None')
         if self.activity_ref is not None and type(self.activity_ref) is not ActivityRef:
             raise TypeError('activity_ref must be ActivityRef or None')
+        if (
+            self.transfer_step_ref is not None
+            and type(self.transfer_step_ref) is not TransferStepRef
+        ):
+            raise TypeError('transfer_step_ref must be TransferStepRef or None')
+        if self.transfer_step_ref is not None and self.kind != 'transfer_storage':
+            raise ValueError('transfer_step_ref is only valid for transfer_storage')
         _require_finite_nonnegative(self.measure, 'measure')
         if type(self.penalty_by_objective) is not tuple:
             raise TypeError('penalty_by_objective must be a tuple')

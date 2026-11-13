@@ -44,6 +44,21 @@ def test_objective_declaration_preserves_order() -> None:
     assert declaration.objectives == (first, second)
 
 
+def test_objective_declaration_normalizes_and_validates_upper_bounds() -> None:
+    objective = NumberObjective('cost', 'cost-component', 'v1')
+
+    unbounded = ObjectiveDeclaration((objective,))
+    assert unbounded.upper_bounds == (None,)
+
+    bounded = ObjectiveDeclaration((objective,), upper_bounds=(10,))
+    assert bounded.upper_bounds == (10,)
+
+    with pytest.raises(ComponentRegistrationError, match='length'):
+        ObjectiveDeclaration((objective,), upper_bounds=())
+    with pytest.raises(ComponentRegistrationError, match='tuple'):
+        ObjectiveDeclaration((objective,), upper_bounds=[10])  # type: ignore[arg-type]
+
+
 def test_objective_comparison_has_minimization_order_values() -> None:
     objective = NumberObjective('cost', 'cost-component', 'v1')
 

@@ -36,12 +36,14 @@ __all__ = [
     'LoadedScenarioBank',
     'LoadedVrpInstance',
     'NodeRecord',
+    'NodeCoordinateRecord',
     'ObjectiveEventTypeRecord',
     'ObjectiveOmissionPenaltyRecord',
     'ObjectiveSpec',
     'PackageRecord',
     'PackageTimeWindowRecord',
     'PackageTransferFacilityRecord',
+    'PickupSymmetryGroup',
     'PenaltyFunctionSpec',
     'PersonRecord',
     'PersonRuleLimitRecord',
@@ -65,6 +67,7 @@ __all__ = [
     'VrpInstanceSettings',
     'VrpInterventionData',
     'VrpNetworkData',
+    'VrpSpatialData',
     'VrpObjectiveData',
     'VrpPackageData',
     'VrpPersonnelData',
@@ -73,10 +76,12 @@ __all__ = [
 
 VrpFeatureId = Literal[
     'directed_route_paths',
+    'planar_node_coordinates',
     'within_day_time_dependent_travel',
     'scenario_uncertainty',
     'network_event_exposure',
     'multi_day_planning',
+    'variable_active_vehicle_count',
     'overnight_depot_choice',
     'multiple_tours_per_day',
     'restricted_vehicle_availability',
@@ -179,6 +184,12 @@ class LoadedScenarioBank(NamedTuple):
 
 class NodeRecord(NamedTuple):
     node_id: str
+
+
+class NodeCoordinateRecord(NamedTuple):
+    node_id: str
+    x: float
+    y: float
 
 
 class ArcRecord(NamedTuple):
@@ -399,6 +410,7 @@ class VrpInstanceSettings(NamedTuple):
     load_unit: str
     service_coverage_mode: str
     staff_depot_mode: str
+    exact_active_vehicle_count: int | None
     rule_treatment: str
     active_simple_rules: frozenset[str]
     hos_regime_id: str
@@ -410,6 +422,12 @@ class VrpNetworkData(NamedTuple):
     arcs: tuple[ArcRecord, ...]
     depots: tuple[DepotRecord, ...]
     transfer_facilities: tuple[TransferFacilityRecord, ...]
+
+
+class VrpSpatialData(NamedTuple):
+    coordinate_system_id: str | None
+    coordinate_unit: str | None
+    node_coordinates: tuple[NodeCoordinateRecord, ...]
 
 
 class VrpFleetData(NamedTuple):
@@ -471,20 +489,30 @@ class VrpObjectiveData(NamedTuple):
     objective_omission_penalties: tuple[ObjectiveOmissionPenaltyRecord, ...]
 
 
+class PickupSymmetryGroup(NamedTuple):
+    """Package pickups declared interchangeable for solution identity."""
+
+    group_id: str
+    package_ids: tuple[str, ...]
+
+
 class LoadedVrpInstance(NamedTuple):
     format_version: int
     instance_id: str
     scenario_bank: LoadedScenarioBank
     settings: VrpInstanceSettings
     network_data: VrpNetworkData
+    spatial_data: VrpSpatialData
     fleet_data: VrpFleetData
     package_data: VrpPackageData
+    pickup_symmetry_groups: tuple[PickupSymmetryGroup, ...]
     intervention_data: VrpInterventionData
     personnel_data: VrpPersonnelData
     activity_relations: VrpActivityRelationData
     work_rule_data: VrpWorkRuleData
     event_data: VrpEventData
     objective_data: VrpObjectiveData
+    time_window_violation_objective_id: str | None
     application_data: FrozenTomlTable | None
     hos_configuration: FrozenTomlTable | None
     hos_rule_definitions: tuple[HosRuleDefinition, ...]

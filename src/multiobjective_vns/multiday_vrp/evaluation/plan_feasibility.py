@@ -51,6 +51,15 @@ class _PlanFeasibilityMethods(_EvaluatorRuntime):
         for item in instance.fleet_data.vehicle_overnight_depots:
             overnight[item.vehicle_id].add(item.depot_id)
 
+        exact_vehicle_count = instance.settings.exact_active_vehicle_count
+        if exact_vehicle_count is not None:
+            active_vehicle_count = len({route.vehicle_id for route in solution.routes})
+            if active_vehicle_count != exact_vehicle_count:
+                return (
+                    f'plan uses {active_vehicle_count} active vehicles; '
+                    f'exactly {exact_vehicle_count} are required'
+                )
+
         driver_ids = {
             item.person_id
             for item in instance.personnel_data.personnel

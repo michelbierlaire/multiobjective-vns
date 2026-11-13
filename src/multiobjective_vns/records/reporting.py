@@ -48,6 +48,7 @@ class ReportDiagnosticKind(StrEnum):
     SOLUTION_DESCRIPTION_FAILURE = 'solution_description_failure'
     OBJECTIVE_NAME_FAILURE = 'objective_name_failure'
     OBJECTIVE_VALUE_FORMAT_FAILURE = 'objective_value_format_failure'
+    OBJECTIVE_BOUND_FORMAT_FAILURE = 'objective_bound_format_failure'
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +77,69 @@ class ReportDiagnostic:
         if self.kind is ReportDiagnosticKind.OBJECTIVE_NAME_FAILURE:
             if self.solution_id is not None:
                 raise ValueError('objective-name failures have no solution ID')
-        elif self.solution_id is None:
+        elif (
+            self.kind is ReportDiagnosticKind.OBJECTIVE_VALUE_FORMAT_FAILURE
+            and self.solution_id is None
+        ):
             raise ValueError('objective-value failures identify one solution')
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveBoundReport:
+    """Configured objective upper bound formatted for run provenance.
+
+    :param objective_id: Objective associated with the bound.
+    :param formatted_upper_bound: Objective-specific display text or the
+        documented ``[unformatted]`` fallback.
+    """
+
+    objective_id: ObjectiveId
+    formatted_upper_bound: str
+
+    def __post_init__(self) -> None:
+        identifier_text(self.objective_id)
+        if (
+            not isinstance(self.formatted_upper_bound, str)
+            or not self.formatted_upper_bound
+        ):
+            raise ValueError('formatted_upper_bound must be nonempty')
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveBoundEventFinding:
+    """Text-only finding suitable for stable event serialization.
+
+    :param objective_id: Objective whose value exceeded its bound.
+    :param objective_value: Formatted value or the ``[unformatted]`` fallback.
+    :param upper_bound: Formatted bound or the ``[unformatted]`` fallback.
+    """
+
+    objective_id: ObjectiveId
+    objective_value: str
+    upper_bound: str
+
+    def __post_init__(self) -> None:
+        identifier_text(self.objective_id)
+        if not isinstance(self.objective_value, str) or not self.objective_value:
+            raise ValueError('objective_value must be nonempty text')
+        if not isinstance(self.upper_bound, str) or not self.upper_bound:
+            raise ValueError('upper_bound must be nonempty text')
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveBoundCount:
+    """Count of submitted occurrences exceeding one objective bound.
+
+    :param objective_id: Objective whose bound was exceeded.
+    :param count: Number of submitted occurrences exceeding that bound.
+    """
+
+    objective_id: ObjectiveId
+    count: int
+
+    def __post_init__(self) -> None:
+        identifier_text(self.objective_id)
+        require_integer(self.count, name='count', minimum=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,32 +166,37 @@ class ModificationCountFrequency:
 
 @dataclass(frozen=True, slots=True)
 class ChoiceStatistics:
-    """Committed attempt, archive, and reward statistics for one choice size."""
+    """Committed attempt, candidate, and archive statistics for one choice size."""
 
     choice_id: ChoiceId
     k: int
     modification_count_definition: str
     attempt_count: int
+    candidate_count: int
+    admitting_attempt_count: int
     archive_admission_count: int
-    archive_reward_total: FiniteReal
     modification_count_frequencies: tuple[ModificationCountFrequency, ...]
 
     def __post_init__(self) -> None:
         require_integer(self.k, name='k', minimum=1)
         require_integer(self.attempt_count, name='attempt_count', minimum=0)
+        require_integer(self.candidate_count, name='candidate_count', minimum=0)
+        require_integer(
+            self.admitting_attempt_count,
+            name='admitting_attempt_count',
+            minimum=0,
+        )
+        if self.admitting_attempt_count > self.attempt_count:
+            raise ValueError('admitting attempts cannot exceed attempts')
         require_integer(
             self.archive_admission_count,
             name='archive_admission_count',
             minimum=0,
         )
-        if self.archive_admission_count > self.attempt_count:
-            raise ValueError('archive admissions cannot exceed attempts')
-        reward_total = finite_real(
-            self.archive_reward_total, name='archive_reward_total'
-        )
-        if not 0.0 <= reward_total <= self.attempt_count:
-            raise ValueError('archive_reward_total must be between zero and attempts')
-        object.__setattr__(self, 'archive_reward_total', reward_total)
+        if self.archive_admission_count < self.admitting_attempt_count:
+            raise ValueError(
+                'admissions must include at least one per admitting attempt'
+            )
         if (
             not isinstance(self.modification_count_definition, str)
             or not self.modification_count_definition.strip()
@@ -140,11 +207,26 @@ class ChoiceStatistics:
             for item in self.modification_count_frequencies
         ):
             raise TypeError('modification_count_frequencies must be a tuple')
-        if (
-            sum(item.count for item in self.modification_count_frequencies)
-            != self.attempt_count
+        positive_counts = sum(
+            item.count
+            for item in self.modification_count_frequencies
+            if item.m is not None and item.m > 0
+        )
+        if positive_counts != self.candidate_count:
+            raise ValueError('positive modification frequencies must sum to candidates')
+        no_candidate_attempts = sum(
+            item.count
+            for item in self.modification_count_frequencies
+            if item.m is None or item.m == 0
+        )
+        if sum(item.count for item in self.modification_count_frequencies) != (
+            self.candidate_count + no_candidate_attempts
         ):
-            raise ValueError('modification frequencies must sum to attempt_count')
+            raise ValueError(
+                'modification frequencies must cover candidates and empty calls'
+            )
+        if no_candidate_attempts > self.attempt_count:
+            raise ValueError('empty calls cannot exceed attempts')
         if any(
             item.m is not None and item.m > self.k
             for item in self.modification_count_frequencies
@@ -153,17 +235,10 @@ class ChoiceStatistics:
 
     @property
     def admission_rate(self) -> float | None:
-        """Return archive admissions per committed attempt, when observed."""
+        """Return admitting attempts per committed attempt, when observed."""
         if self.attempt_count == 0:
             return None
-        return self.archive_admission_count / self.attempt_count
-
-    @property
-    def archive_reward_rate(self) -> float | None:
-        """Return mean difficulty-weighted archive reward, when observed."""
-        if self.attempt_count == 0:
-            return None
-        return self.archive_reward_total / self.attempt_count
+        return self.admitting_attempt_count / self.attempt_count
 
 
 class ComponentRole(StrEnum):
@@ -216,19 +291,43 @@ class OperatorCatalogEntry:
     """Registered Operator metadata copied into the run provenance."""
 
     operator_id: OperatorId
+    configuration_id: ComponentConfigurationId
+    catalog_kind: Literal['ordinary', 'pre_registered_composite', 'promoted_composite']
     max_neighborhood_size: int
     feasibility_restoration: bool
     modification_count_definition: str
+    component_operator_ids: tuple[OperatorId, OperatorId] | None
 
     def __post_init__(self) -> None:
         identifier_text(self.operator_id)
+        identifier_text(self.configuration_id)
+        if self.catalog_kind not in (
+            'ordinary',
+            'pre_registered_composite',
+            'promoted_composite',
+        ):
+            raise ValueError('catalog_kind is invalid')
         require_integer(
             self.max_neighborhood_size, name='max_neighborhood_size', minimum=1
         )
         if not isinstance(self.feasibility_restoration, bool):
             raise TypeError('feasibility_restoration must be bool')
-        if not self.modification_count_definition.strip():
+        if (
+            not isinstance(self.modification_count_definition, str)
+            or not self.modification_count_definition.strip()
+        ):
             raise ValueError('modification_count_definition must be nonempty')
+        if self.catalog_kind == 'ordinary':
+            if self.component_operator_ids is not None:
+                raise ValueError('ordinary Operators have no component IDs')
+        else:
+            if (
+                not isinstance(self.component_operator_ids, tuple)
+                or len(self.component_operator_ids) != 2
+            ):
+                raise ValueError('composite Operators require two component IDs')
+            for component_id in self.component_operator_ids:
+                identifier_text(component_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +337,7 @@ class PromotedCompositionReport:
     operator_id: OperatorId
     source_composition_id: CompositionId
     component_operator_ids: tuple[OperatorId, OperatorId]
-    first_admitted_solution_id: SolutionId
+    first_admitted_solution_id: SolutionId | None
     max_neighborhood_size: int
     feasibility_restoration: bool
     inherited_group_ids: frozenset[OperatorGroupId]
@@ -260,8 +359,10 @@ class PromotedCompositionReport:
             self.source_composition_id.second_operator_id,
         ):
             raise ValueError('component_operator_ids must match source_composition_id')
-        if not isinstance(self.first_admitted_solution_id, SolutionId):
-            raise TypeError('first_admitted_solution_id must be a SolutionId')
+        if self.first_admitted_solution_id is not None and not isinstance(
+            self.first_admitted_solution_id, SolutionId
+        ):
+            raise TypeError('first_admitted_solution_id must be a SolutionId or None')
         require_integer(
             self.max_neighborhood_size, name='max_neighborhood_size', minimum=1
         )
@@ -282,6 +383,13 @@ class RunProvenance:
     components: tuple[ComponentConfigurationEntry, ...]
     operators: tuple[OperatorCatalogEntry, ...]
     operator_groups: tuple[OperatorGroup, ...]
+    objective_bounds: tuple[ObjectiveBoundReport, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.objective_bounds, tuple) or any(
+            not isinstance(item, ObjectiveBoundReport) for item in self.objective_bounds
+        ):
+            raise TypeError('objective_bounds must be a tuple of ObjectiveBoundReport')
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +483,8 @@ class ExecutiveSummary:
     excursion_frequencies: tuple[ExcursionFrequency, ...]
     composition_selection_probability: FiniteReal
     feedback_selection_mode: FeedbackSelectionMode | None
+    objective_bound_counts: tuple[ObjectiveBoundCount, ...] = ()
+    objective_vector_duplicate_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.invocation_id, InvocationId):
@@ -412,6 +522,18 @@ class ExecutiveSummary:
         require_integer(
             self.initial_pareto_count, name='initial_pareto_count', minimum=0
         )
+        require_integer(
+            self.objective_vector_duplicate_count,
+            name='objective_vector_duplicate_count',
+            minimum=0,
+        )
+        if not isinstance(self.objective_bound_counts, tuple) or any(
+            not isinstance(item, ObjectiveBoundCount)
+            for item in self.objective_bound_counts
+        ):
+            raise TypeError(
+                'objective_bound_counts must be a tuple of ObjectiveBoundCount'
+            )
         if not isinstance(self.final_pareto_solutions, tuple):
             raise TypeError('final_pareto_solutions must be a tuple')
         if not isinstance(self.promoted_compositions, tuple) or any(

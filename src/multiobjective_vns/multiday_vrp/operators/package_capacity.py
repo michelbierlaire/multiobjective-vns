@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from functools import cmp_to_key
 
 from multiobjective_vns.identifiers import ObjectiveId
 from multiobjective_vns.multiday_vrp.input_records import LoadedVrpInstance
@@ -18,7 +19,7 @@ from multiobjective_vns.multiday_vrp.operators.capacity_profile import (
 from multiobjective_vns.multiday_vrp.operators.common import (
     VrpPlanAssessor,
     choose_uniformly,
-    operator_result,
+    randomized_order,
     randomized_sample,
     require_vrp_base,
     validate_neighborhood_size,
@@ -32,7 +33,13 @@ from multiobjective_vns.multiday_vrp.solution import (
     VrpSolution,
 )
 from multiobjective_vns.objectives import ObjectiveComparison, ObjectiveDeclaration
-from multiobjective_vns.records.candidates import CandidateContext, OperatorResult
+from multiobjective_vns.random_source import RandomSource
+from multiobjective_vns.records.candidates import (
+    Candidate,
+    CandidateContext,
+    CandidateProposal,
+    OperatorResult,
+)
 from multiobjective_vns.records.evaluation import ApplicationEvaluation
 from multiobjective_vns.values import require_integer
 
@@ -40,6 +47,8 @@ __all__ = ['CapacityAwarePackageChainRelocationOperator']
 
 type _PackageEvent = tuple[int, int, RouteStop]
 type _EventGroups = dict[int, list[_PackageEvent]]
+type _CapacityCandidate = tuple[VrpSolution, tuple[object, ...], float]
+type _ChainPlacement = tuple[tuple[str, int, int, str, int], ...]
 
 
 class CapacityAwarePackageChainRelocationOperator:
@@ -97,13 +106,14 @@ class CapacityAwarePackageChainRelocationOperator:
         """Apply up to ``k`` distinct package-chain relocations.
 
         :param context: Base plan, requested size, feasibility request, and the
-            package's shared random source.
-        :returns: A complete candidate when at least one chain changed.
+            shared random source.
+        :returns: Up to ``context.max_candidates`` final complete candidates.
         """
         size = validate_neighborhood_size(context.k, self._maximum_size)
         working = require_vrp_base(context)
         moved: set[str] = set()
         modifications = 0
+        last_candidates: tuple[_CapacityCandidate, ...] = ()
         for _ in range(size):
             targets = tuple(
                 package_id
@@ -117,24 +127,36 @@ class CapacityAwarePackageChainRelocationOperator:
             candidates = self._candidates(working, package_id, context)
             if not candidates:
                 continue
-            selected = self._choose(candidates, context)
-            working = selected[0]
+            last_candidates = _order_candidates(
+                candidates,
+                self._objectives,
+                self._objective_position,
+                context.random_source,
+            )
+            working = last_candidates[0][0]
             modifications += 1
-        return operator_result(
-            working if modifications else None,
-            modifications=modifications,
-            requested_size=size,
+        if not modifications:
+            return OperatorResult(candidates=())
+        return OperatorResult(
+            candidates=tuple(
+                CandidateProposal(Candidate(solution), modifications)
+                for solution, _values, _excess in last_candidates[
+                    : context.max_candidates
+                ]
+            )
         )
 
     def _target_packages(
         self, solution: VrpSolution, context: CandidateContext
     ) -> tuple[str, ...]:
-        groups_by_package = {
-            package.package_id: _event_groups(solution, package.package_id)
-            for package in self._instance.package_data.packages
-        }
+        package_ids = tuple(
+            package.package_id for package in self._instance.package_data.packages
+        )
+        groups_by_package = _event_groups_by_package(solution, package_ids)
         eligible = tuple(
-            package_id for package_id, groups in groups_by_package.items() if groups
+            package_id
+            for package_id in package_ids
+            if groups_by_package.get(package_id)
         )
         if not eligible:
             return ()
@@ -142,6 +164,9 @@ class CapacityAwarePackageChainRelocationOperator:
         maximum_excess = max(
             (excess for excess, _loaded in states.values()), default=0.0
         )
+        loads = {
+            item.package_id: item.load for item in self._instance.package_data.packages
+        }
         if maximum_excess > 0.0:
             worst_states = tuple(
                 key
@@ -150,10 +175,6 @@ class CapacityAwarePackageChainRelocationOperator:
             )
             state = choose_uniformly(worst_states, context.random_source)
             loaded = states[state][1]
-            loads = {
-                item.package_id: item.load
-                for item in self._instance.package_data.packages
-            }
             scored = tuple(
                 package_id for package_id in eligible if package_id in loaded
             )
@@ -163,9 +184,6 @@ class CapacityAwarePackageChainRelocationOperator:
                     package_id for package_id in scored if loads[package_id] == maximum
                 )
             return ()
-        loads = {
-            item.package_id: item.load for item in self._instance.package_data.packages
-        }
         maximum = max(loads[package_id] for package_id in eligible)
         return tuple(
             package_id for package_id in eligible if loads[package_id] == maximum
@@ -176,18 +194,21 @@ class CapacityAwarePackageChainRelocationOperator:
         solution: VrpSolution,
         package_id: str,
         context: CandidateContext,
-    ) -> tuple[tuple[VrpSolution, tuple[object, ...], float], ...]:
+    ) -> tuple[_CapacityCandidate, ...]:
         groups = _event_groups(solution, package_id)
         if not groups:
             return ()
+        original_placement = _chain_placement(solution, package_id)
         route_by_vehicle_day = {
             (route.vehicle_id, route.day_index): index
             for index, route in enumerate(solution.routes)
         }
         package_compatibility = {
-            (item.vehicle_id, item.package_id): item.compatible
+            item.vehicle_id: item.compatible
             for item in self._instance.package_data.vehicle_package_compatibility
+            if item.package_id == package_id
         }
+        vehicle_ids = tuple(sorted({route.vehicle_id for route in solution.routes}))
         vehicle_options: dict[int, tuple[str, ...]] = {}
         for group_index, events in groups.items():
             days = {
@@ -195,11 +216,9 @@ class CapacityAwarePackageChainRelocationOperator:
             }
             vehicle_options[group_index] = tuple(
                 vehicle_id
-                for vehicle_id in sorted(
-                    {route.vehicle_id for route in solution.routes}
-                )
+                for vehicle_id in vehicle_ids
                 if all((vehicle_id, day) in route_by_vehicle_day for day in days)
-                and package_compatibility.get((vehicle_id, package_id), True)
+                and package_compatibility.get(vehicle_id, True)
             )
             if not vehicle_options[group_index]:
                 return ()
@@ -236,7 +255,7 @@ class CapacityAwarePackageChainRelocationOperator:
             assignments, self._candidate_limit * 8, context.random_source
         )
 
-        generated: list[tuple[VrpSolution, tuple[object, ...], float]] = []
+        generated: list[_CapacityCandidate] = []
         for assignment_key in assignment_choices:
             moved = self._insert_chain(
                 solution,
@@ -248,7 +267,10 @@ class CapacityAwarePackageChainRelocationOperator:
                 context,
             )
             for candidate in moved:
-                if candidate == solution:
+                if (
+                    candidate == solution
+                    or _chain_placement(candidate, package_id) == original_placement
+                ):
                     continue
                 evaluation = self._assess_plan(
                     self._instance, self._objectives, candidate
@@ -330,30 +352,6 @@ class CapacityAwarePackageChainRelocationOperator:
             max_candidate_alternatives=self._candidate_limit,
         )
 
-    def _choose(
-        self,
-        candidates: tuple[tuple[VrpSolution, tuple[object, ...], float], ...],
-        context: CandidateContext,
-    ) -> tuple[VrpSolution, tuple[object, ...], float]:
-        best_excess = min(item[2] for item in candidates)
-        tied = [item for item in candidates if item[2] == best_excess]
-        if self._objective_position is not None:
-            objective = self._objectives.objectives[self._objective_position]
-            best = tied[0]
-            objective_ties = [best]
-            for candidate in tied[1:]:
-                comparison = objective.compare(
-                    candidate[1][self._objective_position],
-                    best[1][self._objective_position],
-                )
-                if comparison is ObjectiveComparison.LESS:
-                    best = candidate
-                    objective_ties = [candidate]
-                elif comparison is ObjectiveComparison.EQUAL:
-                    objective_ties.append(candidate)
-            tied = objective_ties
-        return choose_uniformly(tied, context.random_source)
-
 
 def _event_groups(solution: VrpSolution, package_id: str) -> _EventGroups:
     transfer_count = sum(
@@ -381,6 +379,119 @@ def _event_groups(solution: VrpSolution, package_id: str) -> _EventGroups:
                 rank = 2 * step - 1 if stop.role == 'out' else 2 * step
                 groups[group].append((route_index, rank, stop))
     return dict(groups)
+
+
+def _chain_placement(solution: VrpSolution, package_id: str) -> _ChainPlacement:
+    """Return only this package's route assignments and event positions."""
+    placement: list[tuple[str, int, int, str, int]] = []
+    for route in solution.routes:
+        for stop_index, stop in enumerate(route.stops):
+            if (
+                type(stop) is ActivityStop
+                and stop.activity_ref.activity_id == package_id
+            ):
+                placement.append(
+                    (
+                        route.vehicle_id,
+                        route.day_index,
+                        stop_index,
+                        stop.activity_ref.kind,
+                        0,
+                    )
+                )
+            elif (
+                type(stop) is TransferOperationStop
+                and stop.transfer_step_ref.package_id == package_id
+            ):
+                placement.append(
+                    (
+                        route.vehicle_id,
+                        route.day_index,
+                        stop_index,
+                        stop.role,
+                        stop.transfer_step_ref.step_number,
+                    )
+                )
+    return tuple(placement)
+
+
+def _event_groups_by_package(
+    solution: VrpSolution, package_ids: tuple[str, ...]
+) -> dict[str, _EventGroups]:
+    """Build all declared package event groups in one route-stop pass."""
+    groups_by_package: dict[str, defaultdict[int, list[_PackageEvent]]] = {
+        package_id: defaultdict(list) for package_id in package_ids
+    }
+    transfer_counts: dict[str, int] = defaultdict(int)
+    package_id_set = set(package_ids)
+    for step in solution.transfer_steps:
+        if step.package_id in package_id_set:
+            transfer_counts[step.package_id] += 1
+    for route_index, route in enumerate(solution.routes):
+        for stop_index, stop in enumerate(route.stops):
+            if type(stop) is ActivityStop:
+                package_id = stop.activity_ref.activity_id
+                groups = groups_by_package.get(package_id)
+                if groups is None:
+                    continue
+                if stop.activity_ref.kind == 'pickup':
+                    groups[0].append((route_index, 0, stop))
+                elif stop.activity_ref.kind == 'delivery':
+                    transfer_count = transfer_counts.get(package_id, 0)
+                    groups[transfer_count].append(
+                        (route_index, 2 * transfer_count + 1, stop)
+                    )
+            elif type(stop) is TransferOperationStop:
+                package_id = stop.transfer_step_ref.package_id
+                groups = groups_by_package.get(package_id)
+                if groups is None:
+                    continue
+                step_number = stop.transfer_step_ref.step_number
+                group = step_number - 1 if stop.role == 'out' else step_number
+                rank = 2 * step_number - 1 if stop.role == 'out' else 2 * step_number
+                groups[group].append((route_index, rank, stop))
+    return {
+        package_id: dict(groups) for package_id, groups in groups_by_package.items()
+    }
+
+
+def _order_candidates(
+    candidates: tuple[_CapacityCandidate, ...],
+    objectives: ObjectiveDeclaration,
+    objective_index: int | None,
+    random_source: RandomSource,
+) -> tuple[_CapacityCandidate, ...]:
+    """Order by capacity excess, then objective value, randomizing exact ties."""
+
+    def compare(left: _CapacityCandidate, right: _CapacityCandidate) -> int:
+        if left[2] < right[2]:
+            return -1
+        if left[2] > right[2]:
+            return 1
+        if objective_index is None:
+            return 0
+        comparison = objectives.objectives[objective_index].compare(
+            left[1][objective_index], right[1][objective_index]
+        )
+        if comparison is ObjectiveComparison.LESS:
+            return -1
+        if comparison is ObjectiveComparison.GREATER:
+            return 1
+        return 0
+
+    ranked = sorted(candidates, key=cmp_to_key(compare))
+    ordered: list[_CapacityCandidate] = []
+    group_start = 0
+    while group_start < len(ranked):
+        group_end = group_start + 1
+        while (
+            group_end < len(ranked)
+            and compare(ranked[group_start], ranked[group_end]) == 0
+        ):
+            group_end += 1
+        ordered.extend(randomized_order(ranked[group_start:group_end], random_source))
+        group_start = group_end
+    return tuple(ordered)
 
 
 def _maximum_capacity_excess(

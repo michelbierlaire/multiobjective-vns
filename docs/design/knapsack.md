@@ -47,8 +47,10 @@ z[r](x) = sum_i c[r, i] x[i],   for r = 1, ..., p
 Define `y` to dominate `x` when `z[r](y) >= z[r](x)` for every objective `r`,
 with strict inequality for at least one objective. A feasible solution is
 Pareto-optimal when it is maximal under this dominance relation within `X`.
-The Pareto set can contain many distinct item selections; two selections can
-also have equal objective vectors.
+Two distinct item selections may be mathematically Pareto-optimal with equal
+objective vectors. The generic algorithm's Pareto set keeps one representative
+per objective vector; every distinct visited selection remains in the
+`SolutionRegistry`.
 
 The package treats every objective as a minimization objective. Because this
 model maximizes profit, the application negates each profit sum and supplies
@@ -190,11 +192,12 @@ same `SolutionId`. Its duplicate outcome reuses the stored processing status,
 assessment, and evaluation diagnostics, and carries the current occurrence's
 proposal metadata and `duplicate` disposition. It triggers no new evaluation
 or Operator-guarantee check.
-The knapsack `SolutionCodec` uses the solution tuple itself as its opaque
-`CodecPayload`: `capture()` returns the tuple, and `restore()` returns that
-tuple unchanged. This preserves malformed tuple length, Boolean entries, and
-nonbinary integer entries as well as valid vectors. Capture timing and payload
-placement follow architecture §8.1.
+The knapsack `SolutionCodec` encodes each integer tuple as UTF-8 JSON bytes.
+The JSON value is an array whose entries preserve integer versus Boolean
+values. `restore()` reconstructs the tuple, including malformed tuple length,
+Boolean entries, and nonbinary integer entries. Capture and restore preserve
+the solution value; snapshot and checkpoint timing follow architecture
+§§8.1 and 8.3.
 
 The empty selection `(0, ..., 0)` is well-formed and consumes zero of every
 resource. With nonnegative capacities, it is feasible, and the objective
@@ -251,16 +254,55 @@ their contracts; the following sections map them to the shared architecture.
 
 ### 3.2 Operator catalog
 
-The item order in the instance defines positions `1` through `n`. In each call,
-the Operator uses `CandidateContext.random_source` to form a uniformly random
-ordering of eligible elementary alternatives and considers at most `k` of
-them. Each alternative is considered at most once, so the call has a bounded
-move sample and does not enumerate all size-`k` combinations. If fewer than
-`k` alternatives exist, it considers all of them. `exchange_items` forms its
-alternatives by independently randomizing the selected and unselected item
-positions and pairing them in order. `exact_flip` samples a `k`-item subset.
-`profiled_capacity_repair` first selects the `k` lowest-scoring eligible items
-and then randomizes their order. An Operator returns at most one candidate.
+The item order in the instance defines positions `1` through `n`. Each call
+builds proposals independently from the same base. It samples at most
+`CandidateContext.max_candidates` distinct move patterns, applies each pattern
+to a fresh working copy, filters results under the Operator's feasibility
+rule, and skips unchanged results and results equivalent to an earlier
+proposal in that call. It returns qualifying proposals in sampled order, up to
+the same limit. An empty candidate list is represented by
+`OperatorResult.candidates=()`.
+Consequently, feasibility filtering or repeated solution identities can make
+the returned list shorter than the limit. The shared `RandomSource` defines
+the sample order. Each proposal carries its own `m`; `k` limits the move units
+used to construct that proposal. The engine processes all returned proposals
+in order and records one `CandidateOutcome` per proposal.
+
+For example, with base `c`, `k=1`, and `max_candidates=2`, `flip_items` can
+return `(0,1,0,0)` and `(1,0,0,0)` as two proposals, each with `m=1`; the
+shared random source determines their order.
+
+For `flip_items`, `add_items`, `remove_items`, `exchange_items`, and
+`capacity_repair`, each move pattern first chooses a length uniformly from one
+through `min(k, eligible move count)`, then samples that many elementary
+changes in random order without replacement. A call samples at most
+`CandidateContext.max_candidates` such patterns without replacement. Each
+pattern starts from the same base; changes within a pattern are applied in
+sampled order. `exchange_items` forms each pattern from disjoint selected and
+unselected item pairs. `exact_flip` samples at most the output limit of
+distinct `k`-item subsets without replacement. `capacity_repair` samples
+ordered subsets of up to `k` selected items by the same length rule.
+`profiled_capacity_repair` selects up to `k` lowest-scoring eligible items and
+samples their removal orders. The profile-core Operators use the same pattern
+rules as their unprofiled counterparts, restricted to the profile boundary
+set. The table below defines the result rule for each sampled pattern and the
+resulting list order. Candidate proposals equal to the base or equivalent to
+an earlier result are skipped; the Operator does not resample beyond the
+stated pattern-trial limit to fill the list.
+
+| Operator | Candidate list construction and order |
+|---|---|
+| `flip_items` | Sample ordered sequences of up to `k` distinct item positions. Each changed vector appears in first-sampled order after the feasibility rule is applied. |
+| `add_items` | Sample ordered sequences of up to `k` currently unselected positions; apply additions in sequence and retain qualifying changed vectors in sample order. |
+| `remove_items` | Sample ordered sequences of up to `k` currently selected positions; apply removals in sequence and retain qualifying changed vectors in sample order. |
+| `exchange_items` | Sample ordered sequences of up to `k` disjoint selected/unselected item pairs; apply exchanges in sequence and retain qualifying changed vectors in sample order. |
+| `capacity_repair` | Sample ordered subsets of up to `k` selected positions. For an infeasible base, each pattern yields the first feasible prefix when one exists; otherwise it yields no proposal when feasibility is required. Results appear in pattern-sample order. |
+| `exact_flip` | Sample distinct size-`k` position subsets uniformly without replacement. Each qualifying vector appears in subset-sample order. |
+| `profile_core_flip` | Use the `flip_items` sequence rule with positions restricted to the profile boundary set. |
+| `profile_core_add` | Use the `add_items` sequence rule with currently unselected positions restricted to the profile boundary set. |
+| `profile_core_remove` | Use the `remove_items` sequence rule with currently selected positions restricted to the profile boundary set. |
+| `profile_core_exchange` | Use the `exchange_items` sequence rule with both item positions restricted to the profile boundary set. |
+| `profiled_capacity_repair` | Use the selected lowest-scoring eligible boundary items and sample removal orders. Each distinct resulting vector that meets the feasibility request appears in first-sampled order; from a feasible base, permutations yielding the same vector contribute one proposal. |
 
 For `flip_items`, `add_items`, and `remove_items`, an elementary alternative
 changes one item decision. For `exchange_items`, one alternative swaps one
@@ -268,21 +310,21 @@ selected item with one unselected item. A completed elementary change adds one
 to `m`; an alternative skipped under the feasibility rule adds nothing. For
 these Operators, `k` is the maximum number of elementary changes considered,
 and `m` is the number actually applied. `exact_flip` is the exception: it
-applies exactly `k` distinct flips or returns no candidate.
+applies exactly `k` distinct flips or contributes no proposal.
 
 When the base is feasible and `ensure_feasible=True`, an Operator other than
 `exact_flip` tries each sampled alternative in order and keeps a change only
 when the resulting working vector remains feasible. `exact_flip` applies its
 complete sampled pattern and checks feasibility only on the final vector.
-When the base is infeasible and
+These rules apply independently to each candidate proposal. When the base is infeasible and
 `ensure_feasible=True`, ordinary move Operators apply their sampled changes
 and return the result only if the final vector is feasible. The two repair
 Operators use the stop-at-first-feasible rule specified in the table below.
 With `ensure_feasible=False`, the Operator applies its sampled alternatives
-without feasibility filtering. A call returns `m=0` and no candidate when it
-applies no change or when its final feasibility requirement is unmet. This
-defines the work performed by one call; `m=0` does not prove that another
-random sample or another size would also return no candidate.
+without feasibility filtering. A call returns an empty list when it cannot
+produce a distinct candidate satisfying the requested output contract. This
+defines the result of that bounded randomized call; another sample or size can
+still produce candidates.
 
 In a general instance, `exchange_items` supports sizes `1` through
 `floor(n / 2)` and is registered when `n` is at least `2`. For this
@@ -299,31 +341,32 @@ examples to the shared architecture contracts.
 | Operator | Meaning of `k` and `m` | With `ensure_feasible=True` | With `ensure_feasible=False` |
 |---|---|---|---|
 | `flip_items` | Sample up to `k` distinct item positions and flip them in the sampled order; `m` is the number of flips retained. | From a feasible base, skip a sampled flip if it would make the working vector infeasible. From an infeasible base, return the sampled-flip result only if it is feasible. From `c` with `k=1`, flipping item 1 off gives `(0,1,0,0)`, `m=1`. | Apply all sampled flips. From `c`, flipping item 3 on produces infeasible `e` with `k=1`, `m=1`. |
-| `add_items` | Sample up to `k` distinct currently unselected items and consider them in order; `m` is the number added. | From a feasible base, skip an addition that exceeds any capacity. From `c` with `k=1`, either available item exceeds a capacity, so the result is `m=0` with no candidate. An infeasible base cannot be repaired by adding items. | Apply all sampled additions. From `c`, adding item 3 produces infeasible `e` with `k=1`, `m=1`. |
+| `add_items` | Sample up to `k` distinct currently unselected items and consider them in order; `m` is the number added. | From a feasible base, skip an addition that exceeds any capacity. From `c` with `k=1`, either available item exceeds a capacity, so the Operator returns an empty candidate list. An infeasible base cannot be repaired by adding items. | Apply all sampled additions. From `c`, adding item 3 produces infeasible `e` with `k=1`, `m=1`. |
 | `remove_items` | Sample up to `k` distinct currently selected items and remove them in order; `m` is the number removed. | From a feasible base, all sampled removals are retained. From an infeasible base, retain all sampled removals and return the result only if it is feasible. | Apply all sampled removals; the application assessment records the resulting feasibility. |
 | `exchange_items` | Independently randomize the selected and unselected item positions, pair them in order, and take up to `k` disjoint pairs; `m` is the number of exchanges applied. Each pair removes one selected item and adds one unselected item. | From a feasible base, skip a pair if the resulting working vector exceeds any capacity. From an infeasible base, return the sampled-exchange result only if it is feasible. From `c`, the pair `(item 1, item 3)` returns `b` with `k=1`, `m=1`. | Apply all sampled disjoint exchanges; the result may be infeasible. |
-| `capacity_repair` | Sample up to `k` distinct selected items in random order and remove them in that order; `m` is the number removed. | Registered as a feasibility-restoration Operator. From an infeasible base, stop after the first removal that makes the vector feasible; return no candidate if the sampled removals do not restore feasibility. From `e` with `k=2`, removing item 3 returns `c` with `m=1`. From a feasible base, apply all sampled removals. | From an infeasible base, stop at the first feasible vector; if the sampled removals leave it infeasible, return the result after all sampled removals. From a feasible base, apply all sampled removals. From `(1,1,1,1)` with `k=1`, removing item 4 gives resource use `(5,5)`, still infeasible. |
-| `exact_flip` | Sample exactly `k` distinct item positions uniformly and flip all of them; `m=k` for a returned candidate. | Return the candidate only when the final vector is feasible; otherwise return `m=0` and no candidate. From `(1,1,1,1)` with `k=1`, every one-bit flip remains infeasible. | Return the sampled vector at Hamming distance exactly `k`. |
+| `capacity_repair` | Sample up to `k` distinct selected items in random order and remove them in that order; `m` is the number removed. | Registered as a feasibility-restoration Operator. From an infeasible base, stop after the first removal that makes the vector feasible; return no proposal if the sampled removals do not restore feasibility. From `e` with `k=2`, removing item 3 returns `c` with `m=1`. From a feasible base, apply all sampled removals. | From an infeasible base, stop at the first feasible vector; if the sampled removals leave it infeasible, return the result after all sampled removals. From a feasible base, apply all sampled removals. From `(1,1,1,1)` with `k=1`, removing item 4 gives resource use `(5,5)`, still infeasible. |
+| `exact_flip` | Sample exactly `k` distinct item positions uniformly and flip all of them; `m=k` for a returned candidate. | Return a proposal only when its final vector is feasible; if no sampled pattern qualifies, return no proposal. From `(1,1,1,1)` with `k=1`, every one-bit flip remains infeasible. | Return the sampled vector at Hamming distance exactly `k`. |
 | `profile_core_flip` | Apply the `flip_items` rule using only positions in the profile boundary set. | Apply the shared feasibility rule above. | Apply all sampled flips; the result may be infeasible. |
 | `profile_core_add` | Apply the `add_items` rule using only currently unselected positions in the profile boundary set. | Apply the shared feasibility rule above. | Apply all sampled additions; the result may be infeasible. |
 | `profile_core_remove` | Apply the `remove_items` rule using only currently selected positions in the profile boundary set. | Apply the shared feasibility rule above. | Apply all sampled removals; the result may be infeasible. |
 | `profile_core_exchange` | Apply the `exchange_items` rule using only selected and unselected positions in the profile boundary set. | Apply the shared feasibility rule above. | Apply all sampled disjoint exchanges; the result may be infeasible. |
-| `profiled_capacity_repair` | Rank currently selected boundary-set items by increasing profile score, take up to `k`, then randomize that subset for removal; `m` is the number removed. | Registered as a feasibility-restoration Operator. From an infeasible base, stop at the first feasible vector; return no candidate if the sampled subset does not restore feasibility. From a feasible base, apply all sampled removals. | From an infeasible base, stop at the first feasible vector; if the sampled subset leaves it infeasible, return the result after all sampled removals. From a feasible base, apply all sampled removals. |
+| `profiled_capacity_repair` | Rank currently selected boundary-set items by increasing profile score, take up to `k`, then randomize that subset for removal; `m` is the number removed. | Registered as a feasibility-restoration Operator. From an infeasible base, stop at the first feasible vector; return no proposal if the sampled subset does not restore feasibility. From a feasible base, apply all sampled removals. | From an infeasible base, stop at the first feasible vector; if the sampled subset leaves it infeasible, return the result after all sampled removals. From a feasible base, apply all sampled removals. |
 
-For every Operator, `m=0` describes the result of that bounded randomized call
-under its requested size and feasibility requirement. It records that the call
-returned no candidate; it does not prove that another random sample or a later
-call at the same size would also return no candidate. The examples above for
-`add_items` and `exact_flip` happen to have no qualifying move in their stated
-calls.
+Each `CandidateProposal` has a positive `m`. An empty `OperatorResult.candidates`
+tuple records that the bounded randomized call returned no proposal; summary
+modification-count frequencies represent that call with one `m=0`. Another
+sample or later call at the same size may find a candidate. The examples above
+for `add_items` and `exact_flip` happen to have no qualifying move in their
+stated calls.
 
 These examples show that `m` is interpreted with the operator identity and
 requested size. For example, `exchange_items` reports one exchange as
 `k=1, m=1`, while an operator that counts changed item decisions reports the
-same transformation as `k=2, m=2`. A partial result such as the `capacity_repair`
-call from `e` has `m < k`. A zero result has no candidate. A returned candidate
-is evaluated once; a duplicate proposal reuses the existing solution record
-while retaining an outcome for the proposal occurrence.
+same transformation as `k=2, m=2`. A proposal such as the `capacity_repair`
+call from `e` can have `m < k`. An empty result has no `CandidateProposal`;
+summary statistics represent it with `m=0`. A returned candidate is evaluated
+once; a duplicate proposal reuses the existing solution record while retaining
+an outcome for the proposal occurrence.
 
 Operators may also carry optional candidate metadata. For example,
 `exchange_items` can attach the removed and added item indices so an outcome or
@@ -372,9 +415,7 @@ possible boundary-set size. `profile_core_flip`, `profile_core_add`, and
 `profile_core_remove` support sizes `1` through `Bmax`;
 `profile_core_exchange` supports sizes `1` through `floor(Bmax / 2)` and is
 registered only when that maximum is positive; `profiled_capacity_repair`
-supports sizes `1` through `core_width`. A particular profile and base may
-provide fewer eligible alternatives, producing a partial `m` or `m=0` under
-the catalog rules. With `ensure_feasible=True`, every returned vector satisfies
+supports sizes `1` through `core_width`. A particular profile and base may provide fewer eligible alternatives, producing proposals with partial `m` values or an empty result under the catalog rules; summary statistics use `m=0` for an empty result. With `ensure_feasible=True`, every returned vector satisfies
 all capacities. A profile can be registered
 more than once with different weights, resource prices, or `core_width`; each
 registration has its own `OperatorId` and configuration identity, so its
@@ -399,15 +440,18 @@ archive. That behavior needs archive-aware policy input and is outside this
 solver-free Operator catalog.
 
 An operator composition can be illustrated by `add_items(remove_items(x))`.
-For example, removing item 1 from `c` and then adding item 3 produces `b`.
-This one-step composition uses two Operators from the original catalog. Both
-component calls receive the same requested size `k`; its count is
-`min(m_remove, m_add)`, so this example has `k=1` and composition `m=1`. The
-vector returned by `remove_items` serves as the input to `add_items`; its
-modification count appears in the first Operator-result event. The composition
-calls `remove_items` with `ensure_feasible=False` and passes its feasibility
-request to `add_items`. The engine evaluates and records only the final vector
-from `add_items`, so `b` receives one candidate outcome. The composition is
+For example, removing item 1 from `c` and then adding item 3 produces `b` as
+one possible final proposal. This one-step composition uses two Operators
+from the original catalog. Both component calls receive the same requested
+size `k`; each final proposal has count `min(m_remove, m_add)`, so this example
+has `k=1` and composition `m=1`. The ordered candidates returned by
+`remove_items` serve as inputs to successive `add_items` calls; each
+intermediate count appears in its Operator-result event. The composition calls
+`remove_items` with `ensure_feasible=False` and passes its feasibility request
+to each `add_items` call. The engine evaluates and records each final vector
+from `add_items` in result order, so `b` receives one candidate outcome in
+this illustration, and each other final proposal receives its own outcome.
+The composition is
 identified by the ordered pair
 `(remove_items, add_items)` and its feedback is separate from both standalone
 Operators. An `OperatorGroup` containing these Operators provides a soft hint
@@ -422,15 +466,15 @@ and result handling.
 
 | Architecture object | Concrete example |
 |---|---|
-| `SolutionCodec` | Use each immutable solution tuple as its `CodecPayload`, preserving valid and malformed vectors as defined in §2; see architecture §8.1 for checkpoint timing. |
+| `SolutionCodec` | Encode each immutable solution tuple as UTF-8 JSON bytes, preserving valid and malformed vectors as defined in §2; see architecture §§8.1 and 8.3 for checkpoint and Pareto-snapshot timing. |
 | `SolutionIdentity` | Compare submitted vectors by exact equality. `b` and `d` remain distinct despite equal objective vectors. |
 | `ObjectiveDeclaration` | Use the ordered `ObjectiveFunction` definitions in §1: one function per negated profit objective, each using ascending numeric comparison and a readable name and value format. |
 | `ObjectiveFunction` | Compare two negated profit sums in the usual ascending real order; return `less`, `equal`, or `greater`; provide a readable objective name through `__str__()` and a value rendering for reports. |
 | `ApplicationEvaluator` | Apply the callback contract, including deterministic results for the fixed problem instance, in architecture §5.6 to the knapsack representation and rules in §2. |
-| `CandidateContext` | Supply the base, size, feasibility request, operator-owned state, and the shared `RandomSource`; the `capacity_repair` example above shows an infeasible base. The source seed and checkpoint continuation follow architecture §6.6 and §8.1. |
-| `Operator` and `OperatorResult` | Apply the shared call contract. The catalog above shows per-operator size and modification-count scales. |
+| `CandidateContext` | Supply the base, size, `max_candidates` limit, feasibility request, operator-owned state, and shared `RandomSource`; the `capacity_repair` example above shows an infeasible base. The caller sets `MultiobjectiveVNSConfig.max_candidates_per_attempt`. The source seed and checkpoint continuation follow architecture §6.6 and §8.1. |
+| `Operator` and `OperatorResult` | Apply the shared call contract and return an ordered tuple of `CandidateProposal` records, each with its own candidate and `m`. The catalog above shows per-operator size and modification-count scales. |
 | `SolutionRegistry` and `EvaluationRecord` | Keep one record and one evaluation result for each distinct identified vector. A repeat of `b` refers to its existing record. |
-| `CandidateOutcome` | Describe each submission occurrence. An initial submission has `choice_id=None`; an Operator-produced candidate records the tagged `ChoiceId` defined in architecture §6.6. `component_position=None` for a standalone Operator and `second` for a composition, identifying the Operator that produced the submitted candidate. The outcome also records the base, requested size, actual count, disposition, and `SolutionId` once resolved. |
+| `CandidateOutcome` | Describe each proposal submission occurrence. An initial submission has `choice_id=None`; an Operator-produced candidate records the tagged `ChoiceId` and its 1-based `candidate_index` in the ordered list, as defined in architecture §6.6. `component_position=None` for an ordinary standalone Operator and `second` for a dynamic composition, pre-registered composite, or promoted Operator, identifying the component that produced the submitted candidate. The outcome also records the base, requested size, actual count, disposition, and `SolutionId` once resolved. |
 | `ProblemInstanceId` | Use the identifier and instance contents defined in §1. |
 
 The knapsack evaluator may include resource loads, remaining capacities, and
@@ -444,7 +488,7 @@ focus on items that contribute strongly to competing objectives.
 
 | Architecture object | Concrete example |
 |---|---|
-| `MultiobjectiveVNS` and `MultiobjectiveVNSConfig` | Coordinate candidate processing, identity lookup, and evaluation dispatch through `Executor`; expose search and maintenance operations; and hold search-wide parameters and per-invocation limits. |
+| `MultiobjectiveVNS` and `MultiobjectiveVNSConfig` | Coordinate ordered candidate processing, identity lookup, and evaluation dispatch through `Executor`; expose search and maintenance operations; and hold search-wide parameters and per-invocation limits. The caller must set `max_candidates_per_attempt`. |
 | `ArchivePolicy` | Determine archive membership from objective vectors of feasible, visited solutions. Here `b`, `c`, and `d` have maximal vectors under dominance, while `c` dominates `a`. |
 | `ExplorationPolicy` | Before cleanup, the default pool contains feasible `a`, `b`, `c`, and `d`; relaxed mode also retains infeasible `e`. Cleanup leaves the known Pareto solutions `b`, `c`, and `d` active. Eligibility and custom-policy rules are defined in algorithm design §2. |
 | `BaseSelectionPolicy` | In the relaxed-mode example, infeasible `e` is the current base during an excursion anchored at `c`. The shared eligibility and selection rules are defined in algorithm design §2. |
@@ -481,6 +525,7 @@ For example:
 
 ```python
 from multiobjective_vns import MultiobjectiveVNS
+from multiobjective_vns import MultiobjectiveVNSConfig
 from multiobjective_vns.knapsack import load_knapsack_application
 
 application = load_knapsack_application('path/to/instance.toml')
@@ -492,6 +537,7 @@ search = MultiobjectiveVNS(
     application_evaluator=application.application_evaluator,
     problem_instance_id=application.problem_instance_id,
     operator_groups=application.operator_groups,
+    config=MultiobjectiveVNSConfig(max_candidates_per_attempt=5),
 )
 result = search.run(
     initial_solutions=((0,) * application.instance.n_items,),

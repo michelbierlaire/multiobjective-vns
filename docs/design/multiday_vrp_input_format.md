@@ -39,6 +39,7 @@ geneva-instance/
     objectives.toml
     application-data.toml               # conditional, application-defined
     nodes.csv
+    node-coordinates.csv                # optional, planar spatial support
     arcs.csv
     depots.csv
     vehicles.csv
@@ -198,10 +199,12 @@ complete relation, with one explicit row for every vehicle-package pair.
 | Feature from `multiday_vrp.md` §1.9 | Active encoding | Inactive encoding or specified default |
 |---|---|---|
 | Directed route paths | Always represented by directed `arcs.csv` entries matching the ScenarioBank arc catalog; each route leg follows a path in that graph. | Core feature in every instance. A direct-matrix instance supplies its direct origin-destination arcs. |
+| Planar node coordinates | Declare `node_coordinates` in `[files]`, provide both coordinate metadata fields, and include one row for every depot and route service location in `node-coordinates.csv`. Transit-only nodes may also be listed. | Omit `node_coordinates`, `node_coordinate_system_id`, and `node_coordinate_unit`; the default catalog uses the network and other supplied instance data. |
 | Within-day time-dependent travel | At least one scenario, arc, and day has a travel-time range across its departure-grid boundaries greater than the numeric comparison tolerance. | Set the travel-time range within tolerance at all departure-grid boundaries for each scenario, arc, and day. Values may still differ across days or scenarios. |
 | Scenario uncertainty | At least two positive-probability scenarios have travel-time values whose range exceeds the numeric comparison tolerance at an aligned arc, day, and departure-grid boundary. | Use one scenario as the standard deterministic encoding. Multiple scenarios whose travel-time values differ by no more than the comparison tolerance also represent deterministic travel; their declared aggregation remains active when the scenario count exceeds one. |
 | Network-event exposure | Define event instances in `event-types.csv` and `events.csv`, then include their types in an `event_count` or `maximum_event_exposure` objective through `objective-event-types.csv`. | Omit event-count objectives or give them no event instances to count. Event data may remain available to describe effects already captured in ScenarioBank travel data. |
 | Multi-day planning | Supply more than one planning date in the ScenarioBank target grid. | Supply one planning date. The instance declares its planning dates explicitly. |
+| Variable active-vehicle count | Omit `exact_active_vehicle_count`; the plan may use any number of vehicles allowed by the other requirements. | Set `exact_active_vehicle_count` in `instance.toml` to an integer from `0` through the number of rows in `vehicles.csv`; every feasible plan must use exactly that many distinct vehicles over the horizon. |
 | Overnight-depot choice | Give at least one vehicle multiple eligible rows in `vehicle-overnight-depots.csv`. | Give each vehicle exactly one eligible depot row. The relation is always required; no depot is inferred. |
 | Multiple tours per day | Set `max_tours_per_day` above `1` for at least one vehicle. | **Version 1 default:** write `max_tours_per_day = 1` for every vehicle. |
 | Restricted vehicle availability | Give a vehicle availability intervals that leave a gap larger than the comparison tolerance in the planning horizon. | Omit `vehicle-availability.csv` for full-horizon availability, or write intervals that cover the horizon within tolerance for every vehicle. In a supplied file, a vehicle with no rows has an empty calendar. |
@@ -220,8 +223,8 @@ complete relation, with one explicit row for every vehicle-package pair.
 | Driving-skill restrictions | Add one or more required skill rows to `vehicle-driving-skills.csv`. | Omit vehicle skill requirements. With no vehicle requirements, every authorized driver is skill-eligible for every vehicle, regardless of any skills listed for personnel. |
 | Intervention qualifications or team-size restrictions | Give an intervention a required qualification row, or set `minimum_team_size` above `1`. | **Problem-definition default:** `minimum_team_size = 1`; omit qualification requirements. The value remains explicit in every intervention row. |
 | Restricted personnel availability | Give a person availability intervals that leave a gap larger than the comparison tolerance in the planning horizon. | Omit `personnel-availability.csv` for full-horizon availability, or write intervals that cover the horizon within tolerance for every person. In a supplied file, a person with no rows has an empty calendar. |
-| Personnel availability differentiation | Give at least two assignment-capable people different effective availability calendars; adjacent intervals within tolerance are treated as continuous. | Give every assignment-capable person the same effective calendar. That calendar may be restricted; a restriction shared by all people does not activate this feature. |
-| Driver-assignment differentiation | Provide at least one vehicle with two or more eligible drivers and either differing assignment profiles or active staff-depot-continuity/work/driving/rest/HOS rules. | Keep each vehicle's eligible driver profiles equivalent and leave staff-depot continuity and work/driving/rest/HOS rules inactive. The loader derives profiles from driver skills, intervention qualifications, availability, and initial depots when continuity is selected. |
+| Personnel availability differentiation | Give at least two assignment-capable people different effective availability calendars; adjacent intervals within tolerance are treated as continuous. | Give every assignment-capable person the same effective calendar. A shared restriction is represented by `restricted_personnel_availability`. |
+| Driver-assignment differentiation | Provide at least one vehicle with two or more eligible drivers and either differing assignment profiles or active staff-depot-continuity/work/driving/rest/HOS rules. | Give each vehicle at most one eligible driver, or use equivalent profiles with `staff_depot_mode = 'available_at_assignment'`, `active_simple_rules = []`, and `hos_regime_id = 'none'`. The loader derives profiles from driver skills, intervention qualifications, availability, and initial depots when continuity is selected. |
 | Staff depot continuity | Set `staff_depot_mode = 'depot_continuity'` and provide each person's initial depot. | Inactive selection: `staff_depot_mode = 'available_at_assignment'`; the `initial_depot_id` field is empty for each person. The instance author writes the required mode explicitly. |
 | Work, driving, rest, or HOS rules | Select one or more values in `active_simple_rules`, or select a registered HOS regime and supply its configuration. The problem-definition default treatment is `rule_treatment = 'penalty'`; `compliance` selects hard requirements. | **Problem-definition defaults:** `active_simple_rules = []`, `hos_regime_id = 'none'`, and `hos_regime_version = 'none'`. |
 | Objective declaration | Always declare at least one objective in `objectives.toml`. | Core feature; every instance declares at least one objective. |
@@ -254,35 +257,80 @@ LoadedVrpInstance(
     scenario_bank: LoadedScenarioBank,
     settings: VrpInstanceSettings,
     network_data: VrpNetworkData,
+    spatial_data: VrpSpatialData,
     fleet_data: VrpFleetData,
     package_data: VrpPackageData,
+    pickup_symmetry_groups: tuple[PickupSymmetryGroup, ...],
     intervention_data: VrpInterventionData,
     personnel_data: VrpPersonnelData,
     activity_relations: VrpActivityRelationData,
     work_rule_data: VrpWorkRuleData,
     event_data: VrpEventData,
     objective_data: VrpObjectiveData,
+    time_window_violation_objective_id: str | None,
     application_data: FrozenTomlTable | None,
     hos_configuration: FrozenTomlTable | None,
     hos_rule_definitions: tuple[HosRuleDefinition, ...],
     feature_profile: VrpFeatureProfile,
 )
+
+PickupSymmetryGroup(
+    group_id: str,
+    package_ids: tuple[str, ...],
+)
+
+VrpSpatialData(
+    coordinate_system_id: str | None,
+    coordinate_unit: str | None,
+    node_coordinates: tuple[NodeCoordinateRecord, ...],
+)
+
+NodeCoordinateRecord(
+    node_id: str,
+    x: float,
+    y: float,
+)
 ```
 
-The nested records have these public fields:
+The nested data records and the pickup-symmetry record have these public
+fields:
 
 | Record | Fields |
 |---|---|
-| `VrpInstanceSettings` | `load_unit`, `service_coverage_mode`, `staff_depot_mode`, `rule_treatment`, `active_simple_rules`, `hos_regime_id`, `hos_regime_version` |
+| `VrpInstanceSettings` | `load_unit`, `service_coverage_mode`, `staff_depot_mode`, `exact_active_vehicle_count`, `rule_treatment`, `active_simple_rules`, `hos_regime_id`, `hos_regime_version` |
 | `VrpNetworkData` | `nodes`, `arcs`, `depots`, `transfer_facilities` |
+| `VrpSpatialData` | `coordinate_system_id`, `coordinate_unit`, `node_coordinates` |
+| `NodeCoordinateRecord` | `node_id`, `x`, `y` |
 | `VrpFleetData` | `vehicles`, `vehicle_overnight_depots`, `vehicle_driving_skills`, `vehicle_availability` |
 | `VrpPackageData` | `packages`, `package_time_windows`, `vehicle_package_compatibility`, `package_transfer_facilities` |
+| `PickupSymmetryGroup` | `group_id`, `package_ids` |
 | `VrpInterventionData` | `interventions`, `intervention_time_windows`, `tools`, `intervention_tools`, `intervention_qualifications_required` |
 | `VrpPersonnelData` | `personnel`, `driving_skills`, `intervention_qualifications`, `personnel_driving_skills`, `personnel_intervention_qualifications`, `personnel_availability` |
 | `VrpActivityRelationData` | `precedence`, `co_location` |
 | `VrpWorkRuleData` | `daily_work_limits`, `daily_driving_limits`, `person_rule_limits`, `continuous_driving_limits` |
 | `VrpEventData` | `event_types`, `events`, `objective_event_types` |
 | `VrpObjectiveData` | `objectives`, `penalty_functions`, `objective_omission_penalties` |
+
+`time_window_violation_objective_id` is derived from the validated objective
+bindings. It is the unique objective ID bound to both `early_window` and
+`late_window`; it is `None` when the instance has no service-window
+categories. The loader validates this relationship before returning the
+instance, and the default Operator catalog uses this field for time-window-
+focused Operators.
+
+`pickup_symmetry_groups` contains the optional pickup-order equivalence groups
+declared in `instance.toml` §4. An omitted declaration produces an empty
+tuple. Each group has a unique `group_id` and at least two distinct package
+IDs. A package ID belongs to at most one group. The loader verifies that each
+member package exists and that group members have exactly the same pickup
+node, pickup service duration, and pickup-window alternatives. Window
+alternatives compare by their ordered `(window_index, start_time, end_time)`
+values after timestamp normalization; numeric values compare exactly. A group
+declaration carries the application guarantee defined in
+[`multiday_vrp_solution_design.md`](multiday_vrp_solution_design.md) §4.6.
+The declaration defines pickup-order equivalence for solution identity.
+Package IDs remain attached to their pickup and delivery activities, and
+vehicle assignments and delivery order remain explicit plan decisions.
 
 `VrpInstanceSettings` has this value contract:
 
@@ -291,6 +339,7 @@ VrpInstanceSettings(
     load_unit: str,
     service_coverage_mode: str,
     staff_depot_mode: str,
+    exact_active_vehicle_count: int | None,
     rule_treatment: str,
     active_simple_rules: frozenset[str],
     hos_regime_id: str,
@@ -299,6 +348,8 @@ VrpInstanceSettings(
 ```
 
 The accepted strings and their meanings are defined in §4.
+`exact_active_vehicle_count` is `None` when the manifest omits the field;
+otherwise it contains the validated exact count.
 
 Every field in `VrpNetworkData` through `VrpObjectiveData` is a tuple of
 immutable records. For CSV-backed records, each record's public field names
@@ -309,6 +360,17 @@ For example, `instance.network_data.arcs[0].tail_node_id` is the parsed
 tuple. Tuple order follows the source table's row order; objective tuples
 follow the array order in `objectives.toml`, which defines objective-vector
 order.
+
+`spatial_data` is an immutable `VrpSpatialData` record. When
+`[files].node_coordinates` is absent, it contains
+`coordinate_system_id=None`, `coordinate_unit=None`, and an empty
+`node_coordinates` tuple. When the file is present, both metadata fields are
+nonempty strings copied from `node_coordinate_system_id` and
+`node_coordinate_unit`, and `node_coordinates` follows the CSV row order. Each
+`NodeCoordinateRecord` contains a validated `node_id` and finite `x` and `y`
+floats. The complete-coverage rule activates `planar_node_coordinates` in the
+instance's `feature_profile`; the feature meaning is defined authoritatively
+in [`multiday_vrp.md`](multiday_vrp.md) §1.9.
 
 The `objectives` tuple in `VrpObjectiveData` contains immutable
 `ObjectiveSpec` records with these fields: `objective_id`, `base_measure_id`,
@@ -424,14 +486,16 @@ instance and the registry used to validate its declarations.
 | `instance` | The `LoadedVrpInstance` supplied by or returned from loading. |
 | `problem_instance_id` | The supplied ID, or `instance.instance_id` when omitted. |
 | `solution_codec` | The built-in `VrpSolutionCodec`. |
-| `solution_identity` | The built-in `VrpSolutionIdentity`. |
+| `solution_identity` | The built-in `VrpSolutionIdentity`, bound to the instance's pickup-symmetry groups. |
 | `objective_declaration` | The ordered declaration built from `instance.objective_data`. |
 | `application_evaluator` | The evaluator bound to the instance, extension registry, and post-horizon rules. |
 | `operators` | The feature-selected default Operator registrations. |
-| `operator_groups` | Validated soft composition groups over those registrations. |
+| `pre_registered_compositions` | The feature-selected standalone composite Operator registrations from Operator catalog §1.3. |
+| `operator_groups` | Validated soft composition groups over ordinary and pre-registered composite Operators. |
 
 The caller passes these fields to the corresponding
-`MultiobjectiveVNS` constructor arguments. The caller remains responsible for
+`MultiobjectiveVNS` constructor arguments, including both `operators` and
+`pre_registered_compositions`. The caller remains responsible for
 constructing at least one valid, feasible initial `VrpSolution` and supplying
 it to `run(initial_solutions=...)`. Catalog settings and feature gates are
 defined in [`multiday_vrp_operators.md`](multiday_vrp_operators.md) §§1–2;
@@ -449,17 +513,26 @@ format_version = 1
 instance_id = 'geneva-weekday-service'
 scenario_bank_file = '../traffic/scenario-bank/scenario-bank.toml'
 # application_data_file = 'application-data.toml'
+# node_coordinate_system_id = 'EPSG:2056'
+# node_coordinate_unit = 'm'
 load_unit = 'kg'
 service_coverage_mode = 'mandatory'
 staff_depot_mode = 'available_at_assignment'
+# exact_active_vehicle_count = 3  # omit to let the plan choose the count
 rule_treatment = 'penalty'
 active_simple_rules = []
 hos_regime_id = 'none'
 hos_regime_version = 'none'
 # hos_configuration_file = 'hos-configuration.toml'
 
+[[pickup_symmetry_groups]]
+# The application declares the swap-invariance guarantee defined in §3.5.
+group_id = 'same-depot-loading'
+package_ids = ['package-01', 'package-02']
+
 [files]
 nodes = 'nodes.csv'
+# node_coordinates = 'node-coordinates.csv'  # optional spatial search support
 arcs = 'arcs.csv'
 depots = 'depots.csv'
 vehicles = 'vehicles.csv'
@@ -495,6 +568,7 @@ The recognized `[files]` keys and their conditions are:
 |---|---|---|
 | `objectives` | `objectives.toml` | Required |
 | `nodes` | `nodes.csv` | Required |
+| `node_coordinates` | `node-coordinates.csv` | Optional; when supplied, it must cover every depot and route service location |
 | `arcs` | `arcs.csv` | Required |
 | `depots` | `depots.csv` | Required |
 | `transfer_facilities` | `transfer-facilities.csv` | Required when any transfer facility is defined |
@@ -530,15 +604,42 @@ The recognized `[files]` keys and their conditions are:
 
 `hos_configuration_file` is a top-level manifest field required when
 `hos_regime_id` names a rule set other than `none`.
+`pickup_symmetry_groups` is an optional top-level array of tables. Each table
+has `group_id: nonempty string` and `package_ids: array of at least two
+distinct package ID strings`. Group IDs are unique, and membership is disjoint
+across groups. The loader applies the static member checks and the application
+guarantee specified in §3.5. Group declarations affect solution identity and
+are part of the instance modeling configuration; changing them requires a new
+`instance_id`.
+`exact_active_vehicle_count` is an optional top-level manifest field. When
+present, it is a built-in integer excluding Boolean values, in the range
+`0 <= exact_active_vehicle_count <= number of vehicle rows`; it requires
+exactly that many distinct vehicles to have at least one active vehicle-day
+route in a feasible plan. When omitted, the number of active vehicles remains
+a plan decision. The loader derives `variable_active_vehicle_count` from this
+field as defined in `multiday_vrp.md` §1.9. An explicit zero is valid for an
+instance whose feasible plans use no vehicles.
 `application_data_file` is a top-level field required when an
 application-registered measure, aggregation, penalty function, penalty
 aggregator, or rule needs additional instance data. The loading application
 validates it with the schema declared by the matching extension registration.
 
+`node_coordinate_system_id` and `node_coordinate_unit` are optional top-level
+fields used with `[files].node_coordinates`. Both are required when that file
+is supplied. They are omitted when that file is absent; either metadata field
+without the coordinate file is an input error. The system identifier
+names the planar coordinate system used by every row, such as an EPSG
+projected-coordinate identifier or an application-defined local Cartesian
+system. The unit is a descriptive label shared by the x and y values, such as
+`'m'` or `'solomon_units'`. Coordinate data and metadata are part of the
+instance configuration; changing them requires a new `instance_id` because
+they change the feature profile and the feature-selected Operator catalog.
+
 `instance_id` is a stable application-level identifier for the data and
 modeling configuration. The application changes it when any input or
-modeling declaration that affects feasibility, simulation, or objective
-evaluation changes. The ScenarioBank has its own identity and metadata.
+modeling declaration that affects feasibility, simulation, objective
+evaluation, solution identity, the feature profile, or the default Operator
+catalog changes. The ScenarioBank has its own identity and metadata.
 
 `load_unit` is a descriptive label such as `'kg'`, `'liters'`, or
 `'capacity_units'`. The model uses one scalar unit for package loads, tool
@@ -572,6 +673,28 @@ Required columns: `node_id`.
 
 One row identifies each road node, including service locations and transit
 nodes. The file contains at least one row.
+
+### 5.1.1 Optional `node-coordinates.csv`
+
+Required columns: `node_id,x,y`.
+
+Each row gives one road node a coordinate pair in the planar coordinate
+system named by `node_coordinate_system_id`. `node_id` must occur in
+`nodes.csv`, and each node occurs at most once. The loader requires a row for
+each node used by a depot, package pickup or delivery, intervention, or
+transfer facility. Coordinates for transit-only nodes are optional. Multiple
+node IDs may share the same coordinate pair to represent co-located road
+nodes.
+
+`x` and `y` are finite decimal values converted to Python `float` using the
+binary64 rules in §3.1. They use the common `node_coordinate_unit`. Coordinates
+must describe positions in one planar Cartesian system; geographic longitude
+and latitude are projected to that system by the application before the CSV
+is written. The loader uses them to derive the `planar_node_coordinates`
+feature and to expose spatial information to feature-selected Operators.
+Coordinates contribute geometric information to those Operators. Route
+adjacency, path travel values, feasibility, and objective values continue to
+use the network, ScenarioBank, and application evaluation contracts.
 
 ### 5.2 `arcs.csv`
 
@@ -850,7 +973,7 @@ base_measure_id = 'total_travel_time'
 base_measure_parameters = {}
 aggregation = { id = 'weighted_mean' }
 penalty_aggregation = { id = 'sum' }
-penalty_scales = { early_window = 1.0, late_window = 1.0, vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0, simple_rule = 1.0, hos_rule = 1.0 }
+penalty_scales = {}
 
 [[objectives]]
 objective_id = 'p90-travel-time'
@@ -858,85 +981,47 @@ base_measure_id = 'total_travel_time'
 base_measure_parameters = {}
 aggregation = { id = 'weighted_quantile', q = 0.9 }
 penalty_aggregation = { id = 'sum' }
-penalty_scales = { early_window = 1.0, late_window = 1.0, vehicle_availability = 1.0, personnel_availability = 1.0, duty_overlap = 1.0, simple_rule = 1.0, hos_rule = 1.0 }
+penalty_scales = {}
+
+# Keep service-window penalties in their own objective dimension.
+[[objectives]]
+objective_id = 'time-window-violation'
+base_measure_id = 'zero'
+base_measure_parameters = {}
+aggregation = { id = 'weighted_mean' }
+penalty_aggregation = { id = 'sum' }
+penalty_scales = { early_window = 1.0, late_window = 1.0 }
 
 [[penalty_functions]]
-objective_id = 'mean-travel-time'
+objective_id = 'time-window-violation'
 violation_category = 'early_window'
 rule_id = ''
 function_id = 'linear'
 parameters = { rate = 1.0 }
 
 [[penalty_functions]]
-objective_id = 'mean-travel-time'
+objective_id = 'time-window-violation'
 violation_category = 'late_window'
 rule_id = ''
 function_id = 'linear'
 parameters = { rate = 2.0 }
-
-[[penalty_functions]]
-objective_id = 'mean-travel-time'
-violation_category = 'vehicle_availability'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'mean-travel-time'
-violation_category = 'personnel_availability'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'mean-travel-time'
-violation_category = 'duty_overlap'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'p90-travel-time'
-violation_category = 'early_window'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'p90-travel-time'
-violation_category = 'late_window'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 2.0 }
-
-[[penalty_functions]]
-objective_id = 'p90-travel-time'
-violation_category = 'vehicle_availability'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'p90-travel-time'
-violation_category = 'personnel_availability'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
-
-[[penalty_functions]]
-objective_id = 'p90-travel-time'
-violation_category = 'duty_overlap'
-rule_id = ''
-function_id = 'linear'
-parameters = { rate = 1.0 }
 ```
+
+This example assumes that service windows are active and that no other
+penalty category is active. If vehicle or personnel availability, duty overlap,
+or penalty-treated rules are active, add their bindings to the objective or
+objectives that should receive those penalties. The built-in `zero` measure is
+constant for every plan and scenario; the dedicated window objective's value
+therefore comes from its assigned penalties before its scenario aggregation.
 
 Each `objective_id` is unique. `base_measure_id` names one of these built-in
 measures or an application-registered measure:
 
 | ID | Scenario-level measure |
 |---|---|
+| `zero` | Constant value `0.0` in every scenario; supports an objective made from assigned penalty categories |
 | `total_travel_time` | Sum of all traversed arc travel durations |
+| `total_waiting_time` | Sum of `pre_service_wait + wait` over every stop in every vehicle-day route; see `multiday_vrp.md` §4.2 for the full rule |
 | `event_count` | Total occurrences of the event types assigned to this objective |
 | `maximum_event_exposure` | Maximum event count on any one vehicle-day route |
 | `total_route_duration` | Sum of active vehicle-day duty durations |
@@ -968,10 +1053,11 @@ implementation. A custom aggregation table has an `id` and may include a
 `parameters` TOML table. The loading application's registry defines its
 callable interface and parameter schema under §12.
 
-`penalty_aggregation` selects how per-violation penalty values are combined
-into `P_o[s, x]`. The built-in `sum` applies the category function to each
-violation, sums values within each category, applies that objective's
-category scale, and sums the scaled category totals. An application may
+`penalty_aggregation` selects how the per-violation penalty values assigned to
+that objective are combined into `P_o[s, x]`. The built-in `sum` applies the
+category function to each assigned violation, sums values within each
+category, applies that objective's category scale, and sums the scaled
+category totals. An application may
 register a different penalty aggregation ID; it receives the category-indexed
 penalty values and scales and returns one finite nonnegative value, equal to
 zero exactly when all included violations are zero. A custom penalty
@@ -997,8 +1083,17 @@ Each function receives a violation measure and its TOML `parameters`, and
 returns zero for zero violation and a finite positive value for positive
 violation. The loading application's registry defines how each function ID
 and its parameters bind to an implementation under §12.
-For each objective, every active category has exactly one category-level
-binding, with optional rule-specific overrides for that objective.
+Each active category has at least one objective binding. Within any one
+objective, a category has exactly one category-level binding, with optional
+rule-specific overrides for that objective. A penalty category contributes
+only to objectives that have its binding; the evaluator does not copy a
+penalty into every objective. The `early_window` and `late_window` categories
+are assigned together to exactly one objective, whose `base_measure_id` is
+`zero`. That objective is the dedicated time-window-violation objective, and
+it is the sole recipient of both categories. An application may assign other
+soft-violation categories to that objective as well, for example to combine
+service windows with vehicle or personnel availability. It may assign those
+other categories to additional objectives when that tradeoff is useful.
 
 The built-in penalty function ID `linear` uses `rate * violation_measure`;
 `rate` is a finite positive decimal. The loading application registers
@@ -1012,14 +1107,16 @@ exist; vehicle and personnel availability and duty-overlap categories for the
 corresponding entities; `simple_rule` when a simple rule is selected with
 `rule_treatment = 'penalty'`; and `hos_rule` when an HOS regime is selected
 with that treatment.
-An active category has one category-level function binding and one finite
-positive scale in every objective. Rule-specific function rows override the
-category-level function for the named rule and use the same category scale.
+Within each objective to which a category is assigned, the category has one
+category-level function binding and one finite positive scale. Rule-specific
+function rows override the category-level function for the named rule and use
+the same category scale.
 
 Each objective's `penalty_scales` provides a finite positive multiplier for
-each active penalty category. A missing scale for an active category is an
-input error. Additional scales are retained in the configuration and take
-effect when their categories apply to the instance.
+each penalty category bound to that objective. A missing scale for a bound
+category is an input error. Additional scales are retained in the
+configuration and take effect when their categories are bound and apply to
+the instance.
 
 When `service_coverage_mode = 'penalized_omission'`,
 `objective-omission-penalties.csv` is required with columns
@@ -1029,9 +1126,9 @@ delivery, and intervention activity. In `mandatory` mode, the file is
 omitted.
 
 For each objective and scenario, the application calculates the declared base
-measure, adds the objective-scaled penalty contribution and any omission
-amounts, then applies the declared weighted statistic as specified in
-`multiday_vrp.md` §1.8.
+measure, adds only the penalty contribution assigned to that objective and any
+omission amounts, then applies the declared weighted statistic as specified
+in `multiday_vrp.md` §1.8.
 
 ### 10.2 Application-defined HOS data
 
@@ -1326,14 +1423,14 @@ leg in the scenario, preserving route and arc order. `duty_start_time` and
 `None` when no positive break is scheduled; otherwise they give the actual
 break interval. `activity_ref` is present only for an activity stop, and
 `transfer_step_ref` is present only for a transfer-operation stop.
-`window_assessments_by_objective` contains one record per declared objective,
-in objective declaration order, for an activity with service windows. Each
-record's zero-based selected index is its position among alternatives sorted
-by input `window_index`; it identifies the minimum local score defined in
-`multiday_vrp.md` §3.4. Its early and late
-violation amounts are tolerance-adjusted, and `guidance_value` is that
-alternative's category-scaled local score before penalty aggregation. For
-every other stop, `window_assessments_by_objective` is empty. Every time and
+`window_assessments_by_objective` contains one record for the dedicated
+time-window-violation objective, for an activity with service windows. Its
+zero-based selected index is the position of the selected alternative among
+alternatives sorted by input `window_index`; it identifies the minimum local
+score defined in `multiday_vrp.md` §3.4. Its early and late violation amounts
+are tolerance-adjusted, and `guidance_value` is that alternative's
+category-scaled local score before penalty aggregation. For every other stop,
+`window_assessments_by_objective` is empty. Every time and
 duration is a finite Python `float` on the instance's continuous time axis and in its
 declared time unit. A callback receives a complete trace for the scenario it
 evaluates. The evaluator retains completed traces in `VrpOperatorAnalysis`,
@@ -1475,10 +1572,11 @@ the exact strings in the loaded instance and ScenarioBank. Scenario values
 are supplied in ScenarioBank order; category values are ordered by the
 standard category order in §10.1, and each `values` tuple follows evaluator
 finding order. The penalty aggregator receives function outputs before
-category scaling, together with the configured scale for each category. It
-receives one `PenaltyCategoryInput` for every active category, including a
-category with an empty `values` tuple. Each applicable finding, including a
-zero finding, is passed through its selected penalty function once.
+category scaling, together with the configured scale for each category
+assigned to that objective. It receives one `PenaltyCategoryInput` for every
+category assigned to that objective, including a category with an empty
+`values` tuple. Each applicable finding, including a zero finding, is passed
+through its selected penalty function once.
 
 The HOS validator returns at least one rule. Each `rule_id` is a unique,
 nonempty string, each `personnel_ids` tuple is nonempty and duplicate-free,

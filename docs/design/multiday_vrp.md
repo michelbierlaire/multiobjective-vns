@@ -72,10 +72,10 @@ Objective comparisons use the exact order of their Python `float` values,
 without a tolerance, so Pareto dominance follows a transitive total order.
 Finite evaluated objective values compare numerically, and `math.inf` compares
 greater than every finite value. NaN and negative infinity are invalid
-objective results. The exact structural solution-identity rule in
-[`multiday_vrp_solution_design.md`](multiday_vrp_solution_design.md) also
-compares stored floating-point fields exactly; feasibility tolerance does not
-change solution identity.
+objective results. The canonical solution-identity rule in
+[`multiday_vrp_solution_design.md`](multiday_vrp_solution_design.md) compares
+stored floating-point fields exactly outside declared pickup-order
+symmetries; feasibility tolerance does not change solution identity.
 
 ### 1.1 Planning horizon and road network
 
@@ -309,6 +309,15 @@ Let `K` be the set of vehicles. Each vehicle `k` has:
   such as license classes needed to operate the vehicle;
 - a positive integer `max_tours_per_day[k]`, defaulting to one; and
 - package-vehicle compatibility data described in §1.5.
+
+An instance may declare `exact_active_vehicle_count`, an exact number of
+vehicles that must be used over the planning horizon. A vehicle is active
+over the horizon when it has at least one active vehicle-day route, using the
+definition in §2. If the declaration is absent, the number of active vehicles
+is a decision and may vary from zero through `|K|`, subject to the other
+requirements. If it is present with value `q`, a plan is feasible only when
+exactly `q` distinct vehicles are active. The input format defines its range
+and manifest encoding.
 
 The deterministic order on `K` breaks tied duty start-time orderings in §3.5.
 
@@ -637,7 +646,7 @@ Let `n_objectives` be a positive integer and
 declares one objective for each `o ∈ O`, in objective-vector order. Each
 objective specifies a base scenario cost `C_o[s, x]` for route plan `x`
 (defined in §2) and scenario `s`, a penalty contribution `P_o[s, x]` for the
-declared soft-constraint and penalty-treated rule violations in §§3.4–3.5, an
+violation categories explicitly assigned to that objective in §§3.4–3.5, an
 omission penalty `M_o[a]` for each required service activity `a` when the
 coverage mode in §3.2 allows omission, and an aggregation statistic `rho_o`.
 Define the omission cost for objective `o` by
@@ -658,6 +667,19 @@ F_o(x) = rho_o({(p[s], Y_o[s, x]) : s ∈ S})
 ```
 
 The objective vector is `F(x) = (F_o(x) : o ∈ O)` in the declared order.
+
+When service-window penalties are active, the application declares one
+dedicated time-window-violation objective. Its base measure is the built-in
+`zero` measure, and it receives the `early_window` and `late_window` penalty
+categories. Those categories belong to this objective alone. Their scenario
+penalty total is summarized by this objective's declared statistic, such as a
+weighted mean or maximum. This keeps service-window penalties as their own
+Pareto coordinate alongside vehicle-count, distance, and other objective
+values. The same objective may also collect vehicle-availability,
+personnel-availability, or duty-overlap penalties when the application wants
+one combined temporal-violation dimension. Other penalty categories remain
+assignable to any objective according to the input-format rules in
+`multiday_vrp_input_format.md` §10.1.
 
 The application supplies the fixed data and calculation rule needed by each
 base cost `C_o`. For example, a distance, toll, fuel, or operating-cost
@@ -687,20 +709,16 @@ overflow in a cost, penalty, or aggregation is an unusable objective result;
 the evaluator reports the application assessment and contract diagnostic
 defined by `multiobjective-vns.md` §5.6.
 
-Every objective includes the declared soft time-window, vehicle and personnel
-availability, duty-overlap, and penalty-treated simple or HOS rule measures
-through its `P_o[s, x]`, using the objective-specific penalty functions and
-scales declared by the user. The user defines those scales so each penalty is
-meaningful within its objective. Each penalty contribution is zero when its
-associated rules are respected and positive when a rule is violated. In
-`penalized_omission` mode, the user declares a finite positive `M_o[a]` for
-every objective and required activity; this amount is added to every scenario
-cost for each omitted activity. These contributions enter before scenario
-aggregation. Examples include a mean or selected quantile of total travel cost
-with time-window, personnel-rule, and service-omission penalties included. A
-deterministic base measure has the same value in every scenario; its full
-objective cost may vary with scenario penalties. Section 4 defines the available
-objective measures.
+An objective includes only the violation categories assigned to it, using the
+corresponding user-defined functions and scales. A category assigned to more
+than one objective contributes separately to each of those objectives. Every
+penalty contribution is zero when its associated rule is respected and
+positive when it is violated. In `penalized_omission` mode, the user declares
+a finite positive `M_o[a]` for every objective and required activity; this
+amount is added to every scenario cost for each omitted activity. These
+contributions enter before scenario aggregation. A deterministic base measure
+has the same value in every scenario; its full objective cost may vary with
+scenario penalties. Section 4 defines the available objective measures.
 
 Every representation-valid plan receives an objective vector. If a hard
 feasibility requirement fails in the plan or in any scenario, the plan is
@@ -721,15 +739,17 @@ activities when the coverage check is reached.
 
 ### 1.9 Supported feature catalog
 
-This catalog defines the model meaning of each supported feature and the
-formal condition used to classify it. A feature is **active** when its declared
-data or choice affects the set of permitted plans, feasibility assessment, or
-objective evaluation. Activation means that the feature participates in the
-model; an individual plan may still satisfy every associated condition. An
-optional feature is **inactive** when its stated neutral case removes that
-feature's additional choices, restrictions, or objective contributions. The
-catalog also identifies features that are part of every plan representation
-and therefore have no inactive state.
+This catalog defines the model or search-support meaning of each supported
+feature and the formal condition used to classify it. A feature is **active**
+when its declared data or choice affects the set of permitted plans,
+feasibility assessment, objective evaluation, or the feature-selected search
+capabilities available for the instance. Activation means that the feature
+participates in the declared model or search configuration; an individual
+plan may still satisfy every associated condition. An optional feature is
+**inactive** when its stated neutral case removes its additional choices,
+restrictions, objective contributions, or feature-selected search
+capabilities. The catalog also identifies features that are part of every
+plan representation and therefore have no inactive state.
 
 `VrpFeatureProfile` is an immutable record with one field:
 `active_features: frozenset[VrpFeatureId]`. `VrpFeatureId` is a closed set of
@@ -747,11 +767,12 @@ continuous interval. For personnel-availability differentiation, assignment-
 capable people are authorized drivers and, when interventions exist, people
 who meet at least one intervention's qualification requirements. A **driver
 assignment profile** records the assignment-relevant attributes of an
-authorized driver: driving skills when any vehicle requires a skill,
-intervention qualifications when any intervention requires one, effective
-availability calendar, and initial depot when staff depot continuity is
-selected. Person identifiers are excluded from profile comparison, so
-interchangeable people have equivalent profiles.
+authorized driver who satisfies a vehicle's required skills: driving skills
+when any vehicle requires a skill, intervention qualifications when any
+intervention requires one, effective availability calendar, and initial depot
+when staff depot continuity is selected. Profile comparison uses these
+attributes, so people with equal assignment-relevant values have equivalent
+profiles regardless of their identifiers.
 Decision-domain flexibility is read from the validated instance values and is
 distinct from feature activation. The input format defines field encodings and
 defaults; this section owns the semantic activation criteria. For the capacity
@@ -762,10 +783,12 @@ profile, define
 | Feature group | `VrpFeatureId` | Feature | Active condition and meaning | Inactive meaning |
 |---|---|---|---|---|
 | Travel | `directed_route_paths` | Directed route paths | **Core; always active.** Every leg between consecutive route stops uses a directed path in `G`. A matrix instance may represent each leg by its direct origin–destination arc (§§1.1, 2). | No inactive state; path connectivity is part of every plan. In a direct-matrix profile, the leg uses its direct arc. |
+| Spatial support | `planar_node_coordinates` | Planar node coordinates | Active when the optional coordinate data cover every node used by a depot, package pickup or delivery, intervention, or transfer facility. They enable coordinate-based search Operators; plan feasibility and objective evaluation continue to use the network and application evaluation definitions. Input coverage is specified in `multiday_vrp_input_format.md` §5.1.1. | The optional coordinate data are absent, so the default catalog uses Operators whose inputs are available from the network and other instance data. |
 | Travel | `within_day_time_dependent_travel` | Within-day time-dependent travel | Active when, for at least one scenario, arc, and day, the range of in-horizon boundary travel times exceeds the §1 comparison tolerance (§1.2). The post-horizon extension has a separate role in evaluating late returns and does not affect this profile flag. | Every in-horizon travel-time profile has a boundary range within the comparison tolerance for its day. Its level may differ across calendar days. |
 | Travel | `scenario_uncertainty` | Scenario uncertainty | Active when the range of travel-time values across positive-probability scenarios exceeds the §1 comparison tolerance at some arc, day, and aligned departure-grid boundary (§1.2). | Every scenario range at an aligned arc, day, and boundary is within the comparison tolerance. A single scenario is the standard inactive case. |
 | Travel | `network_event_exposure` | Network-event exposure | Active when at least one event instance is included in at least one selected event-count objective (§§1.3, 4.2). | No event count contributes to an objective. Event effects already represented in travel times remain part of the travel data. |
 | Horizon and fleet | `multi_day_planning` | Multi-day planning | Active when `n_days > 1`; vehicle routes are linked by overnight depot continuity (§§1.1, 1.4, 3.1). | `n_days = 1`; the plan contains one calendar day's vehicle duties. |
+| Horizon and fleet | `variable_active_vehicle_count` | Variable active-vehicle count | Active when `exact_active_vehicle_count` is absent; the number of vehicles used is a plan decision, constrained by the other instance requirements. | Inactive when `exact_active_vehicle_count` is supplied; every feasible plan uses exactly that number of distinct vehicles over the horizon. |
 | Horizon and fleet | `overnight_depot_choice` | Overnight-depot choice | Active when at least one vehicle has more than one eligible overnight depot; the instance records the eligible set for each vehicle (§1.4). | Every vehicle has exactly one eligible overnight depot, so its overnight-depot choice is fixed. |
 | Horizon and fleet | `multiple_tours_per_day` | Multiple tours per day | Active when `max_tours_per_day[k] > 1` for at least one vehicle (§1.4). | `max_tours_per_day[k] = 1` for every vehicle. |
 | Horizon and fleet | `restricted_vehicle_availability` | Restricted vehicle availability | Active when a vehicle's availability calendar leaves a gap larger than the §1 comparison tolerance within a calendar day (§§1.4, 3.5). | Every vehicle is available throughout the horizon within the comparison tolerance. |
@@ -784,8 +807,8 @@ profile, define
 | Personnel | `driving_skill_restrictions` | Driving-skill restrictions | Active when `required_drive_skills[k]` is nonempty for at least one vehicle (§§1.4, 1.7). | Every vehicle has an empty required-skill set; every authorized driver is skill-eligible for every vehicle. |
 | Personnel | `intervention_qualifications_or_team_size` | Intervention qualifications or team-size restrictions | Active when an intervention has a nonempty `Q_required[j]` or `team_size_min[j] > 1` (§§1.6–1.7). | Every intervention has no qualification requirement and a minimum team size of one; any one crew member can staff it. |
 | Personnel | `restricted_personnel_availability` | Restricted personnel availability | Active when a person's availability calendar leaves a gap larger than the §1 comparison tolerance in the planning horizon (§§1.7, 3.5). | Every person's availability covers the full planning horizon within the comparison tolerance. |
-| Personnel | `personnel_availability_differentiation` | Personnel availability differentiation | Active when at least two assignment-capable people have effective availability calendars that differ beyond the §1 tolerance. | All assignment-capable people have equivalent effective availability calendars. A calendar shared by all people can still activate `restricted_personnel_availability`; it leaves this feature inactive. |
-| Personnel | `driver_assignment_differentiation` | Driver-assignment differentiation | Active when at least one vehicle has two or more eligible drivers and either their driver assignment profiles differ or staff-depot-continuity/work/driving/rest/HOS rules make allocation across duties consequential. | Each vehicle has at most one eligible driver, or all eligible drivers have equivalent profiles and no active staff-depot-continuity or work/driving/rest/HOS rule makes allocation consequential. |
+| Personnel | `personnel_availability_differentiation` | Personnel availability differentiation | Active when at least two assignment-capable people have effective availability calendars that differ beyond the §1 tolerance. | All assignment-capable people have equivalent effective availability calendars; a shared calendar's restriction is represented by `restricted_personnel_availability`. |
+| Personnel | `driver_assignment_differentiation` | Driver-assignment differentiation | Active when at least one vehicle has two or more eligible drivers and either their driver assignment profiles differ or staff-depot-continuity/work/driving/rest/HOS rules make allocation across duties consequential. | Each vehicle has at most one eligible driver, or every multi-driver eligible set has equivalent profiles with `staff_depot_mode = available_at_assignment`, `active_simple_rules = ∅`, and `hos_regime_id = none`. |
 | Personnel | `staff_depot_continuity` | Staff depot continuity | Active when `staff_depot_mode = depot_continuity`; successive duties of a person must connect through that person's depot locations (§1.7). | `staff_depot_mode = available_at_assignment`; each assigned person is available at the assigned route's starting depot. |
 | Personnel | `work_driving_rest_hos_rules` | Work, driving, rest, or HOS rules | Active when at least one simple rule is selected or the HOS regime is not `none`; the selected `penalty` or `compliance` treatment determines its effect (§1.7). | The simple-rule activation set is empty and the HOS regime is `none`; no such rule contributes a penalty or hard condition. |
 | Evaluation | `objective_declaration` | Objective declaration | **Core; always active.** At least one minimized objective defines the objective vector and its base cost, penalties, and scenario statistic (§§1.8, 4). | No inactive state; objective evaluation is required for every instance. |
@@ -807,6 +830,11 @@ profile applies these dependency rules:
 - **Network-event exposure:** Event exposure requires both an event instance
   and an objective that counts its type. Event data may still inform the
   supplied travel-time scenarios when no event-count objective is selected.
+- **Spatial search support:** `planar_node_coordinates` is an optional
+  search-support feature. Its coordinate coverage and validation contract are
+  defined in the feature table and input-format §5.1.1. Spatial coordinates
+  guide feature-selected Operators; route paths, travel costs, feasibility,
+  and objective values retain their network and evaluation definitions.
 - **Package features:** Package compatibility, pickup/delivery windows, and
   package service durations apply when `P` is nonempty. Transfer operations
   require at least one package with `max_transfers[i] > 0`; eligible facilities
@@ -832,11 +860,14 @@ profile applies these dependency rules:
   include the driver and assigned intervention-team members. With no
   interventions, each route crew consists only of its driver. Availability,
   depot continuity, and work or HOS rules affect the assigned personnel and
-  duties in a plan. A shared restricted availability calendar creates an
-  availability condition while leaving personnel-availability differentiation
-  inactive. Driver reassignment becomes a default-catalog feature when driver
-  profiles differ or an active continuity/work rule makes assignment across
-  duties consequential; person-ID permutations alone do not activate it.
+  duties in a plan. Personnel-availability differentiation implies restricted
+  personnel availability: distinct effective calendars mean at least one
+  assignment-capable person has a restricted calendar. A common restricted
+  calendar activates the availability condition and preserves profile
+  equivalence. Driver reassignment becomes a default-catalog feature when
+  driver profiles differ or an active continuity/work rule makes assignment
+  across duties consequential. Identifier-only permutations share an
+  equivalent profile.
 - **Day linkage:** Cross-day depot continuity applies when `n_days > 1`. A
   single-day instance still chooses an overnight depot as the route's final
   depot when more than one is eligible, but that choice has no following-day
@@ -1276,17 +1307,16 @@ The complete service interval must fit within the available window for the
 window to be satisfied. Starting before its opening time beyond the numeric
 tolerance incurs an early violation measured from the service start; finishing
 after its closing time beyond the numeric tolerance incurs a late violation
-measured from the service finish. For each objective `o`, the user defines
-separate early- and late-window penalty functions. Each returns zero at a zero
-violation and a finite positive value at a positive violation. Each objective
-also supplies a scale for each active penalty category. For alternative
-window `w = [ell, u]`, the evaluator calculates the objective-specific local
-window score as the sum of the early-window and late-window function outputs
-after applying their category scales. It selects the window with the smallest
-local score separately for each objective; ties select the alternative with
-the earliest opening time, then the earliest closing time, then the lowest
-input `window_index`. This selection rule is fixed even when the objective
-uses a custom penalty aggregation.
+measured from the service finish. The application defines separate early- and
+late-window penalty functions and scales for the dedicated time-window-
+violation objective in §1.8. Each function returns zero at a zero violation
+and a finite positive value at a positive violation. For alternative window
+`w = [ell, u]`, the evaluator calculates one local window score by applying
+those functions and scales, then selects the alternative with the smallest
+score. Ties select the alternative with the earliest opening time, then the
+earliest closing time, then the lowest input `window_index`.
+This local selection rule remains fixed when the time-window objective uses a
+custom penalty aggregation.
 
 For example, with window `[9:00, 10:00]` and a 30-minute service, arriving at
 `8:50` with a planned 10-minute pre-service wait gives service start `9:00`
@@ -1297,38 +1327,38 @@ late violation as well, measured from the service finish. Starting before
 wait can move an early service start into the window; that wait contributes to
 work time and may affect personnel-rule penalties.
 
-For a service activity with alternative window list `W`, define the selected
-window index and its local guidance score for objective `o` as
+For a service activity with alternative window list `W`, let `o_tw` be the
+dedicated time-window-violation objective. Define the selected window index
+and its local guidance score as
 
 ```text
-window_index[s, o] = argmin over [ell, u] in W of
-    scale[o, early_window]
-        * p_early[o](lower_violation(service_start[s], ell))
-    + scale[o, late_window]
-        * p_late[o](upper_violation(service_finish[s], u))
-window_guidance[s, o] = the minimized value above
+window_index[s] = argmin over [ell, u] in W of
+    scale[o_tw, early_window]
+        * p_early[o_tw](lower_violation(service_start[s], ell))
+    + scale[o_tw, late_window]
+        * p_late[o_tw](upper_violation(service_finish[s], u))
+window_guidance[s] = the minimized value above
 ```
 
 For the selected alternative, the evaluator retains the early- and late-window
-function outputs as separate category findings. The configured
+function outputs as separate category findings for `o_tw`. The configured
 `PenaltyAggregation` receives those findings for the objective and scenario,
-along with the category scales, and produces the actual penalty contribution
-`P_o[s, x]` together with the other soft violations. `window_guidance[s, o]`
-is a per-activity guidance value for Operators; it is not a substitute for
-the configured penalty aggregation.
+along with the category scales, and produces their contribution to
+`P_o_tw[s, x]`. `window_guidance[s]` is a per-activity guidance value for
+Operators; it is not a substitute for the configured penalty aggregation.
 
 An intervention's applicable alternatives are drawn from its assigned day's
 list in §1.6.
 
 For scenario `s`, calculate window findings for every service occurrence and
-objective. The user may define aggregates by activity type; every declared
-measure covers all applicable service occurrences. The objective's configured
-penalty aggregator combines these findings with the other scenario-level
-penalties before scenario aggregation. Vehicle and
-personnel availability, duty overlap, and rule violations selected for
-`penalty` treatment contribute additional scenario-level penalties under
-§3.5. Rules selected for `compliance` treatment are feasibility requirements
-under §3.6.
+the time-window-violation objective. The user may define aggregates by
+activity type; every declared measure covers all applicable service
+occurrences. The objective's configured penalty aggregator combines these
+findings before scenario aggregation. Vehicle and personnel availability,
+duty overlap, and rule violations selected for `penalty` treatment contribute
+penalties only to the objectives to which the input assigns them, as described
+in §§1.8 and 3.5. Rules selected for `compliance` treatment are feasibility
+requirements under §3.6.
 
 ### 3.5 Vehicle availability and personnel-rule assessment
 
@@ -1389,13 +1419,13 @@ continuous-driving, break, and rest rules within one regime.
 The typed HOS callback and its complete per-rule/personnel result contract are
 specified in `multiday_vrp_input_format.md` §12.3.
 
-The user supplies a penalty function for each kind of availability,
+The user supplies a penalty function for each assigned kind of availability,
 duty-overlap, or rule violation. Each function returns zero for a zero
 violation measure and a strictly positive finite value for a positive
-measure. The user also defines how availability, duty-overlap, and
-`penalty`-treated rule penalties are aggregated into each objective's
-scenario-level contribution `P_o[s, x]`, together with the time-window
-penalties from §3.4. Under `compliance` treatment, §3.6 determines feasibility
+measure. The user also defines which objectives receive those categories and
+how each objective's configured penalty aggregator combines them into
+`P_o[s, x]`. Time-window categories remain assigned to the dedicated objective
+defined in §1.8. Under `compliance` treatment, §3.6 determines feasibility
 from the selected rule results. The objective evaluator retains the same
 fixed-scenario evaluation model in either treatment.
 
@@ -1406,7 +1436,8 @@ every scenario `s ∈ S`. The hard requirements cover:
 
 - route continuity, depot continuity, daily time-domain and return-time rules,
   driver authorization and vehicle driving skills, personnel assignments and
-  qualifications, and the tour-count limit in §§1.1, 1.4, 1.7, 2, and 3.1;
+  qualifications, the tour-count limit, and `exact_active_vehicle_count`
+  when declared in §§1.1, 1.4, 1.7, 2, and 3.1;
 - required activity coverage under the selected `service_coverage_mode`,
   precedence, co-location, and intervention-day eligibility in §3.2;
 - vehicle cargo capacity, package custody and compatibility, transfer-facility
@@ -1418,10 +1449,12 @@ A hard-constraint violation in any scenario makes the plan infeasible for the
 scenario bank.
 
 Time windows, vehicle and personnel availability, duty overlap, and rules
-selected for `penalty` treatment contribute to objective costs through the
-user-defined penalties in §§3.4–3.5 and 4. Compliance-treated rules appear in
-the hard-requirements list above. A compliance result certifies the plan
-against the selected rule set over the supplied scenario bank.
+selected for `penalty` treatment contribute to the objectives assigned to
+their penalty categories under §§1.8 and 3.4–3.5. Early- and late-window
+penalties contribute to the dedicated time-window-violation objective.
+Compliance-treated rules appear in the hard-requirements list above. A
+compliance result certifies the plan against the selected rule set over the
+supplied scenario bank.
 
 In `penalized_omission` mode, each missing activity contributes the objective
 penalty defined in §§1.8 and 3.2. The plan remains feasible when all remaining
@@ -1440,15 +1473,15 @@ defines the objective vector for a plan with a hard violation.
 For a hard-feasible plan and scenario `s`, let `C_travel[s, x]` be the total
 travel time of plan `x`, calculated by summing the simulated duration of every
 traversed arc across all vehicle-day routes. Each arc duration is evaluated
-at that scenario's actual arc-entry time. For a travel-time objective `o`, the
-scenario-level cost is
-`Y_o[s, x] = C_travel[s, x] + P_o[s, x] + OmitCost_o(x)`, where `P_o[s, x]`
-is the objective-specific contribution from timing and operational-limit
-penalties defined in §1.8. The declared statistic is applied to these complete
-scenario totals; examples include their mean, a selected quantile, or the
-largest value in the scenario bank. For a quantile objective, the evaluator
-first calculates each scenario's complete route cost and penalty total, then
-computes the weighted quantile across those scenario totals.
+at that scenario's actual arc-entry time. A travel-time objective uses
+`C_travel[s, x]` as its base measure and includes only additional penalty
+categories explicitly assigned to that objective. Early- and late-window
+penalties are evaluated in their dedicated objective, as defined in §1.8.
+The declared statistic is applied to each objective's scenario totals;
+examples include their mean, a selected quantile, or the largest value in the
+scenario bank. For a quantile objective, the evaluator first calculates each
+scenario's complete objective cost, then computes the weighted quantile across
+those scenario costs.
 
 Return times are checked against their daily boundaries. A late return is a
 hard feasibility violation under §3.6. The post-horizon travel extension in
@@ -1474,11 +1507,16 @@ group containing several types gives one combined count.
 Other possible objectives include:
 
 - total or maximum route duration across vehicle-days;
+- total planned waiting time across all vehicle-day route stops;
 - total or maximum personnel work time, or driver work time;
 - total operating cost or fuel use;
 - number of vehicles used, number of vehicle-days used, or total number of
   tours; and
 - maximum event exposure on any one route.
+
+The built-in `zero` base measure returns `0.0` in every scenario. It supports
+an objective whose scenario values consist of its assigned penalty categories,
+such as the dedicated time-window-violation objective in §1.8.
 
 For a maximum event-exposure objective, count `E_G` separately on each
 vehicle-day route and take the maximum. For an active route, its duration is
@@ -1492,6 +1530,18 @@ daily totals for drivers under the same selected work measurements, summed over
 driver-days or maximized over those units. The number of vehicles used is
 `sum(1 for k in K if sum(active[k, d] for d in D) > 0)`; the number of
 vehicle-days used is `sum(active[k, d] for k in K, d in D)`.
+When `exact_active_vehicle_count = q` is declared, `vehicles_used` equals
+`q` for every feasible plan and carries no search discrimination.
+
+The built-in `total_waiting_time` base measure is the sum, over every
+vehicle-day route and every route stop, of `pre_service_wait + wait`. It
+includes planned waiting before activities and transfer operations, and
+stationary time after activities, transfer operations, and depot-only stops.
+The scheduled break is contained within `wait`, so its duration is counted
+once as part of that field. The measure uses the plan's stated waiting
+durations, which are shared across scenarios; its value is therefore the same
+in every scenario. A vehicle-day duty begins at `start_time`, and waiting
+before the duty or after it has ended is outside this measure.
 The total number of tours sums, over active vehicle-days, one plus the number
 of marked tour-end stops in that route. This counts a repositioning route as
 one tour and an inactive vehicle-day as zero tours. A deterministic base

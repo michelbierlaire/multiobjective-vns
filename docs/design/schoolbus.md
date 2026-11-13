@@ -35,7 +35,8 @@ representation. The plan is feasible when:
 
 Route plans are immutable by contract while the package retains or exposes
 them, as required by architecture §5.1. An Operator that changes a mutable
-route structure works on its own copy and returns a new candidate plan.
+route structure works on its own copy for each alternative and returns an
+ordered list of candidate plans, up to the configured per-attempt limit.
 
 Every route begins at `o`, visits its students' pickup points in sequence, and
 ends at `h`. For route `r = (i[1], ..., i[q])`, its distance is
@@ -198,8 +199,15 @@ An operator works with the complete route plan as its solution value. Its
 application data—pickup points, road distances, capacity, and school/depot
 locations—are bound by the application as described in architecture §5.8.
 `CandidateContext` supplies the selected base, requested neighborhood size,
-the `ensure_feasible` request, operator-owned state, and the shared
-`RandomSource` used by Operators, policies, and engine sampling.
+the `ensure_feasible` request, operator-owned state, the shared `RandomSource`
+used by Operators, policies, and engine sampling, and the effective
+`max_candidates` limit. The user sets the required
+`MultiobjectiveVNSConfig.max_candidates_per_attempt` value. Each call returns
+an ordered list of up to that limit of different candidate plans, built from
+the same base. Each proposal carries its own `m`; the list order gives the
+Operator's proposal preference. The engine processes all proposals in that
+order and creates one `CandidateOutcome` per proposal. The table examples
+below illustrate individual entries in such a list.
 
 | Architecture concept | School-bus interpretation |
 |---|---|
@@ -207,10 +215,10 @@ the `ensure_feasible` request, operator-owned state, and the shared
 | `Neighborhood` | The set of route plans an operator considers reachable from a base at a given size. A size can represent a number of students to relocate or route positions to reorder. |
 | `Operator` | An application function such as `relocate_student`, `reorder_route`, `merge_routes`, or `destroy_repair`, with a stable `operator_id`; examples follow in the operator catalog. |
 | Feasibility-restoration operator | `repair_capacity`, registered with the capability to work from an infeasible base and return a feasible plan on a successful call with `ensure_feasible=True`. |
-| `CandidateContext` | For example, the base `Rδ`, size `k=2`, the feasibility request, this Operator's continuation state, and the shared `RandomSource`. The source seed and checkpoint continuation follow architecture §6.6 and §8.1. |
+| `CandidateContext` | For example, the base `Rδ`, size `k=2`, the `max_candidates` limit, the feasibility request, this Operator's continuation state, and the shared `RandomSource`. The source seed and checkpoint continuation follow architecture §6.6 and §8.1. |
 | `Candidate` | A proposed route plan, optionally carrying immutable-by-contract metadata such as the moved student and source/destination route, following architecture §5.4. |
-| `OperatorResult` | The requested size `k`, actual modification count `m` on that operator's declared scale, and a candidate when one was generated. For `repair_capacity`, `k=2` and `m=1` can describe a partially realized request. A zero count records zero achieved modifications and an empty candidate field. |
-| `CandidateOutcome` | The report for one initial submission or Operator proposal. An initial outcome identifies the `initial` source and has `choice_id=None`. An Operator-produced candidate records the tagged `ChoiceId` defined in architecture §6.6. `component_position=None` for a standalone Operator and `second` for a composition, identifying the Operator that produced the submitted candidate. The outcome also records the base, requested size, actual count, candidate metadata, `SolutionId` when identity resolves, processing status, available application assessment, component failures, and search disposition when known. |
+| `OperatorResult` | An ordered tuple of `CandidateProposal` values, each containing one candidate and its actual modification count `m` on that Operator's declared scale. For `repair_capacity`, `k=2` and a proposal with `m=1` can describe a partially realized request. An empty tuple records that the call produced no candidates. |
+| `CandidateOutcome` | The report for one initial submission or Operator proposal. An initial outcome identifies the `initial` source and has `choice_id=None`. An Operator-produced candidate records the tagged `ChoiceId` and 1-based `candidate_index` defined in architecture §6.6. `component_position=None` for an ordinary standalone Operator and `second` for a dynamic composition, pre-registered composite, or promoted Operator, identifying the component that produced the submitted candidate. The outcome also records the base, requested size, actual count, candidate metadata, `SolutionId` when identity resolves, processing status, available application assessment, component failures, and search disposition when known. |
 
 The evaluator may include student-to-route assignments, route loads, and each
 student's ride distance in `ApplicationEvaluation.analysis`. Operators receive
@@ -222,24 +230,23 @@ objective values and feasibility.
 #### Operator catalog
 
 The operators below preserve the route representation and assign every known
-student exactly once. A call with `ensure_feasible=True` returns a candidate
-only when the complete plan satisfies the capacity constraint as well. Each
-operator declares a finite maximum size and supports every integer `k` from 1
-through that maximum; a particular base may have no move at a supported size,
-which is reported as `m=0` with no candidate. The meaning of `m` belongs to the
-operator's own scale.
+student exactly once. Every returned proposal with `ensure_feasible=True`
+satisfies the capacity constraint. Each Operator declares a finite maximum
+size and supports every integer `k` from 1 through that maximum; a particular
+base may yield fewer than the configured number of different candidates, or an
+empty result. Each proposal's `m` belongs to the Operator's own scale.
 
 | Operator | Size `k` and count `m` | Feasibility behavior and example |
 |---|---|---|
 | `relocate_student` | `k` is the maximum number of students to relocate; `m` counts students actually placed at a different route or position. Maximum size: `n`. | With `ensure_feasible=True`, choose insertions that respect `Q`. With `False`, moving student 1 from `(1,2)` to `(4,3)` in `Rα` produces `(2)`, `(4,3,1)`, a valid but over-capacity plan (`k=1`, `m=1`). |
 | `exchange_students` | `k` is the maximum number of disjoint cross-route student exchanges; `m` counts completed exchanges. Maximum size: `max(1, floor(n/2))`. | Swapping students 2 and 4 in `Rα` produces `(1,4)`, `(2,3)` with both route sizes unchanged (`k=1`, `m=1`). An `ensure_feasible=True` result satisfies capacity. |
 | `or_opt_block` | `k` is the maximum length of a consecutive student block to relocate; `m` counts selected block members whose route or position changed. Maximum size: `n`. | Moving a block of two consecutive students between routes is an Or-opt-style move (`k=2`, up to `m=2`). This lets one Operator expose single-student and larger block moves through its size parameter. |
-| `reorder_route` | `k` is the maximum number of consecutive route positions considered for reordering; `m` counts positions whose visit order changed. Maximum size: `n`. | A 2-opt-style reversal changes `(4,3)` to `(3,4)` in `Rα` (`k=2`, `m=2`). It preserves student assignment and route loads while changing route distance and ride distances. At `k=1`, no order change is possible, so the result has `m=0` and no candidate. |
-| `two_opt_star` | This Operator has maximum size `1`; `k=1` requests one exchange of route tails after selected cut points, and `m` is `1` when the exchange is applied or `0` when no valid exchange is available. | Exchanging the tails after the first student in each route of `Rα` produces `(1,3)`, `(4,2)` (`k=1`, `m=1`). The student assignments remain complete and each route remains nonempty; capacity is checked when requested. |
-| `split_route` | `k` is the maximum number of routes to split; `m` counts completed splits. Maximum size: `max(1,n-1)`, with `m=0` when `n=1`. | Splitting `(2,4)` in `Rβ` into `(2)` and `(4)` produces `Rε` (`k=1`, `m=1`). The objectives change from `(2,12,5)` to `(3,16,3)`: one additional bus and distance units trade for a shorter maximum ride. |
-| `merge_routes` | `k` is the maximum number of route merges; `m` counts completed merges. Maximum size: `max(1,n-1)`, with `m=0` when `n=1`. | Merging the singleton routes `(3)` and `(4)` in `Rγ` into `(3,4)` reduces bus count by one and respects `Q=2` (`k=1`, `m=1`). With `ensure_feasible=True`, a merge is returned only when the complete plan remains feasible. |
+| `reorder_route` | `k` is the maximum number of consecutive route positions considered for reordering; `m` counts positions whose visit order changed. Maximum size: `n`. | A 2-opt-style reversal changes `(4,3)` to `(3,4)` in `Rα` (`k=2`, `m=2`). It preserves student assignment and route loads while changing route distance and ride distances. At `k=1`, no order change is possible, so the Operator returns an empty tuple. |
+| `two_opt_star` | This Operator has maximum size `1`; `k=1` requests one exchange of route tails after selected cut points, and each proposal has `m=1` when the exchange is applied. | Exchanging the tails after the first student in each route of `Rα` produces `(1,3)`, `(4,2)` (`k=1`, `m=1`). The student assignments remain complete and each route remains nonempty; capacity is checked when requested. |
+| `split_route` | `k` is the maximum number of routes to split; `m` counts completed splits. Maximum size: `max(1,n-1)`; when `n=1`, the Operator returns an empty tuple. | Splitting `(2,4)` in `Rβ` into `(2)` and `(4)` produces `Rε` (`k=1`, `m=1`). The objectives change from `(2,12,5)` to `(3,16,3)`: one additional bus and distance units trade for a shorter maximum ride. |
+| `merge_routes` | `k` is the maximum number of route merges; `m` counts completed merges. Maximum size: `max(1,n-1)`; when `n=1`, the Operator returns an empty tuple. | Merging the singleton routes `(3)` and `(4)` in `Rγ` into `(3,4)` reduces bus count by one and respects `Q=2` (`k=1`, `m=1`). With `ensure_feasible=True`, each returned proposal has a complete feasible plan. |
 | `repair_capacity` | `k` is the maximum number of students selected for relocation from overloaded routes; `m` counts selected students whose final route or position changed. Maximum size: `n`. | Registered with the feasibility-restoration capability for the catalog's capacity-infeasible plans. From `Rδ`, moving student 3 from `(1,2,3)` to `(4)` yields `Rα` with `k=2`, `m=1`, and `ensure_feasible=True`. |
-| `destroy_repair` | `k` is the number of students selected for removal and reinsertion; `m` counts selected students whose final route or position changed. Maximum size: `n`. | One Operator call removes the selected students, reinserts them, and returns one final plan. From `Rα`, selecting students 1 and 4 and reinserting them gives `(2,1)`, `(3,4)` with `k=2`, `m=2`. A capacity-aware variant returns feasible plans for `ensure_feasible=True` and may be registered with restoration capability. |
+| `destroy_repair` | `k` is the number of students selected for removal and reinsertion; `m` counts selected students whose final route or position changed. Maximum size: `n`. | One Operator call removes the selected students, reinserts them, and returns an ordered list of complete plans up to `max_candidates`. From `Rα`, one possible proposal selects students 1 and 4 and reinserts them as `(2,1)`, `(3,4)` with `k=2`, `m=2`. A capacity-aware variant returns only feasible proposals for `ensure_feasible=True` and may be registered with restoration capability. |
 
 `random_destroy_repair`, `long_arc_destroy_repair`, and
 `high_ride_destroy_repair` are useful separate catalog entries: they differ in
@@ -273,16 +280,18 @@ whose use reflects historical performance, motivating separately identified
 destroy-and-repair variants [4].
 
 The destroy and repair phases of `destroy_repair` are internal to that one
-application-provided `Operator` call; the engine receives one `OperatorResult`
-and records one outcome for the selected choice. A composition such as
+application-provided `Operator` call; the engine receives its ordered
+`OperatorResult` list and records one outcome per returned proposal. A
+composition such as
 `reorder_route(relocate_student(R))` is a one-step ordered pair of Operators
 from the original catalog; both receive the same requested `k`. The intermediate
 plan from `relocate_student` serves as the input base to `reorder_route`; its
 modification count appears in the first Operator-result event. The composition
 calls `relocate_student` with `ensure_feasible=False` and passes the
-composition's feasibility request to `reorder_route`. Only the final plan
-returned by `reorder_route` is processed as a candidate and assessed by the
-application.
+composition's feasibility request to each `reorder_route` call. Each
+intermediate from `relocate_student` feeds the next call to `reorder_route`;
+every final plan from those calls is processed in order as a candidate and
+assessed by the application.
 The composition's tagged `choice_id` identifies the ordered pair of source
 `OperatorId` values.
 Its modification count is the smaller of its component counts, so it reaches
@@ -314,16 +323,16 @@ engine uses `Rα`'s stored `EvaluationRecord` for the proposal occurrence.
 |---|---|
 | `SolutionRecord` | One identified route plan, including its payload, `EvaluationRecord`, current archive status when applicable, and candidate-scoped operator contract failures. |
 | `EvaluationRecord` | The single stored processing status, `ApplicationEvaluation`, derived assessment, and evaluation diagnostics for that route plan. |
-| `SolutionRegistry` | One record per distinct identity-resolved route plan, including invalid, infeasible, and failed evaluations. Duplicate route-order representations refer to the existing record. |
-| `Archive` | The known feasible route plans currently admitted under the archive policy. `Rα`, `Rβ`, and `Rε` can all appear: the first two have equal objective vectors, while `Rε` gives a shorter maximum ride. |
-| `ArchivePolicy` | Determine archive membership from feasibility and the three objective values using the declared dominance relation. |
-| `ArchiveStatus` | Classify a feasible record as `Pareto optimal`, `Dominated`, or `Rejected`; `Rejected` marks a former archive member displaced by a later update. |
-| `SearchDisposition` | Describe proposal handling: `duplicate` for a route-list reordering, `dominated` for a proposed `Rγ`, or `archived` when a proposal such as `Rε` enters the archive. |
+| Visited-plan history (`SolutionRegistry`) | One record per distinct identity-resolved route plan, including invalid, infeasible, failed, dominated, and objective-vector-equal plans. Duplicate route-order representations refer to the existing record. |
+| Pareto set | One current representative for each distinct nondominated objective vector among feasible, within-bound route plans. `Rα` and `Rβ` share a vector, so only the earlier registered one appears in the Pareto set; both remain in `SolutionRegistry`. `Rε` also appears when its shorter maximum ride makes its vector nondominated. |
+| `ArchivePolicy` | Determine Pareto-set membership from feasibility and the three objective values using the declared dominance and vector-equality comparisons. |
+| `ArchiveStatus` | Classify a feasible record as `Pareto optimal`, `Dominated`, `Objective-vector duplicate`, or `Rejected`; `Objective-vector duplicate` marks a distinct plan tied with an existing Pareto representative, and `Rejected` marks a former Pareto member displaced by a later update. |
+| `SearchDisposition` | Describe proposal handling: `duplicate` for a route-list reordering, `dominated` for a proposed `Rγ`, `objective_vector_duplicate` for a new plan tied with a current representative, or `archived` when a new trade-off such as `Rε` enters the Pareto set. |
 | `Active pool` | The default pool can contain dominated feasible `Rγ` and, in relaxed mode, infeasible `Rδ`; cleanup retains the current Pareto plans. Eligibility and cleanup are defined in algorithm design §2. |
-| `ExplorationPolicy` | Choose a subset of engine-eligible route plans while retaining every current Pareto archive member. |
+| `ExplorationPolicy` | Choose a subset of engine-eligible route plans while retaining every current Pareto-set representative. |
 | `BaseSelectionPolicy` | In the relaxed-mode example, infeasible `Rδ` is the current base for `repair_capacity` during its excursion. The shared eligibility and selection rules are defined in algorithm design §2. |
 
-Consequently, the archive can omit model-level Pareto plans that the search has not yet visited.
+Consequently, the Pareto set can omit model-level Pareto plans that the search has not yet visited.
 
 The public cleanup call and maintenance result follow architecture §7.
 
@@ -332,7 +341,7 @@ The public cleanup call and maintenance result follow architecture §7.
 | Architecture concept | School-bus interpretation |
 |---|---|
 | `MultiobjectiveVNS` | Coordinate candidate processing, identity lookup, and evaluation dispatch through `Executor`; coordinate policies and continuation; expose search and maintenance operations; and construct their results. |
-| `MultiobjectiveVNSConfig` | Hold built-in per-invocation search-iteration and evaluation-request limits; bus capacity remains application problem data from §1.3. |
+| `MultiobjectiveVNSConfig` | Hold built-in per-invocation limits, including the caller-required `max_candidates_per_attempt`; bus capacity remains application problem data from §1.3. |
 | `BudgetPolicy` | Allow the next search iteration or stop the invocation early; the engine enforces every configured ceiling, including evaluation-request limits. |
 | `FeedbackPolicy` | Maintain separate statistics for standalone route Operators and ordered compositions, using each choice's modification-count scale; state changes follow architecture §6.4 and algorithm design §2. The engine selects a category first; `OperatorGroup` membership provides soft hints among compositions under `performance_matching`. |
 | `Executor` | Invoke the route-plan evaluator for an engine-dispatched request; the `SolutionRegistry` stores each resulting `EvaluationRecord` for reuse. See architecture §§5.5–5.6 and §6.6. |

@@ -29,8 +29,8 @@ to the search engine. The codec contract for this object model is specified in
    findings, and objective values belong to the evaluation record associated
    with the solution.
 4. **Solutions are immutable.** An Operator receives a solution as a read-only
-   value and returns a new candidate. A focused builder may help construct that
-   candidate.
+   value and returns an ordered collection of new candidate plans. A focused
+   builder may help construct each candidate.
 5. **Operational infeasibility remains assessable.** A structurally valid
    candidate may omit or repeat an activity, exceed a capacity, or violate a
    time or personnel rule. The evaluator assesses those conditions according
@@ -295,7 +295,10 @@ are set on the final stop of an intermediate destination-side depot visit when
 the route continues as another tour. The final overnight depot ends the last
 tour implicitly; an explicit final stop there has `tour_end = false`. The tour
 count is one plus the number of markers and is bounded by the vehicle's
-`max_tours_per_day` value.
+`max_tours_per_day` value. The built-in `total_waiting_time` objective sums
+both wait fields over all route stops, as defined in
+[`multiday_vrp.md`](multiday_vrp.md) §4.2; `break_duration` is part of `wait`
+and is counted once.
 
 Route position distinguishes occurrences. If an activity appears more than
 once, each position identifies a separate occurrence for evaluation. Multiple
@@ -340,36 +343,80 @@ and is shared by both operations.
 
 ### 4.6 Solution identity
 
-The VRP application's `SolutionIdentity.equivalent(a, b)` uses exact
-structural equality across every authoritative field of `VrpSolution` and its
-nested records in §§4.1–4.5. Record variants and scalar field values are
-compared at their corresponding positions. The order of `routes`, `stops`,
-`legs`, each leg's `arc_ids`, and `transfer_steps` is significant.
-`team_member_ids` compares by set membership. Identifier values compare by
-their exact string values.
+The VRP application's `SolutionIdentity.equivalent(a, b)` compares canonical
+identity forms of the authoritative `VrpSolution` records in §§4.1–4.5. The
+canonical form removes only pickup-order symmetries declared in the loaded
+instance; every other record variant, field value, and ordering remains part
+of identity. An instance with no groups uses exact structural identity. The
+declaration format and validation are defined in
+[`multiday_vrp_input_format.md`](multiday_vrp_input_format.md) §§3.5 and 4.
+`VrpSolutionIdentity` owns the canonical identity form. The default Operator
+catalog uses the same form when it removes repeated candidate alternatives.
+
+A `PickupSymmetryGroup` identifies package pickups whose relative order the
+declaring application guarantees is interchangeable under every active
+constraint, objective, and registered callback. The loader verifies that
+group members have the same pickup node, pickup service duration, and
+pickup-window alternatives. The application author guarantees that precedence
+rules, custom assessments, and extensions preserve their results when the
+complete pickup-stop records are permuted within a declared group.
+
+For identity comparison, each route is scanned for maximal contiguous blocks
+of pickup stops whose package IDs belong to the same declared group. A block
+ends at another activity, a depot-only stop, a pickup from another group, a
+stop with `tour_end = true`, or a nonempty road leg between adjacent pickups.
+The identity form orders each block of two or more stops by ascending
+`package_id`, moving each complete `ActivityStop` record as a unit. Values for
+`pre_service_wait`, `wait`, `break_duration`, and `team_member_ids` stay with
+their package's pickup record. Boundary legs and all other route and transfer
+fields keep their original positions. A one-stop block is already canonical.
+All other route sections keep their submitted order.
+
+The rule therefore canonicalizes pickup-order variants with nonzero waits or
+break durations while preserving each value's association with its pickup.
+Declared group members have matching pickup nodes, service durations, and
+windows, and the application guarantee covers the remaining active rules and
+callbacks. A travel leg or tour boundary remains fixed and separates blocks.
+
+Thus two plans that differ only by the order within a qualifying block have
+the same solution identity. Package IDs remain attached to their own pickup
+and delivery activities, and the block's complete pickup-stop records retain
+their field values. The search engine applies this identity rule to each
+initial-solution submission and final Operator candidate before evaluation,
+so an equivalent proposal reuses the registered solution and its stored
+evaluation. The canonical form is a comparison key; the registered
+`VrpSolution` value and codec payload retain their original immutable fields.
+This normalization changes solution identity only: it adds no objective and
+does not alter the stored plan or its package assignments.
+
+Outside canonicalized pickup blocks, `routes`, `stops`, `legs`,
+each leg's `arc_ids`, and `transfer_steps` compare in order. `team_member_ids`
+compares by set membership. Identifier values compare by their exact string
+values.
 
 Scalar equality includes the scalar's exact runtime type and value. Finite
 floating-point values compare exactly, with no tolerance. The evaluator uses
 the numeric feasibility tolerance defined in `multiday_vrp.md` §1 for
-constraint checks; solution identity uses these exact scalar values. Thus two
-values within a constraint tolerance remain distinct when their exact values
-differ. Every NaN value
-compares equal to every other NaN value at the corresponding field; positive
-and negative infinity each compare equal only to the same signed infinity;
-positive and negative zero compare equal. These rules make identity
-deterministic for type-correct plans that contain semantically invalid numeric
-values, while the application evaluator assesses their validity. Identity
-applies to every constructed `VrpSolution`, including plans with invalid
-domains, unresolved references, or inconsistent structural relationships.
-Public record constructors reject values outside their declared record,
-tuple, frozenset, and scalar field types before candidate processing.
+constraint checks; canonical identity uses exact scalar values outside the
+pickup-order normalization. Thus two values within a constraint tolerance
+remain distinct when their exact values differ. Every NaN value compares equal
+to every other NaN value at the corresponding field; positive and negative
+infinity each compare equal only to the same signed infinity; positive and
+negative zero compare equal. These rules make identity deterministic for
+type-correct plans that contain semantically invalid numeric values, while the
+application evaluator assesses their validity. Identity applies to every
+constructed `VrpSolution`, including plans with invalid domains, unresolved
+references, or inconsistent structural relationships. Public record
+constructors reject values outside their declared record, tuple, frozenset,
+and scalar field types before candidate processing.
 
 Identity is computed from the authoritative `VrpSolution` record graph.
 Derived views are rebuilt from that graph, the instance remains fixed for the
 search, and evaluation results belong to registry records. A configured
-lookup key must accept every constructed `VrpSolution` and assign the same key
-to structurally equal solutions; distinct solutions may share a key, as
-allowed by the general identity contract.
+lookup key must assign the same key to plans with the same canonical identity;
+distinct identities may share a key, as allowed by the general identity
+contract. The instance ID includes its `PickupSymmetryGroup` declarations, so
+checkpoint continuation restores the same canonical identity rule.
 
 ## 5. Data intentionally derived from the plan
 
@@ -450,8 +497,12 @@ all applicable costs.
 
 ## 7. Operator editing and immutability
 
-An Operator reads one `VrpSolution` and returns a new `VrpSolution`. The
-solution records are immutable; a temporary `SolutionBuilder` may provide
+An Operator reads one `VrpSolution` and returns an ordered tuple of candidate
+proposals, each containing a new immutable `VrpSolution` and its modification
+count. Every proposed plan is built independently from the same base, and the
+tuple contains up to the user-selected per-attempt candidate limit. Candidate
+order expresses the Operator's preference and determines processing order.
+The solution records are immutable; a temporary `SolutionBuilder` may provide
 focused editing operations such as:
 
 - insert, remove, or reorder a route stop;
@@ -465,9 +516,11 @@ focused editing operations such as:
 
 The builder edits the authoritative route and transfer-step records. It then
 creates a type-correct solution and rebuilds or invalidates all derived views.
-The shared plan assessor verifies representation validity before an Operator
-returns its final candidate. The Operator result carries statistics such as
-the modification count.
+The shared plan assessor verifies representation validity for each proposal
+before it is returned. The application Operator contract, proposal records,
+candidate limit, and processing order are defined in
+[`multiday_vrp_operators.md`](multiday_vrp_operators.md) and the generic
+architecture document.
 
 The instance remains fixed while an Operator edits a solution. The Operator
 reads locations, service durations, capacities, skills, and other input data

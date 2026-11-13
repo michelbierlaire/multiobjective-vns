@@ -91,9 +91,15 @@ The tree is a growth plan, not a requirement to create empty modules in advance.
 - Give each object one primary responsibility. Keep application evaluation, solution identity and encoding, archive decisions, pool membership, feedback, budgets, event delivery, and persistence at the boundaries assigned by the design.
 - Use immutable public records for outcomes, events, decisions, and snapshots where the contracts call for stable values. Treat application solutions and metadata as read-only while the package retains or exposes them.
 - Keep policy decision calls read-only. Stage state changes through the documented commit hooks and publish them with the corresponding search transition.
-- Keep candidate processing and search transitions sequential in version one. A composition is one selected choice with one final submitted candidate, as specified by the algorithm.
+- Keep candidate processing and search transitions sequential in version one. A composition is one selected choice and one `CandidateAttempt`; it may return an ordered list of final candidate proposals, all processed in order under the algorithm contract.
 - Use the single configured `RandomSource` for package, policy, and Operator draws. Do not introduce independent module-level random generators.
-- Preserve checkpoint and resume contracts. Treat application codec payloads and component state payloads as opaque; do not assume that solutions or payloads are JSON values or silently serialize them with a generic object serializer.
+- Each application's `ApplicationEvaluator` constructs the complete objective
+  vector, including application-defined costs and penalties. The generic VNS
+  applies the corresponding `ObjectiveFunction` comparisons to maintain the
+  Pareto archive. In the multi-day VRP, early- and late-window penalties belong
+  to a dedicated time-window-violation objective, as defined in
+  `multiday_vrp.md` §1.8 and `multiday_vrp_input_format.md` §10.1.
+- Preserve checkpoint and resume contracts. Require `SolutionCodec.capture` to produce application-defined bytes, and store those bytes without interpreting or re-serializing their contents. The default Pareto snapshot wraps them in base64 within its versioned JSON envelope. Keep component `StatePayload` values opaque to the generic package and preserve them through the configured `CheckpointStore`.
 - Catch component exceptions at the boundaries defined by the design. Convert them to the specified diagnostic and follow the algorithm's recovery or stopping rule. Do not swallow exceptions or continue from partially updated state.
 - Keep version-one implementation scoped to the agreed contracts. Parallel-stream coordination remains a future extension.
 

@@ -1,0 +1,11 @@
+# A one-scenario deterministic bank for the fixed Solomon travel matrix.
+format_version = 1
+arc_catalog_file = 'arc-catalog.csv'
+target_grid_file = 'target-grid.csv'
+time_zone = 'Europe/Zurich'
+time_unit = 'minutes'
+scenario_count = 1
+scenarios_file = 'scenarios.csv'
+travel_times_file = 'travel-times.csv'
+post_horizon_rule_id = 'constant_last_boundary'
+post_horizon_rule_configuration_id = 'builtin-v1'

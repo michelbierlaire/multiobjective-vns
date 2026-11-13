@@ -22,6 +22,7 @@ def run_example() -> RunResult:
     example_directory = Path(__file__).resolve().parent
     application = load_knapsack_application(example_directory / 'instance.toml')
     config = MultiobjectiveVNSConfig(
+        max_candidates_per_attempt=1,
         budget_limits=BudgetLimits(
             max_wall_time_seconds=30,
             max_candidate_attempts=30,

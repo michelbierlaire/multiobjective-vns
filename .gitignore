@@ -226,3 +226,7 @@ examples/knapsack/p410/multiobjective-vns-logs/
 examples/multiday_vrp/minimal/multiobjective-vns-logs/
 examples/multiday_vrp/solomon/C101-25/.DS_Store
 .DS_Store
+/examples/multiday_vrp/solomon/C101-25-3-vehicles/run-bounds-window150-wait30-20261112
+/examples/multiday_vrp/solomon/C101-25-3-vehicles/run-bounds-window150-wait30-symmetry-v4-overnight-20261113
+/examples/multiday_vrp/solomon/C101-25-3-vehicles/run-logs-6h-warmstart-20261112-0842-seed-0
+/examples/multiday_vrp/solomon/C101-25-3-vehicles/run-logs-overnight-symmetry-operators-20261112-seed-0

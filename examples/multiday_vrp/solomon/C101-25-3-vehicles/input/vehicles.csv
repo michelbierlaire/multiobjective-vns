@@ -1,0 +1,4 @@
+vehicle_id,cargo_capacity,seat_capacity,initial_depot_id,max_tours_per_day
+vehicle-01,200.0,1,depot-0,1
+vehicle-02,200.0,1,depot-0,1
+vehicle-03,200.0,1,depot-0,1
